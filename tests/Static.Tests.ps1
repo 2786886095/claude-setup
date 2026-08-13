@@ -38,6 +38,12 @@ foreach ($text in $requiredSafetyChecks) {
 if ($main -match 'AllowUnsigned') {
     throw 'The installer must never install an unsigned AppX package.'
 }
+if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
+    throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
+}
+if ($main -notmatch 'Remove-ResumeAfterRestart') {
+    throw 'The one-shot installer must clear its temporary RunOnce resume entry.'
+}
 
 $requiredBatchParts = @(
     '%~dp0ClaudeSetup.ps1',

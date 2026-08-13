@@ -4,6 +4,8 @@
 
 它不是 Claude 或 Anthropic 的官方项目。脚本只从 Anthropic 官方地址下载 MSIX，并在安装前验证数字签名和包身份。
 
+本工具按“一次性安装与修复”设计：成功运行一遍后即可删除，不常驻、不创建计划任务、不关闭或接管 Claude 官方自动更新。Claude 后续继续通过官方机制更新。
+
 ## 解决什么问题
 
 - 全新 Windows 10/11 安装 Claude Desktop；
@@ -23,6 +25,8 @@
 2. 双击 `install.bat`（推荐）或 `setup.cmd`。
 3. 接受 Windows UAC 管理员确认。
 4. 如果脚本提示需要重启，请重启；脚本会在登录后继续。
+
+重启续跑使用 Windows `RunOnce`，只执行一次；安装成功后脚本会主动清除该项。
 
 只诊断、不修改系统：双击 `diagnose.cmd`。
 
@@ -87,6 +91,8 @@
 - 下载地址固定为 Anthropic 官方 endpoint；
 - 安装前验证签名状态为 `Valid`，签名者包含 `Anthropic`，包名为 `Claude`；
 - 不提供 `AllowUnsigned` 或签名绕过功能；
+- 不修改 `disableAutoUpdates` 或其他 Claude 自动更新策略；
+- 不创建常驻进程或计划任务；
 - 不绕过 AppLocker、企业策略或固件限制。
 
 ## 输出

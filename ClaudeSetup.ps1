@@ -436,6 +436,13 @@ function Register-ResumeAfterRestart {
     Write-Log '已注册重启后自动继续 Claude Setup。' OK
 }
 
+function Remove-ResumeAfterRestart {
+    $runOnce = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+    if (Test-Path -LiteralPath $runOnce) {
+        Remove-ItemProperty -LiteralPath $runOnce -Name 'ClaudeSetupResume' -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-OfficialPackageUrl {
     param([Parameter(Mandatory)][ValidateSet('x64', 'arm64')][string]$Architecture)
     return "$script:OfficialDownloadBase/$Architecture/msix/latest/redirect"
@@ -826,6 +833,7 @@ try {
         Write-Log '仍有失败项，请查看诊断报告。' WARN
         if ($exitCode -eq 0) { $exitCode = 2 }
     } elseif ($exitCode -eq 0) {
+        Remove-ResumeAfterRestart
         Write-Log 'Claude Desktop/Cowork 安装与检测完成。' OK
     }
 } catch {
