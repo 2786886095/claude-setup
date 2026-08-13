@@ -28,6 +28,8 @@ $requiredSafetyChecks = @(
     'RPC pipe closed',
     'sessiondata.vhdx',
     'SupportCompressedVolumes'
+    'Get-ClaudeInstallationCandidates'
+    'Select-ClaudeInstallation'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -73,6 +75,24 @@ try {
     }
     if ((Get-VolumeRoot 'C:\Users\Example\AppData') -ne 'C:') {
         throw 'Volume-root detection failed for C:.'
+    }
+
+    $mockCandidates = @(
+        [pscustomobject]@{ Type = 'EXE'; Score = 300; Version = [version]'99.0'; Path = 'C:\Fake\Newer\Claude.exe' },
+        [pscustomobject]@{ Type = 'MSIX'; Score = 1200; Version = [version]'2.0'; Path = 'C:\Fake\BrokenMsix\Claude.exe' },
+        [pscustomobject]@{ Type = 'MSIX'; Score = 1900; Version = [version]'1.0'; Path = 'C:\Fake\ValidCoworkMsix\Claude.exe' }
+    )
+    $selectedMock = Select-ClaudeInstallation $mockCandidates
+    if ($selectedMock.Path -ne 'C:\Fake\ValidCoworkMsix\Claude.exe') {
+        throw "A signed Cowork MSIX must outrank newer/broken EXE installs: $($selectedMock.Path)"
+    }
+
+    $currentCandidates = @(Get-ClaudeInstallationCandidates)
+    if (Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue) {
+        $currentSelection = Select-ClaudeInstallation $currentCandidates
+        if (-not $currentSelection -or $currentSelection.Type -ne 'MSIX') {
+            throw 'Installed Claude MSIX was not discovered and preferred.'
+        }
     }
     $argumentItems = @(Get-CurrentArgumentList)
     $fileIndex = [Array]::IndexOf($argumentItems, '-File')

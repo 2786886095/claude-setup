@@ -9,6 +9,8 @@
 ## 解决什么问题
 
 - 全新 Windows 10/11 安装 Claude Desktop；
+- 自动寻找已安装 Claude：AppX/MSIX、卸载注册表、运行中进程、快捷方式、用户安装目录，以及所有固定磁盘上的 `Claude`/`Apps`/`Programs`/`Software`/`Tools` 常见移动目录；
+- 多个安装并存时，优先选择 Anthropic 签名有效且具备 Cowork 服务组件的官方 MSIX；
 - 自动适配 x64 与 ARM64；
 - 检查并启用 Virtual Machine Platform；
 - 检查 BIOS/UEFI 虚拟化、HCS/HNS、Hypervisor 启动设置；
@@ -49,6 +51,8 @@
 | 情况 | 行为 |
 |---|---|
 | 未安装 Claude | 下载并验证官方 MSIX，然后安装 |
+| 已有多个 Claude | 自动优先选择签名有效、支持 Cowork 的官方 MSIX |
+| 只有官网 EXE/移动版 | 识别并报告其路径，保留原目录，另行安装官方 MSIX 供 Cowork 使用 |
 | 已安装且健康 | 只补齐依赖并验证 |
 | `Claude.exe` 为 `HashMismatch` | 下载同版本/更新版本官方 MSIX，恢复官方核心文件 |
 | Virtual Machine Platform 未启用 | 自动启用，注册重启后继续 |

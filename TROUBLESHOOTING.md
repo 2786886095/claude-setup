@@ -1,5 +1,16 @@
 # 故障类型与脚本行为
 
+## 自动寻找已安装 Claude
+
+工具依次收集 AppX/MSIX 注册、卸载注册表、运行中进程、开始菜单/桌面快捷方式、用户安装目录，以及所有固定磁盘上的有限常见移动目录。它不会递归扫描整块磁盘。候选排序固定为：
+
+1. Anthropic 签名有效、包含 Cowork 服务组件的官方 MSIX；
+2. 签名损坏但可从官方 MSIX 修复的 Claude MSIX；
+3. Anthropic 签名有效的官网 EXE/便携目录；
+4. 其他能够确认包含 `resources/app.asar` 的 Claude 目录。
+
+普通 EXE 或移动版不会被直接修改，也不会被误认为能提供 Cowork 服务；脚本会保留它们，并安装官方 MSIX。
+
 ## `RPC pipe closed`
 
 优先检查 `Claude.exe` 的 Authenticode 签名。若状态为 `HashMismatch`，通常是主程序或 `app.asar` 被第三方补丁修改。脚本会下载 Anthropic 官方 MSIX，验证签名与包身份，并恢复官方版本。
@@ -54,4 +65,3 @@
 ## 完整汉化与 Cowork
 
 完整汉化若修改 `Claude.exe` 或 `app.asar`，会使签名失效。CoworkVMService 随后拒绝客户端并关闭 RPC 管道。工具不提供签名绕过，也不会自动启用完整汉化。
-

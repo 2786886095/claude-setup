@@ -31,6 +31,7 @@ $script:BackupRoot = Join-Path $script:ProgramDataRoot 'backups'
 $script:LogPath = $null
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:NeedsRestart = $false
+$script:InstallationCandidateCache = $null
 
 function Write-Log {
     param(
@@ -121,10 +122,201 @@ function Get-AppxSystemVolume {
     return Get-AppxVolume | Where-Object { $_.IsSystemVolume } | Select-Object -First 1
 }
 
+function New-ClaudeInstallationCandidate {
+    param(
+        [ValidateSet('MSIX', 'EXE', 'Portable')]
+        [string]$Type,
+        [string]$Path,
+        [string]$Source,
+        $Package = $null,
+        [bool]$CurrentUserRegistered = $false
+    )
+
+    if (-not $Path) { return $null }
+    try { $Path = [IO.Path]::GetFullPath($Path.Trim('"')) } catch { return $null }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    if ([IO.Path]::GetFileName($Path) -notmatch '^Claude\.exe$') { return $null }
+
+    $appDirectory = Split-Path -Parent $Path
+    $resources = Join-Path $appDirectory 'resources'
+    $asar = Join-Path $resources 'app.asar'
+    # Exclude the Claude Code CLI and unrelated files with the same name.
+    if (-not (Test-Path -LiteralPath $asar -PathType Leaf)) { return $null }
+
+    $signature = Test-AnthropicSignature $Path
+    $coworkServiceBinary = Join-Path $resources 'cowork-svc.exe'
+    $coworkCapable = $Type -eq 'MSIX' -and (Test-Path -LiteralPath $coworkServiceBinary -PathType Leaf)
+    $version = $null
+    if ($Package -and $Package.Version) { $version = [version]$Package.Version }
+    else {
+        try { $version = [version](Get-Item -LiteralPath $Path).VersionInfo.ProductVersion } catch {}
+    }
+
+    $score = 0
+    if ($Type -eq 'MSIX') { $score += 1000 }
+    if ($coworkCapable) { $score += 500 }
+    if ($signature.Valid) { $score += 300 }
+    elseif ($signature.Status -eq 'HashMismatch') { $score += 100 }
+    if ($Package -and $Package.PackageFamilyName -eq $script:PackageFamily) { $score += 100 }
+    if ($CurrentUserRegistered) { $score += 50 }
+
+    return [pscustomobject]@{
+        Type = $Type
+        Path = $Path
+        AppDirectory = $appDirectory
+        Resources = $resources
+        Asar = $asar
+        Source = $Source
+        Package = $Package
+        Version = $version
+        SignatureValid = [bool]$signature.Valid
+        SignatureStatus = [string]$signature.Status
+        CoworkCapable = [bool]$coworkCapable
+        CurrentUserRegistered = $CurrentUserRegistered
+        Score = $score
+    }
+}
+
+function Select-ClaudeInstallation {
+    param([object[]]$Candidates)
+    return @($Candidates | Where-Object { $_ } | Sort-Object @(
+        @{ Expression = 'Score'; Descending = $true },
+        @{ Expression = 'Version'; Descending = $true },
+        @{ Expression = 'Path'; Descending = $false }
+    ) | Select-Object -First 1)[0]
+}
+
+function Get-ClaudeInstallationCandidates {
+    param([switch]$Refresh)
+
+    if (-not $Refresh -and $null -ne $script:InstallationCandidateCache) {
+        return $script:InstallationCandidateCache
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+
+    $currentPackages = @(Get-AppxPackage -Name $script:PackageName -ErrorAction SilentlyContinue)
+    $currentPackageNames = @{}
+    foreach ($package in $currentPackages) { $currentPackageNames[$package.PackageFullName] = $true }
+    $packages = @($currentPackages)
+    if (Test-IsAdministrator) {
+        try { $packages += @(Get-AppxPackage -AllUsers -Name $script:PackageName -ErrorAction Stop) } catch {}
+    }
+    foreach ($package in @($packages | Sort-Object PackageFullName -Unique)) {
+        if (-not $package.InstallLocation) { continue }
+        $exe = Join-Path $package.InstallLocation 'app\Claude.exe'
+        $candidate = New-ClaudeInstallationCandidate -Type MSIX -Path $exe -Source "AppX:$($package.PackageFullName)" -Package $package -CurrentUserRegistered ([bool]$currentPackageNames[$package.PackageFullName])
+        if ($candidate -and -not $seen[$candidate.Path.ToLowerInvariant()]) {
+            $seen[$candidate.Path.ToLowerInvariant()] = $true
+            $candidates.Add($candidate)
+        }
+    }
+
+    $registryRoots = @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($root in $registryRoots) {
+        foreach ($entry in @(Get-ItemProperty -Path $root -ErrorAction SilentlyContinue | Where-Object {
+            $_.PSObject.Properties['DisplayName'] -and [string]$_.DisplayName -match '(?i)\bClaude\b'
+        })) {
+            $paths = @()
+            if ($entry.PSObject.Properties['DisplayIcon'] -and $entry.DisplayIcon) { $paths += ([string]$entry.DisplayIcon -replace ',\d+$', '').Trim('"') }
+            if ($entry.PSObject.Properties['InstallLocation'] -and $entry.InstallLocation) {
+                $paths += Join-Path ([string]$entry.InstallLocation) 'Claude.exe'
+                $paths += Join-Path ([string]$entry.InstallLocation) 'app\Claude.exe'
+            }
+            foreach ($path in $paths) {
+                $candidate = New-ClaudeInstallationCandidate -Type EXE -Path $path -Source "Registry:$($entry.PSPath)"
+                if ($candidate -and -not $seen[$candidate.Path.ToLowerInvariant()]) {
+                    $seen[$candidate.Path.ToLowerInvariant()] = $true
+                    $candidates.Add($candidate)
+                }
+            }
+        }
+    }
+
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" -ErrorAction SilentlyContinue)) {
+        $candidate = New-ClaudeInstallationCandidate -Type Portable -Path $process.ExecutablePath -Source "Process:$($process.ProcessId)"
+        if ($candidate -and -not $seen[$candidate.Path.ToLowerInvariant()]) {
+            $seen[$candidate.Path.ToLowerInvariant()] = $true
+            $candidates.Add($candidate)
+        }
+    }
+
+    $commonRoots = @(
+        (Join-Path $env:LOCALAPPDATA 'AnthropicClaude'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Claude'),
+        (Join-Path $env:ProgramFiles 'Claude'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Claude')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    foreach ($root in $commonRoots) {
+        foreach ($exe in @(Get-ChildItem -LiteralPath $root -Filter 'Claude.exe' -File -Recurse -Depth 3 -ErrorAction SilentlyContinue)) {
+            $candidate = New-ClaudeInstallationCandidate -Type EXE -Path $exe.FullName -Source "CommonPath:$root"
+            if ($candidate -and -not $seen[$candidate.Path.ToLowerInvariant()]) {
+                $seen[$candidate.Path.ToLowerInvariant()] = $true
+                $candidates.Add($candidate)
+            }
+        }
+    }
+
+    $fixedDriveRelatives = @(
+        'Claude\Claude.exe',
+        'Claude\app\Claude.exe',
+        'Apps\Claude\Claude.exe',
+        'Apps\Claude\app\Claude.exe',
+        'Programs\Claude\Claude.exe',
+        'Programs\Claude\app\Claude.exe',
+        'Software\Claude\Claude.exe',
+        'Software\Claude\app\Claude.exe',
+        'Tools\Claude\Claude.exe',
+        'Tools\Claude\app\Claude.exe',
+        'Program Files\Claude\Claude.exe',
+        'Program Files\Claude\app\Claude.exe',
+        'Program Files (x86)\Claude\Claude.exe',
+        'Program Files (x86)\Claude\app\Claude.exe'
+    )
+    foreach ($drive in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue)) {
+        foreach ($relative in $fixedDriveRelatives) {
+            $path = Join-Path ($drive.DeviceID + '\') $relative
+            $candidate = New-ClaudeInstallationCandidate -Type Portable -Path $path -Source "FixedDriveCommonPath:$($drive.DeviceID)"
+            if ($candidate -and -not $seen[$candidate.Path.ToLowerInvariant()]) {
+                $seen[$candidate.Path.ToLowerInvariant()] = $true
+                $candidates.Add($candidate)
+            }
+        }
+    }
+
+    $shortcutRoots = @(
+        [Environment]::GetFolderPath('Desktop'),
+        [Environment]::GetFolderPath('CommonDesktopDirectory'),
+        [Environment]::GetFolderPath('StartMenu'),
+        [Environment]::GetFolderPath('CommonStartMenu')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($root in $shortcutRoots) {
+            foreach ($shortcutFile in @(Get-ChildItem -LiteralPath $root -Filter '*.lnk' -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -match '(?i)Claude' })) {
+                $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
+                $candidate = New-ClaudeInstallationCandidate -Type Portable -Path $shortcut.TargetPath -Source "Shortcut:$($shortcutFile.FullName)"
+                if ($candidate -and -not $seen[$candidate.Path.ToLowerInvariant()]) {
+                    $seen[$candidate.Path.ToLowerInvariant()] = $true
+                    $candidates.Add($candidate)
+                }
+            }
+        }
+    } catch {}
+
+    $script:InstallationCandidateCache = $candidates.ToArray()
+    return $script:InstallationCandidateCache
+}
+
 function Get-ClaudePackage {
-    return Get-AppxPackage -Name $script:PackageName -ErrorAction SilentlyContinue |
-        Sort-Object Version -Descending |
-        Select-Object -First 1
+    $selected = Select-ClaudeInstallation @(Get-ClaudeInstallationCandidates | Where-Object { $_.Type -eq 'MSIX' -and $_.CurrentUserRegistered })
+    if ($selected) { return $selected.Package }
+    return $null
 }
 
 function Get-ClaudePaths {
@@ -242,7 +434,9 @@ function Invoke-Diagnostics {
     $computer = Get-CimInstance Win32_ComputerSystem
     $arch = Get-NativeArchitecture
     $isAdmin = Test-IsAdministrator
-    $package = Get-ClaudePackage
+    $installations = @(Get-ClaudeInstallationCandidates)
+    $selectedInstallation = Select-ClaudeInstallation $installations
+    $package = if ($selectedInstallation -and $selectedInstallation.Type -eq 'MSIX') { $selectedInstallation.Package } else { $null }
     $paths = Get-ClaudePaths
     $vmp = $null
     try { $vmp = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop } catch {}
@@ -304,6 +498,7 @@ function Invoke-Diagnostics {
     }
 
     if ($package) {
+        Add-Finding 'installation-selection' 'Pass' "已自动选择官方 MSIX：$($selectedInstallation.Path)" "候选数量：$($installations.Count)，签名：$($selectedInstallation.SignatureStatus)，Cowork：$($selectedInstallation.CoworkCapable)"
         Add-Finding 'package' 'Pass' "Claude $($package.Version) 已安装" $package.InstallLocation
         if ($systemVolume -and -not $package.InstallLocation.StartsWith((Get-VolumeRoot $systemVolume.PackageStorePath), [StringComparison]::OrdinalIgnoreCase)) {
             Add-Finding 'package-volume' 'Fail' 'Claude 不在系统 AppX 卷' $package.InstallLocation
@@ -342,7 +537,13 @@ function Invoke-Diagnostics {
             else { Add-Finding "vhdx-$name" 'Warning' "$name 不存在" '全新安装尚未启动 Cowork 时属于正常；已有错误时需要重建 workspace。' }
         }
     } else {
-        Add-Finding 'package' 'Warning' 'Claude Desktop 尚未安装'
+        if ($selectedInstallation) {
+            Add-Finding 'installation-selection' 'Warning' "找到 $($selectedInstallation.Type) 安装，但它不支持可靠的 Cowork：$($selectedInstallation.Path)" '脚本将保留该目录并安装官方 MSIX。'
+            Add-Finding 'package' 'Warning' '未找到支持 Cowork 的官方 Claude MSIX'
+        } else {
+            Add-Finding 'installation-selection' 'Info' '没有发现现有 Claude 安装路径'
+            Add-Finding 'package' 'Warning' 'Claude Desktop 尚未安装'
+        }
     }
 
     if (Get-PendingRestart) { Add-Finding 'pending-restart' 'Warning' 'Windows 有待完成的重启操作' }
@@ -535,6 +736,7 @@ function Install-OfficialClaude {
         }
         try { Add-AppxPackage @parameters } catch {}
     }
+    $script:InstallationCandidateCache = $null
 }
 
 function Backup-ModifiedClaudeFiles {
@@ -647,6 +849,7 @@ function Repair-ExistingPackageVolume {
     Stop-ClaudeProcesses
     try {
         Move-AppxPackage -Package $paths.Package.PackageFullName -Volume $systemVolume
+        $script:InstallationCandidateCache = $null
     } catch {
         throw "无法安全移动 Claude AppX 包。请先备份本地 Cowork 会话，再卸载并用本脚本重装。错误：$($_.Exception.Message)"
     }
