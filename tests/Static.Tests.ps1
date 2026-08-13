@@ -16,6 +16,7 @@ foreach ($script in $scripts) {
 }
 
 $main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw
+$batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw
 $requiredSafetyChecks = @(
     'Get-AuthenticodeSignature',
     'Anthropic',
@@ -36,6 +37,19 @@ foreach ($text in $requiredSafetyChecks) {
 
 if ($main -match 'AllowUnsigned') {
     throw 'The installer must never install an unsigned AppX package.'
+}
+
+$requiredBatchParts = @(
+    '%~dp0ClaudeSetup.ps1',
+    '%~f0',
+    'fltmc.exe',
+    '-Verb RunAs',
+    '-Action Auto'
+)
+foreach ($text in $requiredBatchParts) {
+    if (-not $batch.Contains($text)) {
+        throw "Expected one-click BAT behavior is missing: $text"
+    }
 }
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY
