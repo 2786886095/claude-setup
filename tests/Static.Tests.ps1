@@ -24,6 +24,8 @@ $requiredSafetyChecks = @(
     'CoworkVMService',
     'HashMismatch',
     'Get-AppxVolume',
+    'Get-AppxSystemVolume',
+    'Set-AppxDefaultVolume',
     'Move-AppxPackage',
     'RPC pipe closed',
     'sessiondata.vhdx',
@@ -42,6 +44,9 @@ if ($main -match 'AllowUnsigned') {
 }
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
+}
+if ($main -match 'Add-AppxPackage\s+-Path' -and $main -notmatch 'parameters\.Volume|parameters\.Volume =|\$parameters\.Volume') {
+    throw 'Official MSIX installation must target the Windows system AppX volume.'
 }
 if ($main -notmatch 'Remove-ResumeAfterRestart') {
     throw 'The one-shot installer must clear its temporary RunOnce resume entry.'

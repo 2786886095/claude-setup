@@ -47,7 +47,7 @@
 
 ## 非 C 盘 WindowsApps
 
-脚本把未来 AppX 安装的默认卷设置为系统卷。现有 Claude 包优先通过 `Move-AppxPackage` 移动；若系统版本不支持或移动失败，脚本停止并要求先备份本地 Cowork 数据，不会擅自卸载。
+脚本把未来 AppX 安装的默认卷设置为 Windows 系统卷，并始终把官方 Claude MSIX 安装到该卷。通常路径为 `C:\Program Files\WindowsApps\Claude_版本...`；如果 Windows 本身安装在其他盘，则使用相应系统盘。现有 Claude 包优先通过 `Move-AppxPackage` 移动；若系统版本不支持或移动失败，脚本停止并要求先备份本地 Cowork 数据，不会擅自卸载。
 
 ## 企业设备
 

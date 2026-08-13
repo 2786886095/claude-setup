@@ -6,6 +6,8 @@
 
 本工具按“一次性安装与修复”设计：成功运行一遍后即可删除，不常驻、不创建计划任务、不关闭或接管 Claude 官方自动更新。Claude 后续继续通过官方机制更新。
 
+Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（一般为 `C:\Program Files\WindowsApps\Claude_版本...`）。脚本不自定义安装目录；在其他磁盘发现的 EXE/移动版只作为现有安装线索，不会被选作 Cowork 主程序。
+
 ## 解决什么问题
 
 - 全新 Windows 10/11 安装 Claude Desktop；
@@ -53,6 +55,7 @@
 | 未安装 Claude | 下载并验证官方 MSIX，然后安装 |
 | 已有多个 Claude | 自动优先选择签名有效、支持 Cowork 的官方 MSIX |
 | 只有官网 EXE/移动版 | 识别并报告其路径，保留原目录，另行安装官方 MSIX 供 Cowork 使用 |
+| Claude MSIX 位于非系统卷 | 移回 Windows 系统 AppX 默认位置 |
 | 已安装且健康 | 只补齐依赖并验证 |
 | `Claude.exe` 为 `HashMismatch` | 下载同版本/更新版本官方 MSIX，恢复官方核心文件 |
 | Virtual Machine Platform 未启用 | 自动启用，注册重启后继续 |

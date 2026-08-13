@@ -710,7 +710,7 @@ function Install-OfficialClaude {
         throw "官方 latest 包 ($($Download.Manifest.Version)) 低于已安装版本 ($($installed.Version))，拒绝降级。"
     }
 
-    Write-Log '正在安装/更新官方 Claude MSIX。' INFO
+    Write-Log "正在安装/更新官方 Claude MSIX；目标为 Windows 系统 AppX 默认路径：$($systemVolume.PackageStorePath)" INFO
     $parameters = @{
         Path = $Download.Path
         ForceApplicationShutdown = $true
@@ -841,7 +841,7 @@ function Repair-ExistingPackageVolume {
     $systemRoot = Get-VolumeRoot $systemVolume.PackageStorePath
     if ($paths.Package.InstallLocation.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)) { return }
 
-    Write-Log "Claude 位于非系统 AppX 卷：$($paths.Package.InstallLocation)" WARN
+    Write-Log "Claude 位于非官方默认系统 AppX 路径：$($paths.Package.InstallLocation)" WARN
     if (-not (Get-Command Move-AppxPackage -ErrorAction SilentlyContinue)) {
         throw '当前 Windows 版本不提供 Move-AppxPackage。请先备份本地 Cowork 会话，卸载 Claude，把默认 AppX 卷设为系统卷后再运行本脚本。'
     }
