@@ -22,6 +22,8 @@ $main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw -Encod
 $batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw -Encoding UTF8
 $legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Encoding UTF8
 $elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw -Encoding UTF8
+$zstdHelperPath = Join-Path $root 'VmZstdDecompress.js'
+$zstdHelper = Get-Content -LiteralPath $zstdHelperPath -Raw -Encoding UTF8
 $attributes = Get-Content -LiteralPath (Join-Path $root '.gitattributes') -Raw -Encoding UTF8
 $batchFiles = Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Extension -in @('.bat', '.cmd') }
 if ($attributes -notmatch '(?m)^\*\.bat text eol=crlf\r?$' -or $attributes -notmatch '(?m)^\*\.cmd text eol=crlf\r?$') {
@@ -68,6 +70,12 @@ $requiredSafetyChecks = @(
     'Get-VmCompressedCommitFailureNames'
     'Sync-VerifiedVmFile'
     'Sync-CompletedVmCompressedCache'
+    'Get-TrustedPortableNode'
+    'Test-TrustedNodeZstdRuntime'
+    'Expand-VerifiedVmCompressedCache'
+    'SHASUMS256.txt'
+    'OpenJS Foundation'
+    'VmZstdDecompress.js'
     'Repair-MsixVmCommitFailure'
     'Cowork VM bundle manifest.'
     'RuntimeChecksum'
@@ -95,6 +103,9 @@ if ($main -match 'AllowUnsigned') {
 }
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
+}
+foreach ($required in @('createZstdDecompress', 'CLAUDE_VM_ZST_SOURCE', 'CLAUDE_VM_RUNTIME_SHA256', "flags: 'wx'")) {
+    if (-not $zstdHelper.Contains($required)) { throw "VmZstdDecompress.js is missing: $required" }
 }
 if ($main -notmatch 'Move-Item -LiteralPath \$bundle -Destination \$backup') {
     throw 'Encrypted VM rebuild must use an in-volume rename to a unique backup.'
@@ -269,16 +280,18 @@ try {
         $fixtureAsar = Join-Path $manifestRoot 'app.asar'
         $sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
         $rootHash = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        $rootRuntimeHash = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
         $kernelHash = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
         $initrdHash = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
         $nextSha = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
-        $fixture = 'binary-prefix Cowork VM bundle manifest. fixture,versions:[{sha:`' + $sha + '`,publishedAt:`2026-08-14`,files:{unix:{x64:[]},win32:{arm64:[],x64:[{name:`rootfs.vhdx`,checksum:`' + $rootHash + '`,progressStart:0,progressEnd:80},{name:`vmlinuz`,checksum:`' + $kernelHash + '`,progressStart:80,progressEnd:90},{name:`initrd`,checksum:`' + $initrdHash + '`,progressStart:90,progressEnd:100}]}}},{sha:`' + $nextSha + '`,files:{}}] binary-suffix'
+        $fixture = 'binary-prefix Cowork VM bundle manifest. fixture,versions:[{sha:`' + $sha + '`,publishedAt:`2026-08-14`,files:{unix:{x64:[]},win32:{arm64:[],x64:[{name:`rootfs.vhdx`,checksum:`' + $rootHash + '`,rawChecksum:`' + $rootRuntimeHash + '`,progressStart:0,progressEnd:80},{name:`vmlinuz`,checksum:`' + $kernelHash + '`,progressStart:80,progressEnd:90},{name:`initrd`,checksum:`' + $initrdHash + '`,progressStart:90,progressEnd:100}]}}},{sha:`' + $nextSha + '`,files:{}}] binary-suffix'
         [IO.File]::WriteAllText($fixtureAsar, $fixture, (New-Object Text.UTF8Encoding($false)))
         $fixtureManifest = Get-OfficialVmManifest -AsarPath $fixtureAsar
         if ($fixtureManifest.Sha -ne $sha -or $fixtureManifest.Architecture -ne 'x64' -or $fixtureManifest.Files.Count -ne 3) {
             throw 'Official VM manifest fixture parsing failed.'
         }
-        if (($fixtureManifest.Files | Where-Object Name -eq 'rootfs.vhdx').RuntimeChecksum -ne $rootHash) {
+        if (($fixtureManifest.Files | Where-Object Name -eq 'rootfs.vhdx').RuntimeChecksum -ne $rootRuntimeHash -or
+            ($fixtureManifest.Files | Where-Object Name -eq 'vmlinuz').RuntimeChecksum) {
             throw 'Official VM runtime checksum parsing failed.'
         }
 
@@ -339,6 +352,34 @@ try {
         }
         if (-not $wrongPrefixRejected -or -not (Test-Path -LiteralPath $wrongPrefix)) {
             throw 'A compressed cache whose checksum prefix does not match the manifest must remain untouched.'
+        }
+
+        $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+        if ($nodeCommand) {
+            & $nodeCommand.Source --check $zstdHelperPath
+            if ($LASTEXITCODE -ne 0) { throw 'VmZstdDecompress.js failed node --check.' }
+            $zstdFixture = Join-Path $manifestRoot 'fixture.zst'
+            $zstdOutput = Join-Path $manifestRoot 'fixture.out'
+            $fixtureBytes = [Text.Encoding]::UTF8.GetBytes('official-zstd-runtime-fixture')
+            $fixtureHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($fixtureBytes)).Replace('-', '').ToLowerInvariant()
+            & $nodeCommand.Source -e "const fs=require('node:fs'),z=require('node:zlib');fs.writeFileSync(process.argv[1],z.zstdCompressSync(Buffer.from(process.argv[2])))" $zstdFixture 'official-zstd-runtime-fixture'
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to create the Node Zstd test fixture.' }
+            $oldZstdSource = $env:CLAUDE_VM_ZST_SOURCE
+            $oldZstdDestination = $env:CLAUDE_VM_ZST_DESTINATION
+            $oldZstdHash = $env:CLAUDE_VM_RUNTIME_SHA256
+            try {
+                $env:CLAUDE_VM_ZST_SOURCE = $zstdFixture
+                $env:CLAUDE_VM_ZST_DESTINATION = $zstdOutput
+                $env:CLAUDE_VM_RUNTIME_SHA256 = $fixtureHash
+                & $nodeCommand.Source $zstdHelperPath
+                if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath $zstdOutput -Algorithm SHA256).Hash.ToLowerInvariant() -ne $fixtureHash) {
+                    throw 'VmZstdDecompress.js did not produce the expected verified output.'
+                }
+            } finally {
+                $env:CLAUDE_VM_ZST_SOURCE = $oldZstdSource
+                $env:CLAUDE_VM_ZST_DESTINATION = $oldZstdDestination
+                $env:CLAUDE_VM_RUNTIME_SHA256 = $oldZstdHash
+            }
         }
     } finally {
         Remove-Item -LiteralPath $manifestRoot -Recurse -Force -ErrorAction SilentlyContinue

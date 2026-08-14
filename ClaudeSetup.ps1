@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.11'
+$script:ToolVersion = '1.0.12'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -553,11 +553,11 @@ function Get-OfficialVmManifest {
     )
     foreach ($match in $fileMatches) {
         $rawMatch = [regex]::Match($match.Groups['rest'].Value, 'rawChecksum:`(?<checksum>[0-9a-f]{64})`')
-        $runtimeChecksum = if ($rawMatch.Success) { $rawMatch.Groups['checksum'].Value } else { $match.Groups['checksum'].Value }
+        $runtimeChecksum = if ($rawMatch.Success) { $rawMatch.Groups['checksum'].Value.ToLowerInvariant() } else { $null }
         $files.Add([pscustomobject]@{
             Name = $match.Groups['name'].Value
             Checksum = $match.Groups['checksum'].Value.ToLowerInvariant()
-            RuntimeChecksum = $runtimeChecksum.ToLowerInvariant()
+            RuntimeChecksum = $runtimeChecksum
         })
     }
     if ($files.Count -eq 0) { throw '当前 VM manifest 的 Windows 文件列表为空。' }
@@ -705,8 +705,143 @@ function Sync-CompletedVmCompressedCache {
     foreach ($directory in $orderedDirectories) {
         [IO.File]::WriteAllText((Join-Path $directory ".$Name.zst.origin"), $BundleSha, $utf8NoBom)
     }
-    Write-Log "已接管 $Name 的完整下载缓存；Claude 将在解压后继续执行官方 SHA-256 校验。" OK
+    Write-Log "已接管 $Name 的完整下载缓存；下一步将完整核对官方 SHA-256 后独立解压。" OK
     return $true
+}
+
+function Test-TrustedNodeZstdRuntime {
+    param([Parameter(Mandatory)][string]$NodePath)
+    if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) { return $false }
+    $signature = Get-AuthenticodeSignature -LiteralPath $NodePath
+    $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
+    if ($signature.Status -ne 'Valid' -or $subject -notmatch 'OpenJS Foundation') { return $false }
+    try {
+        $probe = (& $NodePath -p "typeof require('node:zlib').createZstdDecompress" 2>$null | Select-Object -Last 1).Trim()
+        return $LASTEXITCODE -eq 0 -and $probe -eq 'function'
+    } catch {
+        return $false
+    }
+}
+
+function Get-TrustedPortableNode {
+    $existing = Get-Command node.exe -ErrorAction SilentlyContinue
+    if ($existing -and (Test-TrustedNodeZstdRuntime $existing.Source)) {
+        Write-Log "使用已安装且 OpenJS 签名有效的 Node.js：$($existing.Source)" INFO
+        return $existing.Source
+    }
+
+    $architecture = Get-NativeArchitecture
+    $nodeArchitecture = if ($architecture -eq 'arm64') { 'arm64' } else { 'x64' }
+    $baseUri = 'https://nodejs.org/download/release/latest-v24.x'
+    Write-Log '正在从 nodejs.org 获取官方 Node.js 24 便携运行时，用于本次 Zstandard 解压。' INFO
+    $sums = (Invoke-WebRequest -Uri "$baseUri/SHASUMS256.txt" -UseBasicParsing).Content
+    $match = [regex]::Match(
+        $sums,
+        "(?m)^(?<hash>[0-9a-f]{64})\s+\*?(?<file>node-v[0-9.]+-win-$nodeArchitecture\.zip)\s*$",
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if (-not $match.Success) { throw "Node.js 官方 SHASUMS256.txt 没有 win-$nodeArchitecture 便携包。" }
+
+    $fileName = $match.Groups['file'].Value
+    $expectedHash = $match.Groups['hash'].Value.ToLowerInvariant()
+    $zipPath = Join-Path $script:DownloadsRoot $fileName
+    if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedHash) {
+        Invoke-WebRequest -Uri "$baseUri/$fileName" -OutFile $zipPath -UseBasicParsing
+    }
+    $actualHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $expectedHash) {
+        Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        throw "Node.js 便携包 SHA-256 与官方 SHASUMS256.txt 不符：$fileName"
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $runtimeRoot = Join-Path $script:DownloadsRoot ([IO.Path]::GetFileNameWithoutExtension($fileName))
+    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+    $nodePath = Join-Path $runtimeRoot 'node.exe'
+    $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
+    try {
+        $entries = @($archive.Entries | Where-Object { $_.FullName -match '^[^/]+/node\.exe$' })
+        if ($entries.Count -ne 1) { throw 'Node.js 便携包中的 node.exe 数量异常。' }
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($entries[0], $nodePath, $true)
+    } finally {
+        $archive.Dispose()
+    }
+    if (-not (Test-TrustedNodeZstdRuntime $nodePath)) {
+        throw 'Node.js node.exe 的 OpenJS Foundation 数字签名或 Zstandard API 验证失败。'
+    }
+    Write-Log "Node.js 官方便携运行时验证通过：$fileName；SHA-256=$actualHash" OK
+    return $nodePath
+}
+
+function Expand-VerifiedVmCompressedCache {
+    param(
+        [Parameter(Mandatory)]$ManifestFile,
+        [Parameter(Mandatory)][string]$BundleSha,
+        [Parameter(Mandatory)][string[]]$BundleDirectories
+    )
+    $source = $null
+    foreach ($directory in $BundleDirectories) {
+        $cache = Join-Path $directory "$($ManifestFile.Name).zst"
+        $origin = Join-Path $directory ".$($ManifestFile.Name).zst.origin"
+        if ((Test-Path -LiteralPath $cache -PathType Leaf) -and (Test-Path -LiteralPath $origin -PathType Leaf) -and
+            ((Get-Content -LiteralPath $origin -Raw -ErrorAction SilentlyContinue).Trim() -eq $BundleSha) -and
+            (Test-FileExclusiveAccess $cache)) {
+            $item = Get-Item -LiteralPath $cache -Force
+            if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+                -not ($item.Attributes -band [IO.FileAttributes]::Encrypted)) {
+                $source = $cache
+                break
+            }
+        }
+    }
+    if (-not $source) { return $false }
+
+    Write-Log "正在完整校验 $($ManifestFile.Name).zst 与官方 manifest；大文件可能需要数分钟。" INFO
+    $archiveHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($archiveHash -ne $ManifestFile.Checksum.ToLowerInvariant()) {
+        Write-Log "压缩缓存 SHA-256 与官方 manifest 不一致，保留但拒绝解压：$source" WARN
+        return $false
+    }
+
+    $destination = Join-Path ([IO.Path]::GetDirectoryName($source)) "$($ManifestFile.Name).claude-setup.tmp"
+    if (Test-Path -LiteralPath $destination) {
+        $rejected = "$destination.rejected-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        Move-Item -LiteralPath $destination -Destination $rejected
+        Write-Log "无法证明上次中断的解压文件完整，已保留到：$rejected" WARN
+    }
+
+    $nodePath = Get-TrustedPortableNode
+    $helper = Join-Path $script:Root 'VmZstdDecompress.js'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) { throw "缺少 Zstandard 解压助手：$helper" }
+    $stdout = Join-Path $script:ReportsRoot "vm-zstd-$($ManifestFile.Name)-$(Get-Date -Format 'yyyyMMdd-HHmmss').stdout.log"
+    $stderr = Join-Path $script:ReportsRoot "vm-zstd-$($ManifestFile.Name)-$(Get-Date -Format 'yyyyMMdd-HHmmss').stderr.log"
+    $oldSource = $env:CLAUDE_VM_ZST_SOURCE
+    $oldDestination = $env:CLAUDE_VM_ZST_DESTINATION
+    $oldHash = $env:CLAUDE_VM_RUNTIME_SHA256
+    try {
+        $env:CLAUDE_VM_ZST_SOURCE = $source
+        $env:CLAUDE_VM_ZST_DESTINATION = $destination
+        $env:CLAUDE_VM_RUNTIME_SHA256 = if ($ManifestFile.RuntimeChecksum) { $ManifestFile.RuntimeChecksum } else { '' }
+        Write-Log "正在解压 $($ManifestFile.Name) 并计算输出 SHA-256；大文件可能需要数分钟。" INFO
+        $process = Start-Process -FilePath $nodePath -ArgumentList ('"{0}"' -f $helper) -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        if ($process.ExitCode -ne 0) {
+            $detail = if (Test-Path -LiteralPath $stderr) { (Get-Content -LiteralPath $stderr -Tail 20) -join ' ' } else { '' }
+            throw "Zstandard 解压或完整性校验失败（退出码 $($process.ExitCode)）：$detail"
+        }
+    } finally {
+        $env:CLAUDE_VM_ZST_SOURCE = $oldSource
+        $env:CLAUDE_VM_ZST_DESTINATION = $oldDestination
+        $env:CLAUDE_VM_RUNTIME_SHA256 = $oldHash
+    }
+    $resultText = (Get-Content -LiteralPath $stdout -Raw -ErrorAction Stop).Trim()
+    try { $result = $resultText | ConvertFrom-Json } catch { throw "Zstandard 解压助手没有返回有效结果：$resultText" }
+    if (-not $result.ok -or [string]$result.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'Zstandard 解压助手结果缺少有效输出 SHA-256。' }
+    $outputHash = ([string]$result.sha256).ToLowerInvariant()
+    if ($ManifestFile.RuntimeChecksum -and $outputHash -ne $ManifestFile.RuntimeChecksum.ToLowerInvariant()) {
+        throw "解压输出 SHA-256 与官方 rawChecksum 不一致：$outputHash"
+    }
+    return Sync-VerifiedVmFile -SourcePath $destination -Name $ManifestFile.Name -ExpectedHash $outputHash -BundleSha $BundleSha -BundleDirectories $BundleDirectories
 }
 
 function Sync-VerifiedVmFile {
@@ -731,7 +866,8 @@ function Sync-VerifiedVmFile {
     if (-not ($allowedDirectories | Where-Object { $_.Equals($sourceDirectory, [StringComparison]::OrdinalIgnoreCase) })) {
         throw "VM 临时文件不属于 Claude 的候选 bundle：$source"
     }
-    if ((Split-Path -Leaf $source) -notin @($Name, "$Name.tmp")) { throw "VM 临时文件名不符合预期：$source" }
+    $sourceLeaf = Split-Path -Leaf $source
+    if ($sourceLeaf -notin @($Name, "$Name.tmp", "$Name.claude-setup.tmp")) { throw "VM 临时文件名不符合预期：$source" }
 
     $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($sourceHash -ne $ExpectedHash.ToLowerInvariant()) {
@@ -757,7 +893,8 @@ function Sync-VerifiedVmFile {
             if ($finalHash -ne $ExpectedHash.ToLowerInvariant()) {
                 throw "目标 VM 文件已存在但校验值不同，拒绝覆盖：$final"
             }
-        } elseif ($source.Equals((Join-Path $directory "$Name.tmp"), [StringComparison]::OrdinalIgnoreCase)) {
+        } elseif ($sourceDirectory.Equals($directory, [StringComparison]::OrdinalIgnoreCase) -and
+            $sourceLeaf -in @("$Name.tmp", "$Name.claude-setup.tmp")) {
             Move-Item -LiteralPath $source -Destination $final
             $verifiedFinal = $final
         } else {
@@ -823,12 +960,16 @@ function Repair-MsixVmCommitFailure {
             if ($script:VmCommitAttempted.ContainsKey($attemptKey)) { continue }
             $script:VmCommitAttempted[$attemptKey] = $true
 
-            Write-Log "检测到 MSIX 无法提交 $($file.Name) 压缩缓存，将核对当前 manifest 后接管；解压结果仍由 Claude 做完整校验。" WARN
+            Write-Log "检测到 MSIX 无法提交 $($file.Name) 压缩缓存，将按当前官方 manifest 完整校验并独立解压。" WARN
             Stop-ClaudeProcesses
             Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+            $cachePromoted = $false
             $promoted = $false
             try {
-                $promoted = Sync-CompletedVmCompressedCache -SourcePath $source -Name $file.Name -ManifestChecksum $file.Checksum -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
+                $cachePromoted = Sync-CompletedVmCompressedCache -SourcePath $source -Name $file.Name -ManifestChecksum $file.Checksum -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
+                if ($cachePromoted) {
+                    $promoted = Expand-VerifiedVmCompressedCache -ManifestFile $file -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
+                }
             } finally {
                 Start-CoworkServices
                 if (-not $promoted) { Start-ClaudeAppx }
@@ -847,6 +988,7 @@ function Repair-MsixVmCommitFailure {
         }
 
         foreach ($source in @($sources | Select-Object -Unique)) {
+            if (-not $file.RuntimeChecksum) { continue }
             $item = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
             if (-not $item -or -not (Test-FileExclusiveAccess $source)) { continue }
             $attemptKey = "$source|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
@@ -1169,7 +1311,7 @@ function Invoke-Diagnostics {
         $compressedCommitFailures = Get-VmCompressedCommitFailureNames
         $allCommitFailures = @(@($commitFailures) + @($compressedCommitFailures) | Select-Object -Unique)
         if ($allCommitFailures.Count -gt 0) {
-            Add-Finding 'msix-vm-commit' 'Warning' "检测到 MSIX VM 临时文件或压缩缓存落盘失败：$($allCommitFailures -join ', ')" 'Auto 模式会核对官方 manifest；运行文件必须完整匹配 SHA-256，压缩缓存的解压结果仍由 Claude 完整校验。'
+            Add-Finding 'msix-vm-commit' 'Warning' "检测到 MSIX VM 临时文件或压缩缓存落盘失败：$($allCommitFailures -join ', ')" 'Auto 模式会核对官方 manifest；完整验证压缩缓存后独立解压，并在发布前再次校验输出未变化。'
         }
     } else {
         if ($selectedInstallation) {

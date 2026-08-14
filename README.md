@@ -80,7 +80,9 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 5. 重启后启动官方 Claude。请进入 Cowork，让官方客户端下载并创建新的 `rootfs.vhdx` 与 `sessiondata.vhdx`；
 6. 只有新 bundle 文件齐全、运行文件未加密且 Cowork 健康检查通过，脚本才结束重建状态。
 
-若官方 Claude 因 MSIX 文件系统虚拟化无法提交下载缓存或运行文件，脚本会停止 Claude 冻结文件，并从刚下载且 Anthropic 签名有效的 MSIX 中读取当前 VM manifest。压缩缓存必须匹配当前文件名、bundle 版本和12位校验前缀；转正后仍由 Claude 解压并执行完整 SHA-256。运行文件则必须由脚本重新计算并完全匹配 manifest SHA-256，才会原子转正、写入对应 `.origin` 并同步两条官方数据路径；不匹配文件原样保留且不会发布。随后脚本重新启动 Claude，继续处理下一个官方 VM 文件。该流程不会修改 `Claude.exe` 或 `app.asar`。
+若官方 Claude 因 MSIX 文件系统虚拟化无法提交下载缓存或运行文件，脚本会停止 Claude 冻结文件，并从刚下载且 Anthropic 签名有效的 MSIX 中读取当前 VM manifest。压缩缓存必须匹配当前文件名、bundle版本和12位校验前缀，转正后还必须完整匹配 manifest 中的压缩包 SHA-256。若 manifest 提供 `rawChecksum`，解压输出也必须匹配；否则安全根建立在已完整校验的官方压缩流与 Zstandard帧完整性之上，脚本记录输出 SHA-256并在发布前再次复核文件未变化。随后才会原子转正、写入对应 `.origin`、同步两条官方数据路径并重新启动 Claude。该流程不会修改 `Claude.exe` 或 `app.asar`。
+
+若 Claude 会在提交失败后立即删除解压出的 `.tmp`，脚本会临时使用 Node.js 官方24系便携包的内置 Zstandard API自行解压。Node ZIP必须匹配 nodejs.org 官方 `SHASUMS256.txt`，其中 `node.exe` 必须具有有效的 OpenJS Foundation Authenticode签名；运行时不安装、不加入 PATH、不常驻。
 
 加密备份永远不会由脚本自动删除。确认 Cowork 长期正常后，用户可以自行处理备份。
 

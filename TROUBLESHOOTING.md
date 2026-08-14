@@ -35,7 +35,9 @@
 
 这表示新版 Claude 已在 `rename` 失败后尝试 `copyFile`，但 Windows MSIX 虚拟化仍阻止压缩缓存或解压后运行文件的最终提交。它不是下载速度、C 盘空间或 EFS 的同义错误。
 
-Auto 模式会检查 package LocalCache 与真实 `%APPDATA%` 两个 bundle 目录，读取近期 Cowork 日志，并从本轮已验证 Anthropic 数字签名的官方 MSIX 中解析当前 VM manifest。`.zst.<12位校验前缀>.partial` 只有在文件名、前缀和 bundle 版本匹配时才转正，之后 Claude 必须对解压结果完成完整 SHA-256 校验；`.tmp` 运行文件则由脚本先计算完整 SHA-256，完全一致才会转正。仍被写入、带 EFS、位于重解析点或校验不一致的文件一律不处理。旧的加密 bundle 备份不会删除。
+Auto 模式会检查 package LocalCache 与真实 `%APPDATA%` 两个 bundle 目录，读取近期 Cowork 日志，并从本轮已验证 Anthropic 数字签名的官方 MSIX 中解析当前 VM manifest。`.zst.<12位校验前缀>.partial` 先核对文件名、前缀和 bundle 版本，转正后再计算整个压缩缓存的 SHA-256并与 manifest比较。仍被写入、带 EFS、位于重解析点或校验不一致的文件一律不处理。旧的加密 bundle 备份不会删除。
+
+在缓存解压分支中，Claude 会在提交失败后的 `finally` 中立即删除 `rootfs.vhdx.tmp`，普通轮询无法接管。此时脚本使用 nodejs.org 官方 Node.js 24 便携包内置的 `createZstdDecompress()` 直接解压已完整校验的缓存；ZIP需通过官方 `SHASUMS256.txt`，`node.exe` 还需通过 OpenJS Foundation Authenticode签名。若 manifest 提供 `rawChecksum`，输出必须匹配；未提供时，脚本记录解压输出 SHA-256并在发布前再次计算确认文件未变化。
 
 相关上游问题：[anthropics/claude-code#36642](https://github.com/anthropics/claude-code/issues/36642)、[#51384](https://github.com/anthropics/claude-code/issues/51384)、[#66778](https://github.com/anthropics/claude-code/issues/66778)。
 
