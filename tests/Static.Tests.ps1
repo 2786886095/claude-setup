@@ -70,6 +70,7 @@ $requiredSafetyChecks = @(
     'Get-VmCompressedCommitFailureNames'
     'Sync-VerifiedVmFile'
     'Sync-CompletedVmCompressedCache'
+    'Wait-FileExclusiveAccess'
     'Get-TrustedPortableNode'
     'Test-TrustedNodeZstdRuntime'
     'Expand-VerifiedVmCompressedCache'
@@ -103,6 +104,9 @@ if ($main -match 'AllowUnsigned') {
 }
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
+}
+if ($main -notmatch '(?s)检测到 MSIX 无法提交.*?Stop-ClaudeProcesses.*?Wait-FileExclusiveAccess.*?Get-FileHash.*?file\.Checksum.*?Sync-CompletedVmCompressedCache') {
+    throw 'MSIX compressed-cache repair must stop Claude, obtain exclusive access, and verify the complete hash before promotion.'
 }
 foreach ($required in @('createZstdDecompress', 'CLAUDE_VM_ZST_SOURCE', 'CLAUDE_VM_RUNTIME_SHA256', "flags: 'wx'")) {
     if (-not $zstdHelper.Contains($required)) { throw "VmZstdDecompress.js is missing: $required" }

@@ -39,6 +39,8 @@ Auto 模式会检查 package LocalCache 与真实 `%APPDATA%` 两个 bundle 目�
 
 在缓存解压分支中，Claude 会在提交失败后的 `finally` 中立即删除 `rootfs.vhdx.tmp`，普通轮询无法接管。此时脚本使用 nodejs.org 官方 Node.js 24 便携包内置的 `createZstdDecompress()` 直接解压已完整校验的缓存；ZIP需通过官方 `SHASUMS256.txt`，`node.exe` 还需通过 OpenJS Foundation Authenticode签名。若 manifest 提供 `rawChecksum`，输出必须匹配；未提供时，脚本记录解压输出 SHA-256并在发布前再次计算确认文件未变化。
 
+若诊断清单能看到完整的 `.zst.<12位前缀>.partial`，但 Auto 模式仍只显示“等待重建”，通常是 Claude 仍持有该文件句柄。脚本会先依据当前 manifest 与错误日志锁定精确候选，再停止 Claude 和 Cowork 服务、等待句柄释放，之后才读取和校验文件；不会把仍在写入的文件直接发布。
+
 相关上游问题：[anthropics/claude-code#36642](https://github.com/anthropics/claude-code/issues/36642)、[#51384](https://github.com/anthropics/claude-code/issues/51384)、[#66778](https://github.com/anthropics/claude-code/issues/66778)。
 
 ## `CoworkVMService` 不存在

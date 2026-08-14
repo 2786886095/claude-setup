@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.12'
+$script:ToolVersion = '1.0.13'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -596,6 +596,19 @@ function Test-FileExclusiveAccess {
     }
 }
 
+function Wait-FileExclusiveAccess {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$Seconds = 15
+    )
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    do {
+        if (Test-FileExclusiveAccess $Path) { return $true }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    return Test-FileExclusiveAccess $Path
+}
+
 function Get-VmCommitFailureNames {
     $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $logs = @(
@@ -955,17 +968,27 @@ function Repair-MsixVmCommitFailure {
         }
         foreach ($source in @($compressedSources | Select-Object -Unique)) {
             $item = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
-            if (-not $item -or -not (Test-FileExclusiveAccess $source)) { continue }
+            if (-not $item) { continue }
             $attemptKey = "compressed|$source|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
             if ($script:VmCommitAttempted.ContainsKey($attemptKey)) { continue }
             $script:VmCommitAttempted[$attemptKey] = $true
 
-            Write-Log "检测到 MSIX 无法提交 $($file.Name) 压缩缓存，将按当前官方 manifest 完整校验并独立解压。" WARN
+            Write-Log "检测到 MSIX 无法提交 $($file.Name) 压缩缓存；将先停止 Claude 释放文件句柄，再按当前官方 manifest 完整校验并独立解压。" WARN
             Stop-ClaudeProcesses
             Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
             $cachePromoted = $false
             $promoted = $false
             try {
+                if (-not (Wait-FileExclusiveAccess -Path $source -Seconds 15)) {
+                    Write-Log "停止 Claude/Cowork 后仍无法独占读取 VM 压缩缓存，暂不接管：$source" WARN
+                    continue
+                }
+                Write-Log "正在验证候选 $($file.Name).zst 的完整 SHA-256；大文件可能需要数分钟。" INFO
+                $candidateHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($candidateHash -ne $file.Checksum.ToLowerInvariant()) {
+                    Write-Log "候选压缩缓存尚未完整或与当前官方 manifest 不符，保留原文件并让 Claude 继续：$source" WARN
+                    continue
+                }
                 $cachePromoted = Sync-CompletedVmCompressedCache -SourcePath $source -Name $file.Name -ManifestChecksum $file.Checksum -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
                 if ($cachePromoted) {
                     $promoted = Expand-VerifiedVmCompressedCache -ManifestFile $file -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
@@ -990,7 +1013,7 @@ function Repair-MsixVmCommitFailure {
         foreach ($source in @($sources | Select-Object -Unique)) {
             if (-not $file.RuntimeChecksum) { continue }
             $item = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
-            if (-not $item -or -not (Test-FileExclusiveAccess $source)) { continue }
+            if (-not $item) { continue }
             $attemptKey = "$source|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
             if ($script:VmCommitAttempted.ContainsKey($attemptKey)) { continue }
             $script:VmCommitAttempted[$attemptKey] = $true
@@ -1000,6 +1023,10 @@ function Repair-MsixVmCommitFailure {
             Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
             $promoted = $false
             try {
+                if (-not (Wait-FileExclusiveAccess -Path $source -Seconds 15)) {
+                    Write-Log "停止 Claude/Cowork 后仍无法独占读取 VM 临时文件，暂不接管：$source" WARN
+                    continue
+                }
                 $promoted = Sync-VerifiedVmFile -SourcePath $source -Name $file.Name -ExpectedHash $file.RuntimeChecksum -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
             } finally {
                 Start-CoworkServices
