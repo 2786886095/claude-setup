@@ -11,6 +11,8 @@
 
 普通 EXE 或移动版不会被直接修改，也不会被误认为能提供 Cowork 服务；脚本会保留它们，并安装官方 MSIX。
 
+如果 AppX 注册仍存在，但默认系统路径或 `Claude.exe/resources/app.asar` 缺失，工具会把它识别为半损坏安装。支持时使用 `Remove-AppxPackage -PreserveApplicationData` 保留应用数据，再从官方 MSIX 重新注册并安装。
+
 ## `RPC pipe closed`
 
 优先检查 `Claude.exe` 的 Authenticode 签名。若状态为 `HashMismatch`，通常是主程序或 `app.asar` 被第三方补丁修改。脚本会下载 Anthropic 官方 MSIX，验证签名与包身份，并恢复官方版本。

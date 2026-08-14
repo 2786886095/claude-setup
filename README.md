@@ -53,6 +53,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 | 情况 | 行为 |
 |---|---|
 | 未安装 Claude | 下载并验证官方 MSIX，然后安装 |
+| 默认 AppX 路径不存在/核心文件缺失 | 自动下载官方 MSIX；必要时保留应用数据后重新注册并安装 |
 | 已有多个 Claude | 自动优先选择签名有效、支持 Cowork 的官方 MSIX |
 | 只有官网 EXE/移动版 | 识别并报告其路径，保留原目录，另行安装官方 MSIX 供 Cowork 使用 |
 | Claude MSIX 位于非系统卷 | 移回 Windows 系统 AppX 默认位置 |

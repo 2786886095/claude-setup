@@ -319,6 +319,19 @@ function Get-ClaudePackage {
     return $null
 }
 
+function Test-ClaudeDefaultInstallationReady {
+    param($Package = (Get-ClaudePackage))
+    if (-not $Package -or -not $Package.InstallLocation) { return $false }
+    $systemVolume = Get-AppxSystemVolume
+    if (-not $systemVolume) { return $false }
+    $systemRoot = Get-VolumeRoot $systemVolume.PackageStorePath
+    if (-not $Package.InstallLocation.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $exe = Join-Path $Package.InstallLocation 'app\Claude.exe'
+    $asar = Join-Path $Package.InstallLocation 'app\resources\app.asar'
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or -not (Test-Path -LiteralPath $asar -PathType Leaf)) { return $false }
+    return (Test-AnthropicSignature $exe).Valid
+}
+
 function Get-ClaudePaths {
     $package = Get-ClaudePackage
     if (-not $package) { return $null }
@@ -704,12 +717,31 @@ function Install-OfficialClaude {
     param([Parameter(Mandatory)]$Download)
     $systemVolume = Get-AppxSystemVolume
     $installed = Get-ClaudePackage
+    $registeredPackage = Get-AppxPackage -Name $script:PackageName -ErrorAction SilentlyContinue |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
     Stop-ClaudeProcesses
 
-    if ($installed -and [version]$Download.Manifest.Version -lt [version]$installed.Version) {
-        throw "官方 latest 包 ($($Download.Manifest.Version)) 低于已安装版本 ($($installed.Version))，拒绝降级。"
+    $versionReference = if ($installed) { $installed } else { $registeredPackage }
+    if ($versionReference -and [version]$Download.Manifest.Version -lt [version]$versionReference.Version) {
+        throw "官方 latest 包 ($($Download.Manifest.Version)) 低于已注册版本 ($($versionReference.Version))，拒绝降级。"
     }
 
+    $registeredCorePresent = $false
+    if ($registeredPackage -and $registeredPackage.InstallLocation) {
+        $registeredCorePresent = (Test-Path -LiteralPath (Join-Path $registeredPackage.InstallLocation 'app\Claude.exe') -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $registeredPackage.InstallLocation 'app\resources\app.asar') -PathType Leaf)
+    }
+    if ($registeredPackage -and -not $registeredCorePresent) {
+        Write-Log '发现 AppX 注册残留，但默认目录或核心文件缺失；保留应用数据后重新安装。' WARN
+        Remove-AppxPackage -Package $registeredPackage.PackageFullName -PreserveApplicationData
+        $script:InstallationCandidateCache = $null
+        $registeredPackage = $null
+    }
+
+    if (-not (Test-ClaudeDefaultInstallationReady $registeredPackage)) {
+        Write-Log '默认系统 AppX 路径中没有可用的官方 Claude，触发自动安装/修复。' WARN
+    }
     Write-Log "正在安装/更新官方 Claude MSIX；目标为 Windows 系统 AppX 默认路径：$($systemVolume.PackageStorePath)" INFO
     $parameters = @{
         Path = $Download.Path
@@ -817,6 +849,10 @@ function Restore-OfficialCoreFilesFromMsix {
 }
 
 function Repair-ClaudePackageAndSignature {
+    $readyBeforeRepair = Test-ClaudeDefaultInstallationReady
+    if (-not $readyBeforeRepair) {
+        Write-Log '未在官方默认系统 AppX 路径检测到健康 Claude，将自动下载安装。' WARN
+    }
     $download = Download-OfficialClaude
     Install-OfficialClaude -Download $download
     $paths = Get-ClaudePaths

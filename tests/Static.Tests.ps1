@@ -32,6 +32,8 @@ $requiredSafetyChecks = @(
     'SupportCompressedVolumes'
     'Get-ClaudeInstallationCandidates'
     'Select-ClaudeInstallation'
+    'Test-ClaudeDefaultInstallationReady'
+    'PreserveApplicationData'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -90,6 +92,17 @@ try {
     $selectedMock = Select-ClaudeInstallation $mockCandidates
     if ($selectedMock.Path -ne 'C:\Fake\ValidCoworkMsix\Claude.exe') {
         throw "A signed Cowork MSIX must outrank newer/broken EXE installs: $($selectedMock.Path)"
+    }
+
+    if (Test-ClaudeDefaultInstallationReady $null) {
+        throw 'No registered MSIX must be treated as requiring automatic installation.'
+    }
+    $missingPackage = [pscustomobject]@{
+        InstallLocation = 'Z:\PathThatDoesNotExist\Claude'
+        PackageFullName = 'Claude_missing_x64__pzs8sxrjxfjjc'
+    }
+    if (Test-ClaudeDefaultInstallationReady $missingPackage) {
+        throw 'A missing default installation path must require automatic installation.'
     }
 
     $currentCandidates = @(Get-ClaudeInstallationCandidates)
