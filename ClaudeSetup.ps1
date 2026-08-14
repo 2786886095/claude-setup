@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.13'
+$script:ToolVersion = '1.0.14'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -36,6 +36,7 @@ $script:InstallationCandidateCache = $null
 $script:VmCommitAttempted = @{}
 $script:VmManifestCache = $null
 $script:OfficialMsixPath = $null
+$script:AppxProtectionLogEmitted = $false
 
 function Write-Log {
     param(
@@ -407,6 +408,79 @@ function Test-EncryptedPath {
     return [bool]((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::Encrypted)
 }
 
+function Get-AppxProtectedVmEvidence {
+    param(
+        [string]$BundlePath,
+        [string[]]$NodeLogPaths,
+        [string]$ServiceLogPath
+    )
+    if (-not $BundlePath) {
+        $paths = Get-ClaudePaths
+        if (-not $paths) {
+            return [pscustomobject]@{ Suspected = $false; ExplicitAppxError = $false; SessionDiskError = $false; EncryptedCount = 0; CopyfileUnknown = $false; Reasons = @() }
+        }
+        $BundlePath = Join-Path $paths.LocalUserData 'vm_bundles\claudevm.bundle'
+    }
+    if (-not $NodeLogPaths) {
+        $NodeLogPaths = @(
+            (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
+            (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log')
+        )
+    }
+    if (-not $ServiceLogPath) { $ServiceLogPath = 'C:\ProgramData\Claude\Logs\cowork-service.log' }
+
+    $encryptedCount = 0
+    if (Test-Path -LiteralPath $BundlePath) {
+        $encryptedCount = @(Get-ChildItem -LiteralPath $BundlePath -Force -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted }).Count
+        if (Test-EncryptedPath $BundlePath) { $encryptedCount++ }
+        $parent = Split-Path -Parent $BundlePath
+        if (Test-EncryptedPath $parent) { $encryptedCount++ }
+    }
+
+    $nodeText = @($NodeLogPaths | ForEach-Object {
+        if (Test-Path -LiteralPath $_ -PathType Leaf) { (Get-Content -LiteralPath $_ -Tail 1200 -ErrorAction SilentlyContinue) -join "`n" }
+    }) -join "`n"
+    $serviceText = if (Test-Path -LiteralPath $ServiceLogPath -PathType Leaf) {
+        (Get-Content -LiteralPath $ServiceLogPath -Tail 600 -ErrorAction SilentlyContinue) -join "`n"
+    } else { '' }
+    $combined = "$nodeText`n$serviceText"
+    $explicitAppxError = [bool]($combined -match '(?i)(ERROR_APPX_FILE_NOT_ENCRYPTED|APPX file.+not encrypted|Win32\s+409|\b0x0*199\b)')
+    $sessionDiskError = [bool]($serviceText -match '(?i)CreateVirtualDisk failed:\s*0x0*199')
+    $copyfileUnknown = [bool]($nodeText -match "(?i)UNKNOWN: unknown error, copyfile '.+\\vm_bundles\\claudevm\.bundle\\")
+    $isPackagePrivate = $BundlePath -match '(?i)\\AppData\\Local\\Packages\\Claude_[^\\]+\\LocalCache\\'
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if ($encryptedCount -gt 0 -and $isPackagePrivate) { $reasons.Add("包私有 VM 路径有 $encryptedCount 个 Encrypted(0x4000) 项") }
+    if ($explicitAppxError) { $reasons.Add('日志命中 ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)') }
+    if ($sessionDiskError) { $reasons.Add('Cowork 服务创建 sessiondata.vhdx 时返回 0x199') }
+    if ($copyfileUnknown) { $reasons.Add('包私有 VM 路径出现 UNKNOWN copyfile 提交失败') }
+    return [pscustomobject]@{
+        Suspected = [bool](($encryptedCount -gt 0 -and $isPackagePrivate) -or $explicitAppxError -or $copyfileUnknown)
+        ExplicitAppxError = $explicitAppxError
+        SessionDiskError = $sessionDiskError
+        EncryptedCount = $encryptedCount
+        CopyfileUnknown = $copyfileUnknown
+        Reasons = $reasons.ToArray()
+    }
+}
+
+function Get-VmRebuildProtectionEvidence {
+    param([Parameter(Mandatory)]$State)
+    $results = @()
+    foreach ($path in @([string]$State.OriginalPath, [string]$State.BackupPath) | Select-Object -Unique) {
+        if ($path) { $results += Get-AppxProtectedVmEvidence -BundlePath $path }
+    }
+    $reasons = @($results | ForEach-Object { $_.Reasons } | Select-Object -Unique)
+    return [pscustomobject]@{
+        Suspected = [bool]($results | Where-Object Suspected)
+        ExplicitAppxError = [bool]($results | Where-Object ExplicitAppxError)
+        SessionDiskError = [bool]($results | Where-Object SessionDiskError)
+        EncryptedCount = [int](($results | Measure-Object -Property EncryptedCount -Sum).Sum)
+        CopyfileUnknown = [bool]($results | Where-Object CopyfileUnknown)
+        Reasons = $reasons
+    }
+}
+
 function Invoke-EfsDecrypt {
     param([Parameter(Mandatory)][string]$Path)
     if (-not ('ClaudeSetup.NativeEfs' -as [type])) {
@@ -485,7 +559,7 @@ function Get-VmBundleStatus {
         if (Test-EncryptedPath $BundlePath) { $encrypted += Get-Item -LiteralPath $BundlePath -Force }
     }
     return [pscustomobject]@{
-        Ready = (Test-Path -LiteralPath $BundlePath) -and $missing.Count -eq 0 -and $encrypted.Count -eq 0 -and -not (Test-ReparsePoint $BundlePath)
+        Ready = (Test-Path -LiteralPath $BundlePath) -and $missing.Count -eq 0 -and -not (Test-ReparsePoint $BundlePath)
         Missing = $missing
         Encrypted = $encrypted
         ReparsePoint = Test-ReparsePoint $BundlePath
@@ -939,6 +1013,14 @@ function Sync-VerifiedVmFile {
 
 function Repair-MsixVmCommitFailure {
     param([Parameter(Mandatory)]$State)
+    $protection = Get-VmRebuildProtectionEvidence -State $State
+    if ($protection.Suspected) {
+        if (-not $script:AppxProtectionLogEmitted) {
+            Write-Log "检测到 AppX 应用受保护存储证据：$($protection.Reasons -join '；')。为避免生成 409 拒读的明文文件，已禁用外部写入/解压接管。" ERROR
+            $script:AppxProtectionLogEmitted = $true
+        }
+        return $false
+    }
     $manifest = Get-OfficialVmManifest
     $bundleDirectories = @(Get-VmBundleCandidateDirectories)
     if ($bundleDirectories.Count -eq 0) { return $false }
@@ -975,7 +1057,7 @@ function Repair-MsixVmCommitFailure {
 
             Write-Log "检测到 MSIX 无法提交 $($file.Name) 压缩缓存；将先停止 Claude 释放文件句柄，再按当前官方 manifest 完整校验并独立解压。" WARN
             Stop-ClaudeProcesses
-            Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+            Stop-CoworkVmServiceAndWait
             $cachePromoted = $false
             $promoted = $false
             try {
@@ -1020,7 +1102,7 @@ function Repair-MsixVmCommitFailure {
 
             Write-Log "检测到 MSIX 已校验但未能落盘的 $($file.Name)，将按官方 manifest 复核后接管。" WARN
             Stop-ClaudeProcesses
-            Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+            Stop-CoworkVmServiceAndWait
             $promoted = $false
             try {
                 if (-not (Wait-FileExclusiveAccess -Path $source -Seconds 15)) {
@@ -1048,6 +1130,10 @@ function Start-SafeVmBundleRebuild {
     if ((Test-ReparsePoint $vmBundles) -or (Test-ReparsePoint $bundle)) {
         throw 'vm_bundles 或 claudevm.bundle 是重解析点；为避免移动错误目标，拒绝自动重建。'
     }
+    $protection = Get-AppxProtectedVmEvidence -BundlePath $bundle
+    if ($protection.Suspected) {
+        throw "VM bundle 命中 AppX 应用受保护存储证据，禁止自动备份/重建：$($protection.Reasons -join '；')"
+    }
     if (Test-EncryptedPath $vmBundles) {
         throw 'vm_bundles 父目录会让新文件继续继承加密；拒绝在该目录中自动重建。'
     }
@@ -1063,13 +1149,7 @@ function Start-SafeVmBundleRebuild {
     }
 
     Stop-ClaudeProcesses
-    Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
-    $service = Get-Service CoworkVMService -ErrorAction SilentlyContinue
-    if ($service) {
-        $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(20))
-        $service.Refresh()
-        if ($service.Status -ne 'Stopped') { throw 'CoworkVMService 未能停止，拒绝移动 VM bundle。' }
-    }
+    Stop-CoworkVmServiceAndWait
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $backup = Join-Path $vmBundles "claudevm.bundle.backup-$stamp"
@@ -1124,9 +1204,19 @@ function Wait-ForRebuiltVmBundle {
         [int]$Seconds = 1200
     )
     Write-Log '请在已启动的 Claude 中进入 Cowork；脚本等待并修复 MSIX VM 落盘问题，最长 20 分钟。' WARN
+    $initialProtection = Get-VmRebuildProtectionEvidence -State $State
+    if ($initialProtection.Suspected) {
+        Write-Log "检测到 AppX 应用受保护存储；本工具不会继续重建或向 bundle 写文件：$($initialProtection.Reasons -join '；')" ERROR
+        return $false
+    }
     $deadline = (Get-Date).AddSeconds($Seconds)
     $nextProgress = Get-Date
     while ((Get-Date) -lt $deadline) {
+        $protection = Get-VmRebuildProtectionEvidence -State $State
+        if ($protection.Suspected) {
+            Write-Log "等待期间命中 AppX 应用受保护存储，立即停止外部修复：$($protection.Reasons -join '；')" ERROR
+            return $false
+        }
         $status = Get-VmBundleStatus -BundlePath $State.OriginalPath
         if ($status.Ready) { return $true }
         if (Repair-MsixVmCommitFailure -State $State) {
@@ -1174,6 +1264,8 @@ function Get-RecentCoworkErrors {
         'FILE_ENCRYPTED',
         'EXDEV',
         'UNKNOWN: unknown error, copyfile',
+        'CreateVirtualDisk failed: 0x199',
+        'ERROR_APPX_FILE_NOT_ENCRYPTED',
         'rootfs.vhdx.tmp',
         'API reachability',
         'VM service not running',
@@ -1290,6 +1382,17 @@ function Invoke-Diagnostics {
         else { Add-Finding 'signature' 'Fail' "Claude.exe 签名无效：$($signature.Status)" '完整汉化修改主程序后会导致 Cowork 主动关闭 RPC 管道。' }
 
         $bundle = Join-Path $paths.LocalUserData 'vm_bundles\claudevm.bundle'
+        $appxProtection = Get-AppxProtectedVmEvidence -BundlePath $bundle
+        $sessionDiskPresent = Test-Path -LiteralPath (Join-Path $bundle 'sessiondata.vhdx') -PathType Leaf
+        if ($appxProtection.SessionDiskError -and -not $sessionDiskPresent) {
+            Add-Finding 'appx-session-vhdx' 'Fail' 'Cowork 创建 sessiondata.vhdx 时返回 ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)' '这是 AppX 应用受保护存储与当前 Cowork VHD 创建路径的不兼容证据；本工具不会解密、移动或外部写入 bundle。请向 Anthropic 提交 cowork-service.log。'
+        } elseif ($appxProtection.SessionDiskError) {
+            Add-Finding 'appx-session-vhdx-history' 'Info' '历史日志含 CreateVirtualDisk 0x199，但当前 sessiondata.vhdx 已存在' '保留历史证据；以本轮 Cowork 健康检查为准。'
+        } elseif ($appxProtection.ExplicitAppxError) {
+            Add-Finding 'appx-protected-storage' 'Fail' '日志命中 ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)' ($appxProtection.Reasons -join "`r`n")
+        } elseif ($appxProtection.Suspected) {
+            Add-Finding 'appx-protected-storage' 'Warning' '检测到 AppX 应用受保护存储迹象；已禁用自动 EFS/重建/外部写入修复' ($appxProtection.Reasons -join "`r`n")
+        }
         if (Test-ReparsePoint (Split-Path -Parent $bundle)) { Add-Finding 'vm-reparse' 'Fail' 'vm_bundles 是重解析点/联接' 'HCS 挂载 VHDX 时可能无法解析联接。' }
         elseif (Test-Path -LiteralPath $bundle) { Add-Finding 'vm-reparse' 'Pass' 'vm_bundles 不是重解析点' }
 
@@ -1302,7 +1405,7 @@ function Invoke-Diagnostics {
             $nonRuntimeEncryptedFiles = @($allEncryptedVmFiles | Where-Object { -not (Test-VmRuntimeEfsItem $_) })
         }
         if ((Test-EncryptedPath $bundle) -or $encryptedVmFiles.Count -gt 0) {
-            Add-Finding 'vm-encryption' 'Fail' "VM bundle 或其中 $($encryptedVmFiles.Count) 个文件启用了 EFS 加密" 'HCS 无法挂载加密的 VHDX。'
+            Add-Finding 'vm-encryption' 'Warning' "VM bundle 或其中 $($encryptedVmFiles.Count) 个运行文件带 Encrypted(0x4000) 属性" '在 AppX 包私有 LocalCache 中，这可能是应用受保护加密而非可自动解密的经典 EFS；脚本保持原样。'
         } elseif ($nonRuntimeEncryptedFiles.Count -gt 0) {
             Add-Finding 'vm-encryption' 'Info' "仅有 $($nonRuntimeEncryptedFiles.Count) 个 Claude 元数据或下载归档带加密属性" '这些 .origin/.zst/状态文件不是 HCS 直接使用的运行文件，不阻断 Cowork。'
         } elseif (Test-Path -LiteralPath $bundle) {
@@ -1511,6 +1614,17 @@ function Stop-ClaudeProcesses {
     Start-Sleep -Seconds 2
 }
 
+function Stop-CoworkVmServiceAndWait {
+    $service = Get-Service -Name CoworkVMService -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -ne 'Stopped') {
+        Stop-Service -Name CoworkVMService -Force -ErrorAction Stop
+        $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(20))
+        $service.Refresh()
+        if ($service.Status -ne 'Stopped') { throw 'CoworkVMService 未能在 20 秒内停止。' }
+    }
+    Get-Process -Name 'cowork-svc' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 function Install-OfficialClaude {
     param([Parameter(Mandatory)]$Download)
     $systemVolume = Get-AppxSystemVolume
@@ -1610,7 +1724,7 @@ function Restore-OfficialCoreFilesFromMsix {
     $backup = Backup-ModifiedClaudeFiles $Paths
     Write-Log "已备份被修改的核心文件：$backup" INFO
     Stop-ClaudeProcesses
-    Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+    Stop-CoworkVmServiceAndWait
 
     $targets = @($Paths.App, $Paths.Resources, $Paths.Exe, $Paths.Asar)
     $snapshots = @{}
@@ -1708,32 +1822,11 @@ function Repair-VmStorageAttributes {
         $encrypted += Get-Item -LiteralPath $bundle -Force
     }
     if ($nonRuntimeEncrypted.Count -gt 0) {
-        Write-Log "检测到 $($nonRuntimeEncrypted.Count) 个 .origin/.zst/状态文件带加密属性；它们不是 HCS 运行文件，保留且不阻断安装。" INFO
+        Write-Log "检测到 $($nonRuntimeEncrypted.Count) 个 .origin/.zst/状态文件带 Encrypted(0x4000) 属性。位于 AppX 包私有目录时可能是正常的应用受保护加密，保持原样。" INFO
     }
     if ($encrypted.Count -gt 0) {
-        Write-Log '正在移除 VM bundle 的 EFS 加密属性。' WARN
-        Stop-ClaudeProcesses
-        Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
-        try {
-            foreach ($item in @($encrypted | Sort-Object { $_.FullName.Length } -Descending)) {
-                $length = if ($item.PSIsContainer) { '-' } else { [string]$item.Length }
-                Write-Log "EFS 运行目标：$($item.FullName)；大小=$length；属性=$($item.Attributes)" INFO
-                Invoke-EfsDecrypt -Path $item.FullName
-            }
-        } catch {
-            Write-Log "标准 EFS 解密失败，将切换到可回滚的 VM bundle 重建：$($_.Exception.Message)" WARN
-            return Start-SafeVmBundleRebuild -Reason $_.Exception.Message
-        }
-        $remaining = @(Get-ChildItem -LiteralPath $bundle -Force -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { ($_.Attributes -band [IO.FileAttributes]::Encrypted) -and (Test-VmRuntimeEfsItem $_) })
-        if (Test-EncryptedPath $vmBundles) {
-            $remaining += Get-Item -LiteralPath $vmBundles -Force
-        }
-        if (Test-EncryptedPath $bundle) {
-            $remaining += Get-Item -LiteralPath $bundle -Force
-        }
-        if ($remaining.Count -gt 0) { throw '无法移除 vm_bundles 或其中文件的 EFS 加密属性。' }
-        Write-Log 'VM bundle 的 EFS 加密属性已移除。' OK
+        $protection = Get-AppxProtectedVmEvidence -BundlePath $bundle
+        Write-Log "VM 运行文件带 Encrypted(0x4000) 属性；该属性无法仅凭 FileAttributes 区分经典 EFS 与 AppX 应用受保护加密。为防止破坏包原生文件，脚本不会调用 DecryptFileW、不会移动 bundle、不会自动重建。证据：$($protection.Reasons -join '；')" WARN
     }
     return $null
 }
@@ -1748,6 +1841,11 @@ function Repair-IncompleteWorkspace {
     $required = @('rootfs.vhdx', 'sessiondata.vhdx')
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $bundle $_)) })
     if ($missing.Count -eq 0) { return }
+    $protection = Get-AppxProtectedVmEvidence -BundlePath $bundle
+    if ($protection.Suspected) {
+        Write-Log "workspace 不完整（缺少 $($missing -join ', ')），但命中 AppX 应用受保护存储；禁止归档/重建现有 vm_bundles：$($protection.Reasons -join '；')" ERROR
+        return
+    }
     if (Test-ReparsePoint $vmBundles) {
         throw 'workspace 不完整且 vm_bundles 是重解析点；为避免归档错误目标，拒绝自动重建。'
     }
@@ -1756,7 +1854,7 @@ function Repair-IncompleteWorkspace {
     $archive = Join-Path $script:BackupRoot ("incomplete-workspace-{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     Write-Log "workspace 不完整（缺少 $($missing -join ', ')），将旧目录归档到 $archive。" WARN
     Stop-ClaudeProcesses
-    Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+    Stop-CoworkVmServiceAndWait
     Move-Item -LiteralPath $vmBundles -Destination $archive
     New-Item -ItemType Directory -Path $vmBundles -Force | Out-Null
     Write-Log '旧 workspace 已可恢复地归档；Claude 下次启动会重新下载 VM。' OK

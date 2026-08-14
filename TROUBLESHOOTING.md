@@ -22,9 +22,9 @@
 脚本会区分以下情况：
 
 - 全新安装且尚未打开 Cowork：只提示，不判断为损坏；
-- 已存在 `claudevm.bundle`，但核心磁盘缺失：把整个旧 `vm_bundles` 目录归档到 `%ProgramData%\ClaudeSetup\backups`，再让 Claude 重建；
+- 已存在 `claudevm.bundle`，但核心磁盘缺失：先检查 AppX 409/应用受保护证据；命中时保持目录原样并报告，不自动归档；
 - VM 文件写入 `%APPDATA%`、读取 AppX `LocalCache`：检查 Claude 是否从 AppX 入口启动、AppX 默认卷是否为系统卷；
-- 目录或文件有 EFS 属性：递归解密后复核；
+- 目录或文件带 Encrypted(0x4000)：保持原样并报告；该属性在 AppX 私有目录中不能安全地自动解释为经典 EFS；
 - `vm_bundles` 是 junction/symlink：停止自动修复，避免移动链接指向的未知数据。
 
 ## `EXDEV: cross-device link not permitted`
@@ -33,13 +33,9 @@
 
 ## `UNKNOWN: unknown error, copyfile *.zst.*.partial` / `*.tmp`
 
-这表示新版 Claude 已在 `rename` 失败后尝试 `copyFile`，但 Windows MSIX 虚拟化仍阻止压缩缓存或解压后运行文件的最终提交。它不是下载速度、C 盘空间或 EFS 的同义错误。
+这表示新版 Claude 已在 `rename` 失败后尝试 `copyFile`，但最终提交仍被 Windows 拒绝。若同时出现 Encrypted(0x4000)、`409/0x199`、`ERROR_APPX_FILE_NOT_ENCRYPTED` 或 `CreateVirtualDisk failed: 0x199`，应按 AppX 应用受保护存储故障处理，而不是下载速度或普通 EFS 问题。
 
-Auto 模式会检查 package LocalCache 与真实 `%APPDATA%` 两个 bundle 目录，读取近期 Cowork 日志，并从本轮已验证 Anthropic 数字签名的官方 MSIX 中解析当前 VM manifest。`.zst.<12位校验前缀>.partial` 先核对文件名、前缀和 bundle 版本，转正后再计算整个压缩缓存的 SHA-256并与 manifest比较。仍被写入、带 EFS、位于重解析点或校验不一致的文件一律不处理。旧的加密 bundle 备份不会删除。
-
-在缓存解压分支中，Claude 会在提交失败后的 `finally` 中立即删除 `rootfs.vhdx.tmp`，普通轮询无法接管。此时脚本使用 nodejs.org 官方 Node.js 24 便携包内置的 `createZstdDecompress()` 直接解压已完整校验的缓存；ZIP需通过官方 `SHASUMS256.txt`，`node.exe` 还需通过 OpenJS Foundation Authenticode签名。若 manifest 提供 `rawChecksum`，输出必须匹配；未提供时，脚本记录解压输出 SHA-256并在发布前再次计算确认文件未变化。
-
-若诊断清单能看到完整的 `.zst.<12位前缀>.partial`，但 Auto 模式仍只显示“等待重建”，通常是 Claude 仍持有该文件句柄。脚本会先依据当前 manifest 与错误日志锁定精确候选，再停止 Claude 和 Cowork 服务、等待句柄释放，之后才读取和校验文件；不会把仍在写入的文件直接发布。
+最新版在命中上述证据后只诊断、不改写：不会解密文件、不会归档 bundle、不会把 `.tmp/.partial` 改名转正、不会自行解压并写回，也不会用硬链接让活动 VHDX 与备份共享同一文件记录。请保留 `reports` 和 `C:\ProgramData\Claude\Logs\cowork-service.log`，向 Anthropic 反馈。
 
 相关上游问题：[anthropics/claude-code#36642](https://github.com/anthropics/claude-code/issues/36642)、[#51384](https://github.com/anthropics/claude-code/issues/51384)、[#66778](https://github.com/anthropics/claude-code/issues/66778)。
 
@@ -79,8 +75,8 @@ Auto 模式会检查 package LocalCache 与真实 `%APPDATA%` 两个 bundle 目�
 ## 完整汉化与 Cowork
 
 完整汉化若修改 `Claude.exe` 或 `app.asar`，会使签名失效。CoworkVMService 随后拒绝客户端并关闭 RPC 管道。工具不提供签名绕过，也不会自动启用完整汉化。
-# Encrypted Cowork VM bundle / Win32 87
+# Encrypted Cowork VM bundle / Win32 87 / AppX 409
 
-如果真实 VM 文件（如 `smol-bin.vhdx`、`rootfs.vhdx`）带 `Encrypted` 属性，而标准 `DecryptFileW` 返回 Win32 87，运行最新版 `install.bat`。脚本会采用同卷重命名备份和重启后重建流程，不会自动删除备份。
+如果真实 VM 文件带 `Encrypted` 属性，而 `DecryptFileW` 返回 Win32 87，这不足以证明文件损坏；在包私有 `LocalCache` 中，它可能属于“应用程序受保护”加密。最新版绝不会再用这一组合自动触发 bundle 备份或重建。
 
-重启后若脚本返回退出码 4，请在 Claude 中进入 Cowork，等待官方 VM 下载完成，然后再次运行 `install.bat`。活动状态与完成记录位于 `%ProgramData%\ClaudeSetup`，原备份位于原 `vm_bundles` 目录。
+`409 (0x199)` 的系统名称是 `ERROR_APPX_FILE_NOT_ENCRYPTED`。若 `cowork-service.log` 显示 `CreateVirtualDisk failed: 0x199`，工具会标记为上游/系统兼容性失败并停止修改。不要运行未经完整哈希与版本验证的 `fix_commit.bat`，也不要把活动 VHDX 硬链接到唯一备份；硬链接两侧共享同一文件内容，活动写入会同时改变所谓备份。

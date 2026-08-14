@@ -24,6 +24,7 @@ $legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Enco
 $elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw -Encoding UTF8
 $zstdHelperPath = Join-Path $root 'VmZstdDecompress.js'
 $zstdHelper = Get-Content -LiteralPath $zstdHelperPath -Raw -Encoding UTF8
+$security = Get-Content -LiteralPath (Join-Path $root 'SECURITY.md') -Raw -Encoding UTF8
 $attributes = Get-Content -LiteralPath (Join-Path $root '.gitattributes') -Raw -Encoding UTF8
 $batchFiles = Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Extension -in @('.bat', '.cmd') }
 if ($attributes -notmatch '(?m)^\*\.bat text eol=crlf\r?$' -or $attributes -notmatch '(?m)^\*\.cmd text eol=crlf\r?$') {
@@ -68,6 +69,11 @@ $requiredSafetyChecks = @(
     'Get-OfficialVmManifest'
     'Get-VmCommitFailureNames'
     'Get-VmCompressedCommitFailureNames'
+    'Get-AppxProtectedVmEvidence'
+    'Get-VmRebuildProtectionEvidence'
+    'ERROR_APPX_FILE_NOT_ENCRYPTED'
+    'CreateVirtualDisk failed: 0x199'
+    'Stop-CoworkVmServiceAndWait'
     'Sync-VerifiedVmFile'
     'Sync-CompletedVmCompressedCache'
     'Wait-FileExclusiveAccess'
@@ -104,6 +110,22 @@ if ($main -match 'AllowUnsigned') {
 }
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
+}
+foreach ($required in @('v1.0.4', 'v1.0.13', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '不要把活动 VHDX 硬链接到唯一备份')) {
+    if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
+}
+$storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
+$storageEnd = $main.IndexOf('function Repair-IncompleteWorkspace', $storageStart)
+if ($storageStart -lt 0 -or $storageEnd -le $storageStart) { throw 'Unable to isolate Repair-VmStorageAttributes.' }
+$storageBlock = $main.Substring($storageStart, $storageEnd - $storageStart)
+if ($storageBlock -match 'Invoke-EfsDecrypt|Start-SafeVmBundleRebuild|Move-Item') {
+    throw 'AppX VM storage repair must not decrypt, move, or rebuild encrypted bundle data automatically.'
+}
+if ($main -notmatch '(?s)function Repair-MsixVmCommitFailure.*?Get-VmRebuildProtectionEvidence.*?if \(\$protection\.Suspected\).*?return \$false.*?Get-OfficialVmManifest') {
+    throw 'MSIX VM commit repair must fail closed before any manifest-based external write when AppX protection is suspected.'
+}
+if ($main -notmatch '(?s)function Stop-CoworkVmServiceAndWait.*?WaitForStatus.*?cowork-svc') {
+    throw 'Cowork service shutdown must wait for Stopped and terminate a lingering cowork-svc process.'
 }
 if ($main -notmatch '(?s)检测到 MSIX 无法提交.*?Stop-ClaudeProcesses.*?Wait-FileExclusiveAccess.*?Get-FileHash.*?file\.Checksum.*?Sync-CompletedVmCompressedCache') {
     throw 'MSIX compressed-cache repair must stop Claude, obtain exclusive access, and verify the complete hash before promotion.'
@@ -269,6 +291,16 @@ try {
         $missingStatus = Get-VmBundleStatus -BundlePath $statusRoot
         if ($missingStatus.Ready -or $missingStatus.Missing -notcontains 'sessiondata.vhdx') {
             throw 'Bundle readiness must require sessiondata.vhdx.'
+        }
+
+        $nodeLog = Join-Path $statusRoot 'cowork_vm_node.log'
+        $serviceLog = Join-Path $statusRoot 'cowork-service.log'
+        [IO.File]::WriteAllText($nodeLog, "UNKNOWN: unknown error, copyfile 'C:\Users\Test\AppData\Local\Packages\Claude_test\LocalCache\Roaming\Claude\vm_bundles\claudevm.bundle\rootfs.vhdx.tmp'", (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($serviceLog, 'Warning: failed to create session disk: CreateVirtualDisk failed: 0x199', (New-Object Text.UTF8Encoding($false)))
+        $protectedEvidence = Get-AppxProtectedVmEvidence -BundlePath $statusRoot -NodeLogPaths @($nodeLog) -ServiceLogPath $serviceLog
+        if (-not $protectedEvidence.Suspected -or -not $protectedEvidence.ExplicitAppxError -or
+            -not $protectedEvidence.SessionDiskError -or -not $protectedEvidence.CopyfileUnknown) {
+            throw 'AppX protected-storage evidence detection failed.'
         }
     } finally {
         $resolvedStatusRoot = [IO.Path]::GetFullPath($statusRoot)

@@ -2,6 +2,8 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
+> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护，不再自动解密、移动或外部写入受保护 bundle。已经运行旧版的用户请保留所有 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
+
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
 > `setup.cmd` 只是旧版兼容入口，会自动转交给 `install.bat`；不要把两个文件各运行一次。
@@ -39,10 +41,9 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 检查 BIOS/UEFI 虚拟化、HCS/HNS、Hypervisor 启动设置；
 - 检测 Claude 位于非系统 AppX 卷的情况；
 - 修复 TEMP 与 LocalAppData 跨盘造成的 `EXDEV`；
-- 修复 Windows 11 build 26200 等环境中官方 MSIX 虚拟化导致的 `UNKNOWN ... copyfile`：覆盖 `.zst.<校验前缀>.partial -> .zst` 压缩缓存提交和 `.tmp -> 正式运行文件` 两个阶段；运行文件只接管与刚下载、签名有效的官方 MSIX manifest SHA-256 完全一致的内容，并同步 package LocalCache 与真实 Roaming 两条路径；
-- 检测 EFS 加密、目录联接与 `rootfs.vhdx/sessiondata.vhdx`；
-- EFS 修复只阻断实际 VM 目录、`*.vhdx`、`initrd` 和 `vmlinuz`；Claude 自带的 `.origin` 完整性元数据、`.zst` 下载归档和状态标记会保留并记为信息，避免 Win32 87 误报。
-- 若真实 VM 文件无法用当前账户标准解密，脚本不会删除或覆盖它们：仅在父目录不继承加密且磁盘空间充足时，把整个 `claudevm.bundle` 同卷重命名为时间戳备份，注册一次性重启续跑，再由官方 Claude 重建。
+- 诊断 Windows 11 build 26200 等环境中的 `UNKNOWN ... copyfile`、`ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)` 与 `CreateVirtualDisk` 失败；
+- 检测 Encrypted(0x4000)、目录联接与 `rootfs.vhdx/sessiondata.vhdx`，但不再把 AppX 包私有目录中的 0x4000 自动等同于可解密的经典 EFS；
+- 一旦存在 AppX 应用受保护存储证据，立即禁用 `DecryptFileW`、bundle 归档/重建和外部解压/写入接管，避免把包原生文件变成 409 拒读的明文残留；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
@@ -69,22 +70,11 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 只诊断、不修改系统：双击 `diagnose.cmd`。
 
-### 加密 VM 的可回滚重建
+### AppX 应用受保护存储的失效保护
 
-当 `*.vhdx` 等真实运行文件带加密属性且 Windows 返回 Win32 87、无法标准解密时：
+`FILE_ATTRIBUTE_ENCRYPTED (0x4000)` 只能说明文件已加密，不能单独区分经典用户 EFS 与 MSIX/AppX 的“应用程序受保护”加密。在 Claude 的包私有 `LocalCache` 中，盲目调用 `DecryptFileW` 或从外部进程写入文件可能触发 `ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)`，并使 Cowork 更难恢复。
 
-1. 脚本停止 Claude 与 `CoworkVMService`；
-2. 验证 `vm_bundles` 不是重解析点、父目录不继承加密，并预留“旧 bundle 大小 + 2 GB”的可用空间；
-3. 将 `claudevm.bundle` 同卷重命名为 `claudevm.bundle.backup-时间戳`，不覆盖、不跨卷复制；
-4. 注册一次性重启续跑并要求重启 Windows；
-5. 重启后启动官方 Claude。请进入 Cowork，让官方客户端下载并创建新的 `rootfs.vhdx` 与 `sessiondata.vhdx`；
-6. 只有新 bundle 文件齐全、运行文件未加密且 Cowork 健康检查通过，脚本才结束重建状态。
-
-若官方 Claude 因 MSIX 文件系统虚拟化无法提交下载缓存或运行文件，脚本会停止 Claude 冻结文件，并从刚下载且 Anthropic 签名有效的 MSIX 中读取当前 VM manifest。压缩缓存必须匹配当前文件名、bundle版本和12位校验前缀，转正后还必须完整匹配 manifest 中的压缩包 SHA-256。若 manifest 提供 `rawChecksum`，解压输出也必须匹配；否则安全根建立在已完整校验的官方压缩流与 Zstandard帧完整性之上，脚本记录输出 SHA-256并在发布前再次复核文件未变化。随后才会原子转正、写入对应 `.origin`、同步两条官方数据路径并重新启动 Claude。该流程不会修改 `Claude.exe` 或 `app.asar`。
-
-若 Claude 会在提交失败后立即删除解压出的 `.tmp`，脚本会临时使用 Node.js 官方24系便携包的内置 Zstandard API自行解压。Node ZIP必须匹配 nodejs.org 官方 `SHASUMS256.txt`，其中 `node.exe` 必须具有有效的 OpenJS Foundation Authenticode签名；运行时不安装、不加入 PATH、不常驻。
-
-加密备份永远不会由脚本自动删除。确认 Cowork 长期正常后，用户可以自行处理备份。
+因此最新版只做诊断：命中 0x4000、`UNKNOWN ... copyfile`、显式 409/0x199 或 `CreateVirtualDisk failed: 0x199` 时，不解密、不移动 bundle、不创建硬链接、不转正 `.tmp/.partial`、不向目录写 `.origin`。报告会保留原始路径和近期日志，供 Anthropic 或设备管理员处理。旧版本已经生成的时间戳备份也不会自动删除或自动硬链接回活动目录。
 
 也可以在管理员 PowerShell 中运行：
 
@@ -114,8 +104,8 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 | Virtual Machine Platform 未启用 | 自动启用，注册重启后继续 |
 | Claude 在非系统 AppX 卷 | 优先使用 `Move-AppxPackage` 移动；失败则停止并报告，不删除用户数据 |
 | TEMP 与 LocalAppData 跨盘 | 恢复用户 TEMP/TMP 到 `%LOCALAPPDATA%\Temp` |
-| `UNKNOWN ... copyfile *.zst.*.partial` 或 `*.tmp` | 按签名有效的官方 MSIX manifest 复核缓存/临时文件，分阶段转正并同步 LocalCache/Roaming |
-| VM 目录使用 EFS | 尝试解密 |
+| `UNKNOWN ... copyfile *.zst.*.partial` 或 `*.tmp` | 先识别 AppX 409/应用受保护证据；命中时停止外部写入修复并报告 |
+| VM 目录或文件带 Encrypted(0x4000) | 保持原样并报告；不自动解密或重建 |
 | VM 目录是 junction/reparse point | 停止并报告，避免误删大体积 VM 数据 |
 | VDI/虚拟机 | 警告需要嵌套虚拟化 |
 | 企业 AppLocker/策略阻止 | 停止并输出报告，不绕过安全策略 |
