@@ -45,6 +45,7 @@ $requiredSafetyChecks = @(
     'DecryptFile(string path, uint reserved)'
     'Install-ClaudeDesktopShortcut'
     'shell:AppsFolder\$script:Aumid'
+    'Test-IgnorableEncryptedMarker'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -139,6 +140,16 @@ try {
     }
     if (Test-ClaudeDefaultInstallationReady $missingPackage) {
         throw 'A missing default installation path must require automatic installation.'
+    }
+
+    $originMarker = [pscustomobject]@{ PSIsContainer = $false; Length = 0; Name = '.rootfs.vhdx.zst.origin' }
+    $runtimeDisk = [pscustomobject]@{ PSIsContainer = $false; Length = 8447328256; Name = 'rootfs.vhdx' }
+    $nonEmptyOrigin = [pscustomobject]@{ PSIsContainer = $false; Length = 1; Name = '.rootfs.vhdx.origin' }
+    if (-not (Test-IgnorableEncryptedMarker $originMarker)) {
+        throw 'A zero-byte Claude .origin marker must not block Cowork EFS repair.'
+    }
+    if ((Test-IgnorableEncryptedMarker $runtimeDisk) -or (Test-IgnorableEncryptedMarker $nonEmptyOrigin)) {
+        throw 'Runtime disks and non-empty metadata must never be ignored by EFS repair.'
     }
 
     $currentCandidates = @(Get-ClaudeInstallationCandidates)

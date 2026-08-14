@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.1'
+$script:ToolVersion = '1.0.2'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -425,6 +425,12 @@ namespace ClaudeSetup {
     }
 }
 
+function Test-IgnorableEncryptedMarker {
+    param([Parameter(Mandatory)]$Item)
+    if ($Item.PSIsContainer -or $Item.Length -ne 0) { return $false }
+    return $Item.Name -match '^\..+\.origin$|^\.(cowork-adopted|auto_reinstall_attempted)$'
+}
+
 function Test-CompressedPath {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
@@ -550,12 +556,17 @@ function Invoke-Diagnostics {
         elseif (Test-Path -LiteralPath $bundle) { Add-Finding 'vm-reparse' 'Pass' 'vm_bundles 不是重解析点' }
 
         $encryptedVmFiles = @()
+        $ignoredEncryptedMarkers = @()
         if (Test-Path -LiteralPath $bundle) {
-            $encryptedVmFiles = @(Get-ChildItem -LiteralPath $bundle -File -Recurse -ErrorAction SilentlyContinue |
+            $allEncryptedVmFiles = @(Get-ChildItem -LiteralPath $bundle -Force -File -Recurse -ErrorAction SilentlyContinue |
                 Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
+            $ignoredEncryptedMarkers = @($allEncryptedVmFiles | Where-Object { Test-IgnorableEncryptedMarker $_ })
+            $encryptedVmFiles = @($allEncryptedVmFiles | Where-Object { -not (Test-IgnorableEncryptedMarker $_) })
         }
         if ((Test-EncryptedPath $bundle) -or $encryptedVmFiles.Count -gt 0) {
             Add-Finding 'vm-encryption' 'Fail' "VM bundle 或其中 $($encryptedVmFiles.Count) 个文件启用了 EFS 加密" 'HCS 无法挂载加密的 VHDX。'
+        } elseif ($ignoredEncryptedMarkers.Count -gt 0) {
+            Add-Finding 'vm-encryption' 'Info' "仅有 $($ignoredEncryptedMarkers.Count) 个零字节 Claude 元数据标记带加密属性" '这些 .origin/状态标记不是 HCS 挂载的 VHDX，不阻断 Cowork。'
         } elseif (Test-Path -LiteralPath $bundle) {
             Add-Finding 'vm-encryption' 'Pass' 'VM bundle 及其文件未启用 EFS 加密'
         }
@@ -919,10 +930,15 @@ function Repair-VmStorageAttributes {
     if (Test-ReparsePoint $vmBundles) {
         throw "检测到 vm_bundles 是重解析点：$vmBundles。为避免误移动大量 VM 数据，脚本不会自动删除联接。"
     }
-    $encrypted = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
+    $allEncrypted = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
+    $ignoredMarkers = @($allEncrypted | Where-Object { Test-IgnorableEncryptedMarker $_ })
+    $encrypted = @($allEncrypted | Where-Object { -not (Test-IgnorableEncryptedMarker $_) })
     if (Test-EncryptedPath $vmBundles) {
         $encrypted += Get-Item -LiteralPath $vmBundles -Force
+    }
+    if ($ignoredMarkers.Count -gt 0) {
+        Write-Log "检测到 $($ignoredMarkers.Count) 个零字节 .origin/状态标记带加密属性；它们不是 VM 磁盘，保留且不阻断安装。" INFO
     }
     if ($encrypted.Count -gt 0) {
         Write-Log '正在移除 VM bundle 的 EFS 加密属性。' WARN
@@ -932,7 +948,7 @@ function Repair-VmStorageAttributes {
             Invoke-EfsDecrypt -Path $item.FullName
         }
         $remaining = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::Encrypted) -and -not (Test-IgnorableEncryptedMarker $_) })
         if (Test-EncryptedPath $vmBundles) {
             $remaining += Get-Item -LiteralPath $vmBundles -Force
         }

@@ -40,6 +40,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 检测 Claude 位于非系统 AppX 卷的情况；
 - 修复 TEMP 与 LocalAppData 跨盘造成的 `EXDEV`；
 - 检测 EFS 加密、目录联接与 `rootfs.vhdx/sessiondata.vhdx`；
+- EFS 修复只阻断实际 VM 目录和运行文件；Claude 自带的零字节 `.origin`/状态标记会保留并记为信息，避免 Win32 87 误报。
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
