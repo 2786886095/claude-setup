@@ -119,7 +119,6 @@ if ($main -notmatch 'if \(\$handshakePassed -and -not \$vmRequested\)') {
 
 $requiredBatchParts = @(
     '%~dp0ClaudeSetup.ps1',
-    '%~f0',
     'fltmc.exe',
     'ElevateInstall.ps1',
     '-Action Auto'
@@ -154,11 +153,30 @@ if ($batch -notmatch 'CLAUDE_SETUP_ELEVATION_EXIT%"=="194" exit /b 194' -or
     $batch -notmatch 'CLAUDE_SETUP_ELEVATION_EXIT%"=="4" exit /b 4') {
     throw 'The non-elevated parent must pass through expected restart and pending-rebuild exit codes.'
 }
-foreach ($required in @('$env:ComSpec', '-Verb RunAs', '-Wait', '-PassThru', '/d /c')) {
+if ($batch -match '(?i)-(BatchPath|WorkingDirectory)') {
+    throw 'install.bat must not pass filesystem paths through the UAC helper command line.'
+}
+foreach ($required in @('$PSScriptRoot', '$env:ComSpec', '-Verb RunAs', '-Wait', '-PassThru', '/d /c', 'ValidateOnly')) {
     if (-not $elevator.Contains($required)) { throw "ElevateInstall.ps1 is missing: $required" }
+}
+if ($elevator -match '\[IO\.Path\]::GetFullPath\(\$(BatchPath|WorkingDirectory)\)') {
+    throw 'The elevation helper must not canonicalize path arguments received through cmd.exe.'
 }
 if ($elevator -match 'Start-Process -FilePath \$BatchPath') {
     throw 'The elevation helper must invoke cmd.exe, not pass a batch file directly to Start-Process.'
+}
+
+$elevationTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("Claude Setup 中文 & [path] {0}" -f [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $elevationTestRoot -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Destination $elevationTestRoot
+    Copy-Item -LiteralPath (Join-Path $root 'install.bat') -Destination $elevationTestRoot
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $elevationTestRoot 'ElevateInstall.ps1') -ValidateOnly
+    if ($LASTEXITCODE -ne 0) {
+        throw "Elevation helper path validation failed with exit code $LASTEXITCODE."
+    }
+} finally {
+    Remove-Item -LiteralPath $elevationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY

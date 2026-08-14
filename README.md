@@ -60,7 +60,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 
 `install.bat` 会根据退出码显示编号式下一步：需要重启时提示保留解压目录、重启、接受 UAC 和进入 Cowork；下载未完成时提示等待后再次运行；验证成功时确认桌面快捷方式和加密备份状态。
 
-UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结果，不再直接把 `.bat` 传给 `Start-Process`。`install.bat` 在运行 PowerShell 主脚本前就会写入 `reports\install-bootstrap.log`，即使 UAC 或启动器失败也能诊断。
+UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结果，不再直接把 `.bat` 传给 `Start-Process`。提权脚本从自身所在目录定位 `install.bat`，不会把末尾带反斜杠的目录作为命令行参数传递，因此兼容中文、空格及常见特殊字符路径。`install.bat` 在运行 PowerShell 主脚本前就会写入 `reports\install-bootstrap.log`，即使 UAC 或启动器失败也能诊断。
 
 仓库通过 `.gitattributes` 强制所有 `.bat/.cmd` 使用 Windows CRLF 换行；发布测试会拒绝仅含 LF 的批处理文件，避免 `cmd.exe` 拼接行、变量截断和退出码 9009。
 

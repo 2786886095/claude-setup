@@ -6,7 +6,6 @@ cd /d "%~dp0"
 
 set "CLAUDE_SETUP_PS1=%~dp0ClaudeSetup.ps1"
 set "CLAUDE_SETUP_ELEVATOR=%~dp0ElevateInstall.ps1"
-set "CLAUDE_SETUP_BAT=%~f0"
 set "CLAUDE_SETUP_DIR=%~dp0"
 set "CLAUDE_SETUP_REPORTS=%~dp0reports"
 set "CLAUDE_SETUP_BOOTSTRAP_LOG=%CLAUDE_SETUP_REPORTS%\install-bootstrap.log"
@@ -35,7 +34,7 @@ goto administrator_confirmed
 :request_administrator
 echo Requesting administrator privileges...
 >>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] requesting UAC through cmd.exe helper
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_ELEVATOR%" -BatchPath "%CLAUDE_SETUP_BAT%" -WorkingDirectory "%CLAUDE_SETUP_DIR%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_ELEVATOR%"
 set "CLAUDE_SETUP_ELEVATION_EXIT=%errorlevel%"
 >>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] elevated child exited with code %CLAUDE_SETUP_ELEVATION_EXIT%
 if "%CLAUDE_SETUP_ELEVATION_EXIT%"=="0" exit /b 0

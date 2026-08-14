@@ -1,19 +1,20 @@
 [CmdletBinding()]
-param(
-    [Parameter(Mandatory)][string]$BatchPath,
-    [Parameter(Mandatory)][string]$WorkingDirectory
-)
+param([switch]$ValidateOnly)
 
 $ErrorActionPreference = 'Stop'
 
 try {
-    $batch = [IO.Path]::GetFullPath($BatchPath)
-    $working = [IO.Path]::GetFullPath($WorkingDirectory)
-    if (-not (Test-Path -LiteralPath $batch -PathType Leaf)) { throw "install.bat not found: $batch" }
-    if (-not (Test-Path -LiteralPath $working -PathType Container)) { throw "Working directory not found: $working" }
-    if (-not ([IO.Path]::GetDirectoryName($batch)).Equals($working.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'install.bat and its working directory do not match.'
-    }
+    # Derive both paths locally. Passing a quoted directory ending in a backslash
+    # through cmd.exe -> powershell.exe can preserve the closing quote as part of
+    # the value on some systems, making GetFullPath report illegal characters.
+    $workingItem = Get-Item -LiteralPath $PSScriptRoot -ErrorAction Stop
+    $batchItem = Get-Item -LiteralPath (Join-Path $workingItem.FullName 'install.bat') -ErrorAction Stop
+    if (-not $workingItem.PSIsContainer) { throw "Working directory not found: $PSScriptRoot" }
+    if ($batchItem.PSIsContainer) { throw "install.bat is not a file: $($batchItem.FullName)" }
+
+    $working = $workingItem.FullName
+    $batch = $batchItem.FullName
+    if ($ValidateOnly) { exit 0 }
 
     $cmdArguments = '/d /c ""{0}""' -f $batch
     $process = Start-Process -FilePath $env:ComSpec -ArgumentList $cmdArguments -WorkingDirectory $working -Verb RunAs -Wait -PassThru
