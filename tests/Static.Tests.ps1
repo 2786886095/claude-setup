@@ -123,6 +123,12 @@ if ($legacyBatch -notmatch '旧版兼容入口' -or $legacyBatch -notmatch '唯�
 if ($batch -notmatch 'CLAUDE_SETUP_EXIT%"=="4"' -or $batch -notmatch 'encrypted backup has NOT been deleted') {
     throw 'install.bat must explain the pending Cowork rebuild exit code without claiming deletion.'
 }
+if ($batch -notmatch 'NEXT STEPS / 下一步：重启后继续完成' -or
+    $batch -notmatch 'Do NOT move or delete this extracted setup folder' -or
+    $batch -notmatch 'enter Cowork and keep this window open' -or
+    $batch -notmatch '再次运行 install\.bat，完成最终验证') {
+    throw 'install.bat must show complete numbered next steps for restart and pending rebuild outcomes.'
+}
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY
 try {

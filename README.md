@@ -57,6 +57,8 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 
 重启续跑使用 Windows `RunOnce`，只执行一次；安装成功后脚本会主动清除该项。
 
+`install.bat` 会根据退出码显示编号式下一步：需要重启时提示保留解压目录、重启、接受 UAC 和进入 Cowork；下载未完成时提示等待后再次运行；验证成功时确认桌面快捷方式和加密备份状态。
+
 `setup.cmd` 仅为兼容旧下载保留，它会转交给 `install.bat`；两者不要重复运行。
 
 只诊断、不修改系统：双击 `diagnose.cmd`。
