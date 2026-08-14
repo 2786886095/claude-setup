@@ -5,8 +5,14 @@ title Claude Setup - Recommended installer - install.bat
 cd /d "%~dp0"
 
 set "CLAUDE_SETUP_PS1=%~dp0ClaudeSetup.ps1"
+set "CLAUDE_SETUP_ELEVATOR=%~dp0ElevateInstall.ps1"
 set "CLAUDE_SETUP_BAT=%~f0"
 set "CLAUDE_SETUP_DIR=%~dp0"
+set "CLAUDE_SETUP_REPORTS=%~dp0reports"
+set "CLAUDE_SETUP_BOOTSTRAP_LOG=%CLAUDE_SETUP_REPORTS%\install-bootstrap.log"
+
+if not exist "%CLAUDE_SETUP_REPORTS%" mkdir "%CLAUDE_SETUP_REPORTS%" >nul 2>&1
+>>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] install.bat started from "%CLAUDE_SETUP_DIR%"
 
 if not exist "%CLAUDE_SETUP_PS1%" (
     echo [ERROR] ClaudeSetup.ps1 was not found next to install.bat.
@@ -14,14 +20,35 @@ if not exist "%CLAUDE_SETUP_PS1%" (
     pause
     exit /b 2
 )
+if not exist "%CLAUDE_SETUP_ELEVATOR%" (
+    echo [ERROR] ElevateInstall.ps1 was not found next to install.bat.
+    >>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] ERROR ElevateInstall.ps1 missing
+    echo Please download and extract the complete claude-setup package first.
+    pause
+    exit /b 2
+)
 
 fltmc.exe >nul 2>&1
-if errorlevel 1 (
-    echo Requesting administrator privileges...
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
-      "Start-Process -FilePath $env:CLAUDE_SETUP_BAT -WorkingDirectory $env:CLAUDE_SETUP_DIR -Verb RunAs"
-    exit /b %errorlevel%
-)
+if errorlevel 1 goto request_administrator
+goto administrator_confirmed
+
+:request_administrator
+echo Requesting administrator privileges...
+>>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] requesting UAC through cmd.exe helper
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_ELEVATOR%" -BatchPath "%CLAUDE_SETUP_BAT%" -WorkingDirectory "%CLAUDE_SETUP_DIR%"
+set "CLAUDE_SETUP_ELEVATION_EXIT=%errorlevel%"
+>>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] elevated child exited with code %CLAUDE_SETUP_ELEVATION_EXIT%
+if "%CLAUDE_SETUP_ELEVATION_EXIT%"=="0" exit /b 0
+if "%CLAUDE_SETUP_ELEVATION_EXIT%"=="194" exit /b 194
+if "%CLAUDE_SETUP_ELEVATION_EXIT%"=="4" exit /b 4
+echo [ERROR] Elevated installer exited with code %CLAUDE_SETUP_ELEVATION_EXIT%.
+echo Check reports\install-bootstrap.log.
+pause
+exit /b %CLAUDE_SETUP_ELEVATION_EXIT%
+
+:administrator_confirmed
+
+>>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] administrator token confirmed; starting ClaudeSetup.ps1
 
 echo ============================================================
 echo  Recommended entry: install.bat
@@ -29,6 +56,7 @@ echo  Installing or repairing Claude Desktop and Cowork...
 echo ============================================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_PS1%" -Action Auto
 set "CLAUDE_SETUP_EXIT=%errorlevel%"
+>>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] ClaudeSetup.ps1 exited with code %CLAUDE_SETUP_EXIT%
 
 echo.
 if "%CLAUDE_SETUP_EXIT%"=="0" (

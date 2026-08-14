@@ -59,6 +59,8 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 
 `install.bat` 会根据退出码显示编号式下一步：需要重启时提示保留解压目录、重启、接受 UAC 和进入 Cowork；下载未完成时提示等待后再次运行；验证成功时确认桌面快捷方式和加密备份状态。
 
+UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结果，不再直接把 `.bat` 传给 `Start-Process`。`install.bat` 在运行 PowerShell 主脚本前就会写入 `reports\install-bootstrap.log`，即使 UAC 或启动器失败也能诊断。
+
 `setup.cmd` 仅为兼容旧下载保留，它会转交给 `install.bat`；两者不要重复运行。
 
 只诊断、不修改系统：双击 `diagnose.cmd`。

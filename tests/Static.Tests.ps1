@@ -2,7 +2,7 @@
 
 $root = Split-Path -Parent $PSScriptRoot
 $scripts = @(
-    Get-Item -LiteralPath (Join-Path $root 'ClaudeSetup.ps1')
+    Get-ChildItem -LiteralPath $root -Filter '*.ps1' -File
     Get-ChildItem -LiteralPath (Join-Path $root 'tests') -Filter '*.ps1' -File -Recurse
 )
 foreach ($script in $scripts) {
@@ -21,6 +21,7 @@ foreach ($script in $scripts) {
 $main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw -Encoding UTF8
 $batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw -Encoding UTF8
 $legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Encoding UTF8
+$elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw -Encoding UTF8
 $requiredSafetyChecks = @(
     'Get-AuthenticodeSignature',
     'Anthropic',
@@ -104,7 +105,7 @@ $requiredBatchParts = @(
     '%~dp0ClaudeSetup.ps1',
     '%~f0',
     'fltmc.exe',
-    '-Verb RunAs',
+    'ElevateInstall.ps1',
     '-Action Auto'
 )
 foreach ($text in $requiredBatchParts) {
@@ -129,6 +130,19 @@ if ($batch -notmatch 'NEXT STEPS / 下一步：重启后继续完成' -or
     $batch -notmatch 'enter Cowork and keep this window open' -or
     $batch -notmatch '再次运行 install\.bat，完成最终验证') {
     throw 'install.bat must show complete numbered next steps for restart and pending rebuild outcomes.'
+}
+if ($batch -notmatch 'install-bootstrap\.log' -or $batch -notmatch 'requesting UAC through cmd\.exe helper') {
+    throw 'install.bat must leave a bootstrap log before UAC or ClaudeSetup.ps1 starts.'
+}
+if ($batch -notmatch 'CLAUDE_SETUP_ELEVATION_EXIT%"=="194" exit /b 194' -or
+    $batch -notmatch 'CLAUDE_SETUP_ELEVATION_EXIT%"=="4" exit /b 4') {
+    throw 'The non-elevated parent must pass through expected restart and pending-rebuild exit codes.'
+}
+foreach ($required in @('$env:ComSpec', '-Verb RunAs', '-Wait', '-PassThru', '/d /c')) {
+    if (-not $elevator.Contains($required)) { throw "ElevateInstall.ps1 is missing: $required" }
+}
+if ($elevator -match 'Start-Process -FilePath \$BatchPath') {
+    throw 'The elevation helper must invoke cmd.exe, not pass a batch file directly to Start-Process.'
 }
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY
