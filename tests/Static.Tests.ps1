@@ -65,7 +65,9 @@ $requiredSafetyChecks = @(
     'Test-VmRuntimeEfsItem'
     'Get-OfficialVmManifest'
     'Get-VmCommitFailureNames'
+    'Get-VmCompressedCommitFailureNames'
     'Sync-VerifiedVmFile'
+    'Sync-CompletedVmCompressedCache'
     'Repair-MsixVmCommitFailure'
     'Cowork VM bundle manifest.'
     'RuntimeChecksum'
@@ -309,6 +311,34 @@ try {
             (Test-Path -LiteralPath (Join-Path $bundleOne 'initrd')) -or
             (Test-Path -LiteralPath (Join-Path $bundleOne '.initrd.origin'))) {
             throw 'A rejected VM temp file must remain untouched and unpublished.'
+        }
+
+        $compressedPartial = Join-Path $bundleOne ("rootfs.vhdx.zst.{0}.partial" -f $rootHash.Substring(0, 12))
+        [IO.File]::WriteAllBytes($compressedPartial, [Text.Encoding]::UTF8.GetBytes('completed-compressed-cache-fixture'))
+        $compressedLength = (Get-Item -LiteralPath $compressedPartial).Length
+        if (-not (Sync-CompletedVmCompressedCache -SourcePath $compressedPartial -Name 'rootfs.vhdx' -ManifestChecksum $rootHash -BundleSha $sha -BundleDirectories @($bundleOne, $bundleTwo))) {
+            throw 'Completed VM compressed cache synchronization did not run.'
+        }
+        foreach ($directory in @($bundleOne, $bundleTwo)) {
+            $cache = Join-Path $directory 'rootfs.vhdx.zst'
+            $cacheOrigin = Join-Path $directory '.rootfs.vhdx.zst.origin'
+            if (-not (Test-Path -LiteralPath $cache) -or (Get-Item -LiteralPath $cache).Length -ne $compressedLength -or
+                (Get-Content -LiteralPath $cacheOrigin -Raw).Trim() -ne $sha) {
+                throw "Completed VM compressed cache publication failed in $directory."
+            }
+        }
+        if (Test-Path -LiteralPath $compressedPartial) { throw 'A completed same-directory compressed cache must be atomically promoted.' }
+
+        $wrongPrefix = Join-Path $bundleOne 'initrd.zst.000000000000.partial'
+        [IO.File]::WriteAllBytes($wrongPrefix, [Text.Encoding]::UTF8.GetBytes('wrong-prefix-cache-fixture'))
+        $wrongPrefixRejected = $false
+        try {
+            [void](Sync-CompletedVmCompressedCache -SourcePath $wrongPrefix -Name 'initrd' -ManifestChecksum $initrdHash -BundleSha $sha -BundleDirectories @($bundleOne, $bundleTwo))
+        } catch {
+            $wrongPrefixRejected = $true
+        }
+        if (-not $wrongPrefixRejected -or -not (Test-Path -LiteralPath $wrongPrefix)) {
+            throw 'A compressed cache whose checksum prefix does not match the manifest must remain untouched.'
         }
     } finally {
         Remove-Item -LiteralPath $manifestRoot -Recurse -Force -ErrorAction SilentlyContinue

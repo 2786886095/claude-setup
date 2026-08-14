@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.10'
+$script:ToolVersion = '1.0.11'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -612,6 +612,103 @@ function Get-VmCommitFailureNames {
     return ,$names
 }
 
+function Get-VmCompressedCommitFailureNames {
+    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $logs = @(
+        (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
+        (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log')
+    )
+    foreach ($log in $logs) {
+        if (-not (Test-Path -LiteralPath $log -PathType Leaf)) { continue }
+        foreach ($line in (Get-Content -LiteralPath $log -Tail 800 -ErrorAction SilentlyContinue)) {
+            $match = [regex]::Match(
+                $line,
+                "copyfile '[^']*[\\/](?<name>rootfs\.vhdx|vmlinuz|initrd)\.zst\.(?<prefix>[0-9a-f]{12})\.partial' -> '[^']*[\\/](?<destination>[^']+)'",
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+            if ($match.Success -and $match.Groups['destination'].Value.Equals("$($match.Groups['name'].Value).zst", [StringComparison]::OrdinalIgnoreCase)) {
+                [void]$names.Add($match.Groups['name'].Value)
+            }
+        }
+    }
+    return ,$names
+}
+
+function Sync-CompletedVmCompressedCache {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$ManifestChecksum,
+        [Parameter(Mandatory)][string]$BundleSha,
+        [Parameter(Mandatory)][string[]]$BundleDirectories
+    )
+    if ($Name -notin @('rootfs.vhdx', 'vmlinuz', 'initrd')) { throw "拒绝接管非 manifest VM 缓存：$Name" }
+    $source = [IO.Path]::GetFullPath($SourcePath)
+    $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+    if ($sourceItem.PSIsContainer -or $sourceItem.Length -le 0 -or
+        ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        ($sourceItem.Attributes -band [IO.FileAttributes]::Encrypted)) {
+        throw "VM 压缩缓存不是普通未加密文件：$source"
+    }
+    if (-not (Test-FileExclusiveAccess $source)) { return $false }
+
+    $allowedDirectories = @($BundleDirectories | ForEach-Object { [IO.Path]::GetFullPath($_) } | Select-Object -Unique)
+    $sourceDirectory = [IO.Path]::GetDirectoryName($source)
+    if (-not ($allowedDirectories | Where-Object { $_.Equals($sourceDirectory, [StringComparison]::OrdinalIgnoreCase) })) {
+        throw "VM 压缩缓存不属于 Claude 的候选 bundle：$source"
+    }
+    $prefix = $ManifestChecksum.Substring(0, 12).ToLowerInvariant()
+    $allowedLeaves = @("$Name.zst.$prefix.partial", "$Name.zst")
+    if ((Split-Path -Leaf $source) -notin $allowedLeaves) {
+        throw "VM 压缩缓存名与当前官方 manifest 不匹配：$source"
+    }
+
+    $orderedDirectories = @($sourceDirectory) + @($allowedDirectories | Where-Object { -not $_.Equals($sourceDirectory, [StringComparison]::OrdinalIgnoreCase) })
+    $materialized = $null
+    foreach ($directory in $orderedDirectories) {
+        $parent = Split-Path -Parent $directory
+        if ((Test-ReparsePoint $parent) -or (Test-EncryptedPath $parent)) {
+            throw "VM 缓存目标父目录不安全（重解析点或加密）：$parent"
+        }
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        if ((Test-ReparsePoint $directory) -or (Test-EncryptedPath $directory)) {
+            throw "VM 缓存目标目录不安全（重解析点或加密）：$directory"
+        }
+
+        $final = Join-Path $directory "$Name.zst"
+        if (Test-Path -LiteralPath $final) {
+            $existing = Get-Item -LiteralPath $final -Force
+            if ($existing.PSIsContainer -or $existing.Length -ne $sourceItem.Length) {
+                throw "目标 VM 压缩缓存已存在但大小不同，拒绝覆盖：$final"
+            }
+        } elseif ($source.Equals((Join-Path $directory "$Name.zst.$prefix.partial"), [StringComparison]::OrdinalIgnoreCase)) {
+            Move-Item -LiteralPath $source -Destination $final
+            $materialized = $final
+        } else {
+            if (-not $materialized) { $materialized = $source }
+            $targetRoot = [IO.Path]::GetPathRoot($final)
+            $targetDrive = Get-PSDrive -Name $targetRoot.TrimEnd('\').TrimEnd(':') -ErrorAction SilentlyContinue
+            $requiredFree = [int64]$sourceItem.Length + 512MB
+            if ($targetDrive -and $targetDrive.Free -lt $requiredFree) {
+                throw "同步 $Name 压缩缓存需要 $([math]::Round($requiredFree/1GB,1)) GB，但 $targetRoot 仅剩 $([math]::Round($targetDrive.Free/1GB,1)) GB。"
+            }
+            Copy-Item -LiteralPath $materialized -Destination $final
+            if ((Get-Item -LiteralPath $final -Force).Length -ne $sourceItem.Length) {
+                Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
+                throw "同步后的 VM 压缩缓存大小不一致：$final"
+            }
+        }
+        if (-not $materialized) { $materialized = $final }
+    }
+
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    foreach ($directory in $orderedDirectories) {
+        [IO.File]::WriteAllText((Join-Path $directory ".$Name.zst.origin"), $BundleSha, $utf8NoBom)
+    }
+    Write-Log "已接管 $Name 的完整下载缓存；Claude 将在解压后继续执行官方 SHA-256 校验。" OK
+    return $true
+}
+
 function Sync-VerifiedVmFile {
     param(
         [Parameter(Mandatory)][string]$SourcePath,
@@ -696,6 +793,7 @@ function Repair-MsixVmCommitFailure {
     $bundleDirectories = @(Get-VmBundleCandidateDirectories)
     if ($bundleDirectories.Count -eq 0) { return $false }
     $failureNames = Get-VmCommitFailureNames
+    $compressedFailureNames = Get-VmCompressedCommitFailureNames
 
     foreach ($file in $manifest.Files) {
         if ($file.Name -notin @('rootfs.vhdx', 'vmlinuz', 'initrd')) { continue }
@@ -703,6 +801,40 @@ function Repair-MsixVmCommitFailure {
         $activeOrigin = Join-Path ([string]$State.OriginalPath) ".$($file.Name).origin"
         if ((Test-Path -LiteralPath $activeFinal) -and (Test-Path -LiteralPath $activeOrigin) -and
             ((Get-Content -LiteralPath $activeOrigin -Raw -ErrorAction SilentlyContinue).Trim() -eq $manifest.Sha)) { continue }
+
+        $compressedSources = New-Object System.Collections.Generic.List[string]
+        $prefix = $file.Checksum.Substring(0, 12).ToLowerInvariant()
+        foreach ($directory in $bundleDirectories) {
+            $partial = Join-Path $directory "$($file.Name).zst.$prefix.partial"
+            if ($compressedFailureNames.Contains($file.Name) -and (Test-Path -LiteralPath $partial -PathType Leaf)) {
+                $compressedSources.Add($partial)
+            }
+            $cache = Join-Path $directory "$($file.Name).zst"
+            $cacheOrigin = Join-Path $directory ".$($file.Name).zst.origin"
+            if ((Test-Path -LiteralPath $cache -PathType Leaf) -and (Test-Path -LiteralPath $cacheOrigin -PathType Leaf) -and
+                ((Get-Content -LiteralPath $cacheOrigin -Raw -ErrorAction SilentlyContinue).Trim() -eq $manifest.Sha)) {
+                $compressedSources.Add($cache)
+            }
+        }
+        foreach ($source in @($compressedSources | Select-Object -Unique)) {
+            $item = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+            if (-not $item -or -not (Test-FileExclusiveAccess $source)) { continue }
+            $attemptKey = "compressed|$source|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
+            if ($script:VmCommitAttempted.ContainsKey($attemptKey)) { continue }
+            $script:VmCommitAttempted[$attemptKey] = $true
+
+            Write-Log "检测到 MSIX 无法提交 $($file.Name) 压缩缓存，将核对当前 manifest 后接管；解压结果仍由 Claude 做完整校验。" WARN
+            Stop-ClaudeProcesses
+            Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+            $promoted = $false
+            try {
+                $promoted = Sync-CompletedVmCompressedCache -SourcePath $source -Name $file.Name -ManifestChecksum $file.Checksum -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
+            } finally {
+                Start-CoworkServices
+                if (-not $promoted) { Start-ClaudeAppx }
+            }
+            if ($promoted) { return $true }
+        }
 
         $sources = New-Object System.Collections.Generic.List[string]
         foreach ($directory in $bundleDirectories) {
@@ -1034,8 +1166,10 @@ function Invoke-Diagnostics {
             }
         }
         $commitFailures = Get-VmCommitFailureNames
-        if ($commitFailures.Count -gt 0) {
-            Add-Finding 'msix-vm-commit' 'Warning' "检测到 MSIX VM 临时文件落盘失败：$(@($commitFailures) -join ', ')" 'Auto 模式会仅接管与官方 manifest SHA-256 完全匹配的临时文件。'
+        $compressedCommitFailures = Get-VmCompressedCommitFailureNames
+        $allCommitFailures = @(@($commitFailures) + @($compressedCommitFailures) | Select-Object -Unique)
+        if ($allCommitFailures.Count -gt 0) {
+            Add-Finding 'msix-vm-commit' 'Warning' "检测到 MSIX VM 临时文件或压缩缓存落盘失败：$($allCommitFailures -join ', ')" 'Auto 模式会核对官方 manifest；运行文件必须完整匹配 SHA-256，压缩缓存的解压结果仍由 Claude 完整校验。'
         }
     } else {
         if ($selectedInstallation) {
