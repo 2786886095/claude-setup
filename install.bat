@@ -37,6 +37,10 @@ if "%CLAUDE_SETUP_EXIT%"=="0" (
     echo Windows restart is required. Restart the computer to continue setup.
 ) else if "%CLAUDE_SETUP_EXIT%"=="194" (
     echo Windows restart is required. Restart the computer to continue setup.
+) else if "%CLAUDE_SETUP_EXIT%"=="4" (
+    echo VM rebuild is waiting for Cowork to finish downloading.
+    echo Open Cowork in Claude, wait for the download, then run install.bat again.
+    echo The encrypted backup has NOT been deleted.
 ) else (
     echo Setup exited with code %CLAUDE_SETUP_EXIT%.
     echo Check the reports folder for diagnostics.

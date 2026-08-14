@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.3'
+$script:ToolVersion = '1.0.4'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -28,6 +28,7 @@ $script:ReportsRoot = Join-Path $script:Root 'reports'
 $script:DownloadsRoot = Join-Path $script:Root 'downloads'
 $script:ProgramDataRoot = Join-Path $env:ProgramData 'ClaudeSetup'
 $script:BackupRoot = Join-Path $script:ProgramDataRoot 'backups'
+$script:VmRebuildStatePath = Join-Path $script:ProgramDataRoot 'vm-rebuild-active.json'
 $script:LogPath = $null
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:NeedsRestart = $false
@@ -431,6 +432,176 @@ function Test-VmRuntimeEfsItem {
     return $Item.Name -like '*.vhdx' -or $Item.Name -in @('initrd', 'vmlinuz')
 }
 
+function Get-CurrentBootStamp {
+    return (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+}
+
+function Get-VmRebuildState {
+    if (-not (Test-Path -LiteralPath $script:VmRebuildStatePath)) { return $null }
+    try {
+        return Get-Content -LiteralPath $script:VmRebuildStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        throw "VM 重建状态文件损坏，拒绝继续：$script:VmRebuildStatePath"
+    }
+}
+
+function Save-VmRebuildState {
+    param([Parameter(Mandatory)]$State)
+    New-Item -ItemType Directory -Path $script:ProgramDataRoot -Force | Out-Null
+    $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:VmRebuildStatePath -Encoding UTF8
+}
+
+function Assert-VmRebuildState {
+    param([Parameter(Mandatory)]$State)
+    if ([int]$State.SchemaVersion -ne 1) { throw '不支持的 VM 重建状态版本。' }
+    $paths = Get-ClaudePaths
+    if (-not $paths) { throw '无法验证 VM 重建状态：Claude 官方 AppX 不存在。' }
+    $vmBundles = [IO.Path]::GetFullPath((Join-Path $paths.LocalUserData 'vm_bundles'))
+    $expectedBundle = [IO.Path]::GetFullPath((Join-Path $vmBundles 'claudevm.bundle'))
+    $stateBundle = [IO.Path]::GetFullPath([string]$State.OriginalPath)
+    $stateBackup = [IO.Path]::GetFullPath([string]$State.BackupPath)
+    if (-not $stateBundle.Equals($expectedBundle, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "VM 重建状态的活动路径不属于当前 Claude：$stateBundle"
+    }
+    if (-not ([IO.Path]::GetDirectoryName($stateBackup)).Equals($vmBundles, [StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Leaf $stateBackup) -notlike 'claudevm.bundle.backup-*') {
+        throw "VM 重建状态的备份路径不安全：$stateBackup"
+    }
+    if (-not (Test-Path -LiteralPath $stateBackup)) { throw "VM 重建备份丢失：$stateBackup" }
+    if (Test-ReparsePoint $stateBackup) { throw "VM 重建备份变成了重解析点：$stateBackup" }
+}
+
+function Get-VmBundleStatus {
+    param([Parameter(Mandatory)][string]$BundlePath)
+    $required = @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz')
+    $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $BundlePath $_)) })
+    $encrypted = @()
+    if (Test-Path -LiteralPath $BundlePath) {
+        $encrypted = @(Get-ChildItem -LiteralPath $BundlePath -Force -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::Encrypted) -and (Test-VmRuntimeEfsItem $_) })
+        if (Test-EncryptedPath $BundlePath) { $encrypted += Get-Item -LiteralPath $BundlePath -Force }
+    }
+    return [pscustomobject]@{
+        Ready = (Test-Path -LiteralPath $BundlePath) -and $missing.Count -eq 0 -and $encrypted.Count -eq 0 -and -not (Test-ReparsePoint $BundlePath)
+        Missing = $missing
+        Encrypted = $encrypted
+        ReparsePoint = Test-ReparsePoint $BundlePath
+    }
+}
+
+function Start-SafeVmBundleRebuild {
+    param([Parameter(Mandatory)][string]$Reason)
+    $paths = Get-ClaudePaths
+    if (-not $paths) { throw '无法为 VM 重建解析 Claude 路径。' }
+    $vmBundles = Join-Path $paths.LocalUserData 'vm_bundles'
+    $bundle = Join-Path $vmBundles 'claudevm.bundle'
+    if (-not (Test-Path -LiteralPath $bundle)) { throw "需要重建，但未找到原 bundle：$bundle" }
+    if ((Test-ReparsePoint $vmBundles) -or (Test-ReparsePoint $bundle)) {
+        throw 'vm_bundles 或 claudevm.bundle 是重解析点；为避免移动错误目标，拒绝自动重建。'
+    }
+    if (Test-EncryptedPath $vmBundles) {
+        throw 'vm_bundles 父目录会让新文件继续继承加密；拒绝在该目录中自动重建。'
+    }
+
+    $bundleBytes = [int64](Get-ChildItem -LiteralPath $bundle -Force -File -Recurse -ErrorAction Stop |
+        Measure-Object -Property Length -Sum).Sum
+    $volumeRoot = [IO.Path]::GetPathRoot($bundle)
+    $driveName = $volumeRoot.TrimEnd('\').TrimEnd(':')
+    $drive = Get-PSDrive -Name $driveName -ErrorAction Stop
+    $requiredFree = $bundleBytes + 2GB
+    if ($drive.Free -lt $requiredFree) {
+        throw "安全重建需要保留原 bundle 并下载新副本；可用空间 $([math]::Round($drive.Free/1GB,1)) GB，小于所需 $([math]::Round($requiredFree/1GB,1)) GB。"
+    }
+
+    Stop-ClaudeProcesses
+    Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+    $service = Get-Service CoworkVMService -ErrorAction SilentlyContinue
+    if ($service) {
+        $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(20))
+        $service.Refresh()
+        if ($service.Status -ne 'Stopped') { throw 'CoworkVMService 未能停止，拒绝移动 VM bundle。' }
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backup = Join-Path $vmBundles "claudevm.bundle.backup-$stamp"
+    if (Test-Path -LiteralPath $backup) { throw "备份目标已存在：$backup" }
+    Move-Item -LiteralPath $bundle -Destination $backup
+    if ((Test-Path -LiteralPath $bundle) -or -not (Test-Path -LiteralPath $backup)) {
+        throw 'VM bundle 同卷重命名后的路径验证失败。'
+    }
+
+    $state = [pscustomobject]@{
+        SchemaVersion = 1
+        Status = 'AwaitingRestart'
+        Reason = $Reason
+        OriginalPath = $bundle
+        BackupPath = $backup
+        BackupBytes = $bundleBytes
+        StagedAt = (Get-Date).ToUniversalTime().ToString('o')
+        BootStamp = Get-CurrentBootStamp
+    }
+    try {
+        Save-VmRebuildState $state
+        Register-ResumeAfterRestart
+    } catch {
+        $registrationError = $_.Exception.Message
+        $rolledBack = $false
+        try {
+            if ((Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $bundle)) {
+                Move-Item -LiteralPath $backup -Destination $bundle
+            }
+            if (Test-Path -LiteralPath $bundle) {
+                Remove-ResumeAfterRestart
+                Remove-Item -LiteralPath $script:VmRebuildStatePath -Force -ErrorAction SilentlyContinue
+                $rolledBack = $true
+            }
+        } catch {}
+        if ($rolledBack) { throw "无法登记重启续跑，VM bundle 已回滚到原路径：$registrationError" }
+        throw "无法登记重启续跑且自动回滚未完成。请保留以下路径并人工核对：原路径=$bundle；备份=$backup；错误=$registrationError"
+    }
+    Write-Log "已将加密 VM bundle 同卷重命名备份到：$backup" OK
+    Write-Log '备份不会自动删除；只有新 bundle 完整、未加密且 Cowork 验证通过后才会结束重建状态。' WARN
+    return $state
+}
+
+function Test-RebuildRestartCompleted {
+    param([Parameter(Mandatory)]$State)
+    return (Get-CurrentBootStamp) -ne [string]$State.BootStamp
+}
+
+function Wait-ForRebuiltVmBundle {
+    param(
+        [Parameter(Mandatory)]$State,
+        [int]$Seconds = 300
+    )
+    Write-Log '请在已启动的 Claude 中进入 Cowork；脚本等待新 VM bundle 与 sessiondata.vhdx，最长 5 分钟。' WARN
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $nextProgress = Get-Date
+    while ((Get-Date) -lt $deadline) {
+        $status = Get-VmBundleStatus -BundlePath $State.OriginalPath
+        if ($status.Ready) { return $true }
+        if ((Get-Date) -ge $nextProgress) {
+            $encryptedNames = @($status.Encrypted | Select-Object -ExpandProperty Name -Unique)
+            Write-Log "等待重建：缺少=$($status.Missing -join ',')；加密运行项=$($encryptedNames -join ',')；重解析点=$($status.ReparsePoint)" INFO
+            $nextProgress = (Get-Date).AddSeconds(30)
+        }
+        Start-Sleep -Seconds 5
+    }
+    return $false
+}
+
+function Complete-VmBundleRebuild {
+    param([Parameter(Mandatory)]$State)
+    $State.Status = 'Completed'
+    $State | Add-Member -NotePropertyName VerifiedAt -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o')) -Force
+    Save-VmRebuildState $State
+    $receipt = Join-Path $script:ProgramDataRoot ("vm-rebuild-completed-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $receipt -Encoding UTF8
+    Remove-Item -LiteralPath $script:VmRebuildStatePath -Force
+    Write-Log "新 VM bundle 已验证；原加密备份继续保留：$($State.BackupPath)" OK
+    Write-Log "重建完成记录：$receipt" INFO
+}
+
 function Test-CompressedPath {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
@@ -479,10 +650,14 @@ function Invoke-Diagnostics {
     $selectedInstallation = Select-ClaudeInstallation $installations
     $package = if ($selectedInstallation -and $selectedInstallation.Type -eq 'MSIX') { $selectedInstallation.Package } else { $null }
     $paths = Get-ClaudePaths
+    $rebuildState = Get-VmRebuildState
     $vmp = $null
     try { $vmp = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop } catch {}
 
     Add-Finding 'os' 'Info' "$($os.Caption) $($os.Version), build $($os.BuildNumber)" "$($computer.Manufacturer) $($computer.Model)"
+    if ($rebuildState) {
+        Add-Finding 'vm-rebuild-state' 'Warning' "VM bundle 安全重建进行中：$($rebuildState.Status)" "备份：$($rebuildState.BackupPath)`r`n活动路径：$($rebuildState.OriginalPath)"
+    }
     if ([version]$os.Version -ge [version]'10.0') {
         Add-Finding 'os-support' 'Pass' 'Windows 10/11 版本范围受 Claude Desktop 支持'
     } else {
@@ -930,12 +1105,17 @@ function Repair-VmStorageAttributes {
     if (Test-ReparsePoint $vmBundles) {
         throw "检测到 vm_bundles 是重解析点：$vmBundles。为避免误移动大量 VM 数据，脚本不会自动删除联接。"
     }
-    $allEncrypted = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
+    $bundle = Join-Path $vmBundles 'claudevm.bundle'
+    if (-not (Test-Path -LiteralPath $bundle)) { return }
+    $allEncrypted = @(Get-ChildItem -LiteralPath $bundle -Force -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
     $nonRuntimeEncrypted = @($allEncrypted | Where-Object { -not (Test-VmRuntimeEfsItem $_) })
     $encrypted = @($allEncrypted | Where-Object { Test-VmRuntimeEfsItem $_ })
     if (Test-EncryptedPath $vmBundles) {
         $encrypted += Get-Item -LiteralPath $vmBundles -Force
+    }
+    if (Test-EncryptedPath $bundle) {
+        $encrypted += Get-Item -LiteralPath $bundle -Force
     }
     if ($nonRuntimeEncrypted.Count -gt 0) {
         Write-Log "检测到 $($nonRuntimeEncrypted.Count) 个 .origin/.zst/状态文件带加密属性；它们不是 HCS 运行文件，保留且不阻断安装。" INFO
@@ -944,19 +1124,28 @@ function Repair-VmStorageAttributes {
         Write-Log '正在移除 VM bundle 的 EFS 加密属性。' WARN
         Stop-ClaudeProcesses
         Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
-        foreach ($item in @($encrypted | Sort-Object { $_.FullName.Length } -Descending)) {
-            $length = if ($item.PSIsContainer) { '-' } else { [string]$item.Length }
-            Write-Log "EFS 运行目标：$($item.FullName)；大小=$length；属性=$($item.Attributes)" INFO
-            Invoke-EfsDecrypt -Path $item.FullName
+        try {
+            foreach ($item in @($encrypted | Sort-Object { $_.FullName.Length } -Descending)) {
+                $length = if ($item.PSIsContainer) { '-' } else { [string]$item.Length }
+                Write-Log "EFS 运行目标：$($item.FullName)；大小=$length；属性=$($item.Attributes)" INFO
+                Invoke-EfsDecrypt -Path $item.FullName
+            }
+        } catch {
+            Write-Log "标准 EFS 解密失败，将切换到可回滚的 VM bundle 重建：$($_.Exception.Message)" WARN
+            return Start-SafeVmBundleRebuild -Reason $_.Exception.Message
         }
-        $remaining = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
+        $remaining = @(Get-ChildItem -LiteralPath $bundle -Force -Recurse -ErrorAction SilentlyContinue |
             Where-Object { ($_.Attributes -band [IO.FileAttributes]::Encrypted) -and (Test-VmRuntimeEfsItem $_) })
         if (Test-EncryptedPath $vmBundles) {
             $remaining += Get-Item -LiteralPath $vmBundles -Force
         }
+        if (Test-EncryptedPath $bundle) {
+            $remaining += Get-Item -LiteralPath $bundle -Force
+        }
         if ($remaining.Count -gt 0) { throw '无法移除 vm_bundles 或其中文件的 EFS 加密属性。' }
         Write-Log 'VM bundle 的 EFS 加密属性已移除。' OK
     }
+    return $null
 }
 
 function Repair-IncompleteWorkspace {
@@ -1132,16 +1321,62 @@ function Invoke-AutoSetup {
         return 3010
     }
 
+    $rebuildState = Get-VmRebuildState
+    if ($rebuildState) { Assert-VmRebuildState $rebuildState }
+    if ($rebuildState -and $rebuildState.Status -eq 'Completed') {
+        $completedStatus = Get-VmBundleStatus -BundlePath $rebuildState.OriginalPath
+        if (-not $completedStatus.Ready) { throw 'VM 重建状态标记为 Completed，但活动 bundle 未通过复核。' }
+        Remove-Item -LiteralPath $script:VmRebuildStatePath -Force
+        Write-Log "已清理上次完成但未移除的活动状态；备份仍保留：$($rebuildState.BackupPath)" INFO
+        $rebuildState = $null
+    }
+    if ($rebuildState -and -not (Test-RebuildRestartCompleted $rebuildState)) {
+        Register-ResumeAfterRestart
+        Write-Log '加密 VM bundle 已安全备份；必须重启 Windows 后才能创建全新的 VM。' WARN
+        if ($RestartIfNeeded) {
+            Write-Log '将在 15 秒后重新启动。运行 shutdown /a 可取消。' WARN
+            & shutdown.exe /r /t 15 /c 'Claude Setup 正在重建 Cowork VM bundle'
+        }
+        return 3010
+    }
+    if ($rebuildState) {
+        $rebuildState.Status = 'Rebuilding'
+        Save-VmRebuildState $rebuildState
+        Write-Log "检测到重启已完成，开始验证新 VM bundle；旧备份：$($rebuildState.BackupPath)" INFO
+    }
+
     Repair-ExistingPackageVolume
     $paths = Repair-ClaudePackageAndSignature
-    Repair-VmStorageAttributes
-    Repair-IncompleteWorkspace
+    if (-not $rebuildState) {
+        $stagedRebuild = Repair-VmStorageAttributes
+        if ($stagedRebuild) {
+            Write-Log '已完成可回滚备份。请重启 Windows；登录后脚本会自动继续。' WARN
+            if ($RestartIfNeeded) {
+                Write-Log '将在 15 秒后重新启动。运行 shutdown /a 可取消。' WARN
+                & shutdown.exe /r /t 15 /c 'Claude Setup 正在重建 Cowork VM bundle'
+            }
+            return 3010
+        }
+        Repair-IncompleteWorkspace
+    }
     Start-CoworkServices
     Install-CompatibleChinese
     [void](Install-ClaudeDesktopShortcut)
     if (-not $SkipLaunch) {
         Start-ClaudeAppx
-        if (-not (Invoke-HealthWait)) { return 3 }
+        if ($rebuildState) {
+            if (-not (Wait-ForRebuiltVmBundle -State $rebuildState)) {
+                Write-Log '新 VM bundle 尚未完成。请进入 Claude 的 Cowork，等待下载完成后再次运行 install.bat；旧备份仍保留。' ERROR
+                return 4
+            }
+            if (-not (Invoke-HealthWait -VmSeconds 300)) { return 3 }
+            Complete-VmBundleRebuild -State $rebuildState
+        } elseif (-not (Invoke-HealthWait)) {
+            return 3
+        }
+    } elseif ($rebuildState) {
+        Write-Log 'VM 重建验证不能与 -SkipLaunch 同时使用；旧备份和重建状态均已保留。' ERROR
+        return 4
     }
     return 0
 }
@@ -1178,7 +1413,12 @@ try {
             if ($script:NeedsRestart) { Register-ResumeAfterRestart; $exitCode = 3010; break }
             Repair-ExistingPackageVolume
             [void](Repair-ClaudePackageAndSignature)
-            Repair-VmStorageAttributes
+            $stagedRebuild = Repair-VmStorageAttributes
+            if ($stagedRebuild) {
+                Write-Log '已完成可回滚备份。请重启 Windows；登录后运行 install.bat 继续验证。' WARN
+                $exitCode = 3010
+                break
+            }
             Repair-IncompleteWorkspace
             Start-CoworkServices
             [void](Install-ClaudeDesktopShortcut)

@@ -46,6 +46,13 @@ $requiredSafetyChecks = @(
     'Install-ClaudeDesktopShortcut'
     'shell:AppsFolder\$script:Aumid'
     'Test-VmRuntimeEfsItem'
+    'Start-SafeVmBundleRebuild'
+    'Wait-ForRebuiltVmBundle'
+    'Complete-VmBundleRebuild'
+    'Assert-VmRebuildState'
+    'vm-rebuild-active.json'
+    'claudevm.bundle.backup-'
+    'BackupBytes'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -58,6 +65,15 @@ if ($main -match 'AllowUnsigned') {
 }
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
+}
+if ($main -notmatch 'Move-Item -LiteralPath \$bundle -Destination \$backup') {
+    throw 'Encrypted VM rebuild must use an in-volume rename to a unique backup.'
+}
+if ($main -match 'Remove-Item[^\r\n]*(BackupPath|claudevm\.bundle\.backup)') {
+    throw 'The installer must never automatically delete an encrypted VM backup.'
+}
+if ($main -notmatch '\$requiredFree = \$bundleBytes \+ 2GB') {
+    throw 'Safe rebuild must reserve enough free space for the retained backup and new bundle.'
 }
 if ($main -match 'cipher\.exe\s+/d') {
     throw 'EFS repair must use the Unicode DecryptFile API so non-ASCII profile paths are safe.'
@@ -75,8 +91,9 @@ if ($main -match 'Add-AppxPackage\s+-Path' -and $main -notmatch 'parameters\.Vol
 if ($main -notmatch 'Remove-ResumeAfterRestart') {
     throw 'The one-shot installer must clear its temporary RunOnce resume entry.'
 }
-if ($main -notmatch 'if \(-not \(Invoke-HealthWait\)\) \{ return 3 \}') {
-    throw 'Auto setup must fail closed when the current-run Cowork health check does not pass.'
+if ($main -notmatch 'Invoke-HealthWait -VmSeconds 300\)\) \{ return 3 \}' -or
+    $main -notmatch 'elseif \(-not \(Invoke-HealthWait\)\)') {
+    throw 'Normal and rebuilt Auto paths must fail closed when the current-run Cowork health check does not pass.'
 }
 if ($main -notmatch 'if \(\$handshakePassed -and -not \$vmRequested\)') {
     throw 'A valid handshake with no requested VM must pass after the handshake deadline.'
@@ -102,6 +119,9 @@ if ($batch -notmatch '(?i)Recommended entry:\s*install\.bat') {
 }
 if ($legacyBatch -notmatch '旧版兼容入口' -or $legacyBatch -notmatch '唯一推荐入口 install\.bat') {
     throw 'setup.cmd must visibly identify itself as a legacy compatibility entry.'
+}
+if ($batch -notmatch 'CLAUDE_SETUP_EXIT%"=="4"' -or $batch -notmatch 'encrypted backup has NOT been deleted') {
+    throw 'install.bat must explain the pending Cowork rebuild exit code without claiming deletion.'
 }
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY
@@ -152,6 +172,28 @@ try {
     }
     if (-not (Test-VmRuntimeEfsItem $runtimeDisk) -or -not (Test-VmRuntimeEfsItem $kernel) -or -not (Test-VmRuntimeEfsItem $directory)) {
         throw 'VM directories, VHDX files, initrd, and vmlinuz must remain strict EFS repair targets.'
+    }
+
+    $statusRoot = Join-Path ([IO.Path]::GetTempPath()) ("ClaudeSetupStatic-{0}" -f [guid]::NewGuid().ToString('N'))
+    $safeTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    try {
+        New-Item -ItemType Directory -Path $statusRoot -Force | Out-Null
+        foreach ($name in @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz')) {
+            New-Item -ItemType File -Path (Join-Path $statusRoot $name) -Force | Out-Null
+        }
+        $readyStatus = Get-VmBundleStatus -BundlePath $statusRoot
+        if (-not $readyStatus.Ready) { throw 'A complete unencrypted test bundle must be ready.' }
+        Remove-Item -LiteralPath (Join-Path $statusRoot 'sessiondata.vhdx') -Force
+        $missingStatus = Get-VmBundleStatus -BundlePath $statusRoot
+        if ($missingStatus.Ready -or $missingStatus.Missing -notcontains 'sessiondata.vhdx') {
+            throw 'Bundle readiness must require sessiondata.vhdx.'
+        }
+    } finally {
+        $resolvedStatusRoot = [IO.Path]::GetFullPath($statusRoot)
+        if ($resolvedStatusRoot.StartsWith($safeTempRoot, [StringComparison]::OrdinalIgnoreCase) -and
+            (Split-Path -Leaf $resolvedStatusRoot) -like 'ClaudeSetupStatic-*') {
+            Remove-Item -LiteralPath $resolvedStatusRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     $currentCandidates = @(Get-ClaudeInstallationCandidates)

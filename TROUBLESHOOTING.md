@@ -67,3 +67,8 @@
 ## 完整汉化与 Cowork
 
 完整汉化若修改 `Claude.exe` 或 `app.asar`，会使签名失效。CoworkVMService 随后拒绝客户端并关闭 RPC 管道。工具不提供签名绕过，也不会自动启用完整汉化。
+# Encrypted Cowork VM bundle / Win32 87
+
+如果真实 VM 文件（如 `smol-bin.vhdx`、`rootfs.vhdx`）带 `Encrypted` 属性，而标准 `DecryptFileW` 返回 Win32 87，运行最新版 `install.bat`。脚本会采用同卷重命名备份和重启后重建流程，不会自动删除备份。
+
+重启后若脚本返回退出码 4，请在 Claude 中进入 Cowork，等待官方 VM 下载完成，然后再次运行 `install.bat`。活动状态与完成记录位于 `%ProgramData%\ClaudeSetup`，原备份位于原 `vm_bundles` 目录。

@@ -41,6 +41,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 修复 TEMP 与 LocalAppData 跨盘造成的 `EXDEV`；
 - 检测 EFS 加密、目录联接与 `rootfs.vhdx/sessiondata.vhdx`；
 - EFS 修复只阻断实际 VM 目录、`*.vhdx`、`initrd` 和 `vmlinuz`；Claude 自带的 `.origin` 完整性元数据、`.zst` 下载归档和状态标记会保留并记为信息，避免 Win32 87 误报。
+- 若真实 VM 文件无法用当前账户标准解密，脚本不会删除或覆盖它们：仅在父目录不继承加密且磁盘空间充足时，把整个 `claudevm.bundle` 同卷重命名为时间戳备份，注册一次性重启续跑，再由官方 Claude 重建。
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
@@ -59,6 +60,19 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 `setup.cmd` 仅为兼容旧下载保留，它会转交给 `install.bat`；两者不要重复运行。
 
 只诊断、不修改系统：双击 `diagnose.cmd`。
+
+### 加密 VM 的可回滚重建
+
+当 `*.vhdx` 等真实运行文件带加密属性且 Windows 返回 Win32 87、无法标准解密时：
+
+1. 脚本停止 Claude 与 `CoworkVMService`；
+2. 验证 `vm_bundles` 不是重解析点、父目录不继承加密，并预留“旧 bundle 大小 + 2 GB”的可用空间；
+3. 将 `claudevm.bundle` 同卷重命名为 `claudevm.bundle.backup-时间戳`，不覆盖、不跨卷复制；
+4. 注册一次性重启续跑并要求重启 Windows；
+5. 重启后启动官方 Claude。请进入 Cowork，让官方客户端下载并创建新的 `rootfs.vhdx` 与 `sessiondata.vhdx`；
+6. 只有新 bundle 文件齐全、运行文件未加密且 Cowork 健康检查通过，脚本才结束重建状态。
+
+加密备份永远不会由脚本自动删除。确认 Cowork 长期正常后，用户可以自行处理备份。
 
 也可以在管理员 PowerShell 中运行：
 
