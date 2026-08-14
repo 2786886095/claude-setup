@@ -746,8 +746,6 @@ function Install-OfficialClaude {
     $parameters = @{
         Path = $Download.Path
         ForceApplicationShutdown = $true
-        ForceTargetApplicationShutdown = $true
-        InstallAllResources = $true
     }
     if ($systemVolume) { $parameters.Volume = $systemVolume }
     try {
@@ -970,15 +968,21 @@ function Start-ClaudeAppx {
 }
 
 function Invoke-HealthWait {
-    param([int]$Seconds = 45)
+    param(
+        [int]$HandshakeSeconds = 45,
+        [int]$VmSeconds = 120
+    )
     $serviceLog = 'C:\ProgramData\Claude\Logs\cowork-service.log'
     $mainProcess = Get-Process -Name Claude -ErrorAction SilentlyContinue |
         Where-Object { $_.MainWindowHandle -ne 0 } |
         Sort-Object StartTime -Descending |
         Select-Object -First 1
     $cutoff = if ($mainProcess) { $mainProcess.StartTime.AddSeconds(-3) } else { (Get-Date).AddSeconds(-5) }
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    while ((Get-Date) -lt $deadline) {
+    $handshakeDeadline = (Get-Date).AddSeconds($HandshakeSeconds)
+    $vmDeadline = $null
+    $handshakePassed = $false
+    $vmRequested = $false
+    while ((Get-Date) -lt $handshakeDeadline -or ($vmDeadline -and (Get-Date) -lt $vmDeadline)) {
         if (Test-Path -LiteralPath $serviceLog) {
             $tail = Get-Content -LiteralPath $serviceLog -Tail 160 -ErrorAction SilentlyContinue
             $currentRun = @($tail | Where-Object {
@@ -986,7 +990,20 @@ function Invoke-HealthWait {
                 $stamp = [datetime]::MinValue
                 return [datetime]::TryParse($Matches.stamp, [ref]$stamp) -and $stamp -ge $cutoff
             })
-            if ($currentRun -match 'API reachability: REACHABLE' -and $currentRun -match 'sdk-daemon is ready') {
+            if ($currentRun -match 'Client signature verified:' -and $currentRun -match 'Persistent RPC: entering loop') {
+                if (-not $handshakePassed) {
+                    $handshakePassed = $true
+                    Write-Log 'Cowork 服务已验证当前 Claude 官方签名，RPC 连接正常。' OK
+                }
+            }
+            if ($currentRun -match 'Configuring VM for user=|Creating HCS compute system|Starting compute system') {
+                if (-not $vmRequested) {
+                    $vmRequested = $true
+                    $vmDeadline = (Get-Date).AddSeconds($VmSeconds)
+                    Write-Log '检测到本轮已请求启动 Cowork VM，继续等待网络与 API。' INFO
+                }
+            }
+            if ($vmRequested -and $currentRun -match 'API reachability: REACHABLE' -and $currentRun -match 'sdk-daemon is ready') {
                 Write-Log 'Cowork VM 网络已连接，API 可达。' OK
                 return $true
             }
@@ -994,10 +1011,22 @@ function Invoke-HealthWait {
                 Write-Log '当前 Claude 客户端被 Cowork 服务拒绝：签名验证失败。' ERROR
                 return $false
             }
+            if ($handshakePassed -and -not $vmRequested -and (Get-Date) -ge $handshakeDeadline) {
+                Write-Log 'Claude 与 Cowork 服务握手通过；VM 尚未被用户请求，深度 VM 检测延期到首次进入 Cowork。' OK
+                return $true
+            }
         }
         Start-Sleep -Seconds 2
     }
-    Write-Log '未在等待时间内确认 Cowork API 可达；已生成诊断报告供进一步排查。' WARN
+    if ($handshakePassed -and -not $vmRequested) {
+        Write-Log 'Claude 与 Cowork 服务握手通过；VM 尚未被用户请求，深度 VM 检测延期到首次进入 Cowork。' OK
+        return $true
+    }
+    if (-not $handshakePassed) {
+        Write-Log "未在 $HandshakeSeconds 秒内确认本轮 Claude/Cowork 签名握手；验证失败。" ERROR
+    } elseif ($vmRequested) {
+        Write-Log "本轮已请求 Cowork VM，但未在 $VmSeconds 秒内确认 API 可达；验证失败。" ERROR
+    }
     return $false
 }
 
@@ -1021,7 +1050,7 @@ function Invoke-AutoSetup {
     Install-CompatibleChinese
     if (-not $SkipLaunch) {
         Start-ClaudeAppx
-        [void](Invoke-HealthWait)
+        if (-not (Invoke-HealthWait)) { return 3 }
     }
     return 0
 }
@@ -1060,7 +1089,10 @@ try {
             Repair-VmStorageAttributes
             Repair-IncompleteWorkspace
             Start-CoworkServices
-            if (-not $SkipLaunch) { Start-ClaudeAppx; [void](Invoke-HealthWait) }
+            if (-not $SkipLaunch) {
+                Start-ClaudeAppx
+                if (-not (Invoke-HealthWait)) { $exitCode = 3 }
+            }
         }
         'Launch' { Start-ClaudeAppx }
         'Auto' { $exitCode = Invoke-AutoSetup }

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $scripts = Get-ChildItem -LiteralPath $root -Filter '*.ps1' -File -Recurse
@@ -17,6 +17,7 @@ foreach ($script in $scripts) {
 
 $main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw
 $batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw
+$legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw
 $requiredSafetyChecks = @(
     'Get-AuthenticodeSignature',
     'Anthropic',
@@ -34,6 +35,10 @@ $requiredSafetyChecks = @(
     'Select-ClaudeInstallation'
     'Test-ClaudeDefaultInstallationReady'
     'PreserveApplicationData'
+    '[int]$HandshakeSeconds = 45'
+    '[int]$VmSeconds = 120'
+    'Client signature verified:'
+    'VM 尚未被用户请求'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -47,11 +52,24 @@ if ($main -match 'AllowUnsigned') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
+if ($main -match '(?s)ForceApplicationShutdown\s*=.*ForceTargetApplicationShutdown\s*=' -or
+    $main -match '(?s)ForceTargetApplicationShutdown\s*=.*ForceApplicationShutdown\s*=') {
+    throw 'Add-AppxPackage cannot receive ForceApplicationShutdown and ForceTargetApplicationShutdown together.'
+}
+if ($main -match '(?s)\$parameters\s*=\s*@\{[^}]*InstallAllResources\s*=') {
+    throw 'A plain Claude .msix must not receive the bundle-only InstallAllResources option.'
+}
 if ($main -match 'Add-AppxPackage\s+-Path' -and $main -notmatch 'parameters\.Volume|parameters\.Volume =|\$parameters\.Volume') {
     throw 'Official MSIX installation must target the Windows system AppX volume.'
 }
 if ($main -notmatch 'Remove-ResumeAfterRestart') {
     throw 'The one-shot installer must clear its temporary RunOnce resume entry.'
+}
+if ($main -notmatch 'if \(-not \(Invoke-HealthWait\)\) \{ return 3 \}') {
+    throw 'Auto setup must fail closed when the current-run Cowork health check does not pass.'
+}
+if ($main -notmatch 'if \(\$handshakePassed -and -not \$vmRequested\)') {
+    throw 'A valid handshake with no requested VM must pass after the handshake deadline.'
 }
 
 $requiredBatchParts = @(
@@ -65,6 +83,9 @@ foreach ($text in $requiredBatchParts) {
     if (-not $batch.Contains($text)) {
         throw "Expected one-click BAT behavior is missing: $text"
     }
+}
+if ($legacyBatch -notmatch '(?i)call\s+"%~dp0install\.bat"') {
+    throw 'setup.cmd must delegate to the canonical install.bat entry point.'
 }
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY
