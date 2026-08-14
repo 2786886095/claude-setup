@@ -24,7 +24,7 @@ $legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Enco
 $elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw -Encoding UTF8
 $attributes = Get-Content -LiteralPath (Join-Path $root '.gitattributes') -Raw -Encoding UTF8
 $batchFiles = Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Extension -in @('.bat', '.cmd') }
-if ($attributes -notmatch '(?m)^\*\.bat text eol=crlf$' -or $attributes -notmatch '(?m)^\*\.cmd text eol=crlf$') {
+if ($attributes -notmatch '(?m)^\*\.bat text eol=crlf\r?$' -or $attributes -notmatch '(?m)^\*\.cmd text eol=crlf\r?$') {
     throw '.gitattributes must force CRLF for Windows batch and command files.'
 }
 foreach ($batchFile in $batchFiles) {
@@ -56,7 +56,10 @@ $requiredSafetyChecks = @(
     'VM 尚未被用户请求'
     'DecryptFile(string path, uint reserved)'
     'Install-ClaudeDesktopShortcut'
+    'Convert-PngToIcon'
     'shell:AppsFolder\$script:Aumid'
+    'Assets\Square150x150Logo.png'
+    'Claude-official.ico'
     'Test-VmRuntimeEfsItem'
     'Start-SafeVmBundleRebuild'
     'Wait-ForRebuiltVmBundle'

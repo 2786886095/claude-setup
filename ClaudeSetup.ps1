@@ -1206,6 +1206,55 @@ function Install-CompatibleChinese {
     }
 }
 
+function Convert-PngToIcon {
+    param(
+        [Parameter(Mandatory)][string]$PngPath,
+        [Parameter(Mandatory)][string]$IconPath
+    )
+    Add-Type -AssemblyName System.Drawing
+    $source = $null
+    $bitmap = $null
+    $graphics = $null
+    $pngStream = $null
+    $fileStream = $null
+    $writer = $null
+    try {
+        $source = [Drawing.Image]::FromFile($PngPath)
+        $bitmap = New-Object Drawing.Bitmap -ArgumentList 256, 256
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        $graphics.Clear([Drawing.Color]::Transparent)
+        $graphics.CompositingQuality = [Drawing.Drawing2D.CompositingQuality]::HighQuality
+        $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $graphics.DrawImage($source, 0, 0, 256, 256)
+
+        $pngStream = New-Object IO.MemoryStream
+        $bitmap.Save($pngStream, [Drawing.Imaging.ImageFormat]::Png)
+        $pngBytes = $pngStream.ToArray()
+        $fileStream = [IO.File]::Open($IconPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $writer = New-Object IO.BinaryWriter($fileStream)
+        $writer.Write([uint16]0)
+        $writer.Write([uint16]1)
+        $writer.Write([uint16]1)
+        $writer.Write([byte]0)
+        $writer.Write([byte]0)
+        $writer.Write([byte]0)
+        $writer.Write([byte]0)
+        $writer.Write([uint16]1)
+        $writer.Write([uint16]32)
+        $writer.Write([uint32]$pngBytes.Length)
+        $writer.Write([uint32]22)
+        $writer.Write($pngBytes)
+    } finally {
+        if ($writer) { $writer.Dispose() } elseif ($fileStream) { $fileStream.Dispose() }
+        if ($pngStream) { $pngStream.Dispose() }
+        if ($graphics) { $graphics.Dispose() }
+        if ($bitmap) { $bitmap.Dispose() }
+        if ($source) { $source.Dispose() }
+    }
+}
+
 function Install-ClaudeDesktopShortcut {
     $paths = Get-ClaudePaths
     if (-not $paths) { throw '创建桌面快捷方式前未找到 Claude 官方 AppX 包。' }
@@ -1214,17 +1263,17 @@ function Install-ClaudeDesktopShortcut {
         if (-not $desktop) { throw '无法解析当前用户桌面目录。' }
 
         $assetRoot = Join-Path $env:LOCALAPPDATA 'ClaudeSetup'
-        $iconPath = Join-Path $assetRoot 'Claude.ico'
+        $iconPath = Join-Path $assetRoot 'Claude-official.ico'
         New-Item -ItemType Directory -Path $assetRoot -Force | Out-Null
         try {
-            Add-Type -AssemblyName System.Drawing
-            $icon = [Drawing.Icon]::ExtractAssociatedIcon($paths.Exe)
-            if ($icon) {
-                $stream = [IO.File]::Open($iconPath, [IO.FileMode]::Create)
-                try { $icon.Save($stream) } finally { $stream.Dispose(); $icon.Dispose() }
+            $officialLogo = Join-Path $paths.Package.InstallLocation 'Assets\Square150x150Logo.png'
+            if (-not (Test-Path -LiteralPath $officialLogo)) { throw "官方 AppX 图标不存在：$officialLogo" }
+            Convert-PngToIcon -PngPath $officialLogo -IconPath $iconPath
+            if (-not (Test-Path -LiteralPath $iconPath) -or (Get-Item -LiteralPath $iconPath).Length -le 22) {
+                throw '生成的 Claude ICO 无效。'
             }
         } catch {
-            Write-Log "无法提取持久化 Claude 图标，将使用程序图标：$($_.Exception.Message)" WARN
+            Write-Log "无法生成持久化官方 Claude 图标，将使用程序图标：$($_.Exception.Message)" WARN
             $iconPath = $paths.Exe
         }
 
@@ -1237,6 +1286,8 @@ function Install-ClaudeDesktopShortcut {
         $shortcut.Description = 'Claude Desktop（官方 AppX）'
         $shortcut.IconLocation = "$iconPath,0"
         $shortcut.Save()
+        $iconRefresh = Join-Path $env:WINDIR 'System32\ie4uinit.exe'
+        if (Test-Path -LiteralPath $iconRefresh) { Start-Process -FilePath $iconRefresh -ArgumentList '-show' -WindowStyle Hidden -ErrorAction SilentlyContinue }
         Write-Log "已创建或更新桌面快捷方式：$shortcutPath" OK
         return $shortcutPath
     } catch {
