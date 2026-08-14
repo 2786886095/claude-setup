@@ -53,6 +53,7 @@ $requiredSafetyChecks = @(
     'vm-rebuild-active.json'
     'claudevm.bundle.backup-'
     'BackupBytes'
+    'Get-ResumeCommand'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -214,6 +215,10 @@ try {
     if ($fileIndex -lt 0 -or $fileIndex + 1 -ge $argumentItems.Count -or
         $argumentItems[$fileIndex + 1] -notmatch '^".+ClaudeSetup\.ps1"$') {
         throw "Resume/elevation command does not quote the script path: $($argumentItems -join ' ')"
+    }
+    $resumeCommand = Get-ResumeCommand
+    if ($resumeCommand -notmatch '^cmd\.exe /d /c "".+install\.bat""$' -or $resumeCommand -match 'ClaudeSetup\.ps1') {
+        throw "RunOnce must call the canonical pausing install.bat instead of a transient PowerShell window: $resumeCommand"
     }
 } finally {
     $env:CLAUDE_SETUP_IMPORT_ONLY = $previousImportMode

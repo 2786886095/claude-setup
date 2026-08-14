@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.5'
+$script:ToolVersion = '1.0.6'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -850,12 +850,17 @@ function Enable-CoworkPrerequisites {
     }
 }
 
+function Get-ResumeCommand {
+    $installer = Join-Path $script:Root 'install.bat'
+    if (-not (Test-Path -LiteralPath $installer)) { throw "重启续跑入口不存在：$installer" }
+    return ('cmd.exe /d /c ""{0}""' -f $installer)
+}
+
 function Register-ResumeAfterRestart {
-    $arguments = Get-CurrentArgumentList | Where-Object { $_ -ne '-RestartIfNeeded' }
-    $command = 'powershell.exe ' + ($arguments -join ' ')
+    $command = Get-ResumeCommand
     New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Force | Out-Null
     Set-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ClaudeSetupResume' -Value $command
-    Write-Log '已注册重启后自动继续 Claude Setup。' OK
+    Write-Log '已注册重启后通过 install.bat 自动继续 Claude Setup；续跑窗口会保留结果与下一步提示。' OK
 }
 
 function Remove-ResumeAfterRestart {
