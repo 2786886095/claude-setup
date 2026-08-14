@@ -46,7 +46,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
 - 安装或修复成功后，在当前用户桌面创建或更新 `Claude.lnk`；快捷方式使用稳定的官方 AppX 启动标识，Claude 自动更新后仍然有效。
-- 桌面快捷方式优先使用官方 MSIX `Assets\Square150x150Logo.png` 生成持久化 256×256 ICO，不再提取 `Claude.exe` 的灰色通用 Electron 图标。
+- 桌面快捷方式优先使用官方 MSIX `Assets\Square150x150Logo.png` 生成持久化 256×256 ICO；生成时自动裁掉 PNG 外圈透明留白并保留 2 像素安全边距，不再使用偏小的灰色通用 Electron 图标。
 - 启动后必须验证本轮 Claude/Cowork 官方签名握手与 RPC；若用户已请求 Cowork VM，再等待最多 120 秒验证 VM、网络和 API。尚未进入 Cowork 时明确标记为“深度检测延期”，不把未启动的 VM 误判为故障。
 
 ## 一键使用

@@ -1219,7 +1219,24 @@ function Convert-PngToIcon {
     $fileStream = $null
     $writer = $null
     try {
-        $source = [Drawing.Image]::FromFile($PngPath)
+        $source = New-Object Drawing.Bitmap -ArgumentList $PngPath
+        $minX = $source.Width
+        $minY = $source.Height
+        $maxX = -1
+        $maxY = -1
+        for ($y = 0; $y -lt $source.Height; $y++) {
+            for ($x = 0; $x -lt $source.Width; $x++) {
+                if ($source.GetPixel($x, $y).A -gt 0) {
+                    if ($x -lt $minX) { $minX = $x }
+                    if ($x -gt $maxX) { $maxX = $x }
+                    if ($y -lt $minY) { $minY = $y }
+                    if ($y -gt $maxY) { $maxY = $y }
+                }
+            }
+        }
+        if ($maxX -lt $minX -or $maxY -lt $minY) { throw '官方 Claude PNG 没有可见像素。' }
+        $sourceBounds = New-Object Drawing.Rectangle -ArgumentList $minX, $minY, ($maxX - $minX + 1), ($maxY - $minY + 1)
+        $destinationBounds = New-Object Drawing.Rectangle -ArgumentList 2, 2, 252, 252
         $bitmap = New-Object Drawing.Bitmap -ArgumentList 256, 256
         $graphics = [Drawing.Graphics]::FromImage($bitmap)
         $graphics.Clear([Drawing.Color]::Transparent)
@@ -1227,7 +1244,7 @@ function Convert-PngToIcon {
         $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
         $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
         $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-        $graphics.DrawImage($source, 0, 0, 256, 256)
+        $graphics.DrawImage($source, $destinationBounds, $sourceBounds, [Drawing.GraphicsUnit]::Pixel)
 
         $pngStream = New-Object IO.MemoryStream
         $bitmap.Save($pngStream, [Drawing.Imaging.ImageFormat]::Png)
@@ -1263,7 +1280,7 @@ function Install-ClaudeDesktopShortcut {
         if (-not $desktop) { throw '无法解析当前用户桌面目录。' }
 
         $assetRoot = Join-Path $env:LOCALAPPDATA 'ClaudeSetup'
-        $iconPath = Join-Path $assetRoot 'Claude-official.ico'
+        $iconPath = Join-Path $assetRoot 'Claude-official-cropped.ico'
         New-Item -ItemType Directory -Path $assetRoot -Force | Out-Null
         try {
             $officialLogo = Join-Path $paths.Package.InstallLocation 'Assets\Square150x150Logo.png'
