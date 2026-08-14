@@ -22,6 +22,17 @@ $main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw -Encod
 $batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw -Encoding UTF8
 $legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Encoding UTF8
 $elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw -Encoding UTF8
+$attributes = Get-Content -LiteralPath (Join-Path $root '.gitattributes') -Raw -Encoding UTF8
+$batchFiles = Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Extension -in @('.bat', '.cmd') }
+if ($attributes -notmatch '(?m)^\*\.bat text eol=crlf$' -or $attributes -notmatch '(?m)^\*\.cmd text eol=crlf$') {
+    throw '.gitattributes must force CRLF for Windows batch and command files.'
+}
+foreach ($batchFile in $batchFiles) {
+    $batchText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($batchFile.FullName))
+    if ($batchText -match '(?<!\r)\n') {
+        throw "$($batchFile.Name) contains bare LF line endings; cmd.exe compatibility requires CRLF."
+    }
+}
 $requiredSafetyChecks = @(
     'Get-AuthenticodeSignature',
     'Anthropic',

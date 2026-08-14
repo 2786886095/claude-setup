@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.7'
+$script:ToolVersion = '1.0.8'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
