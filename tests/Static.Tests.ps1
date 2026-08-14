@@ -1,7 +1,10 @@
 ﻿$ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
-$scripts = Get-ChildItem -LiteralPath $root -Filter '*.ps1' -File -Recurse
+$scripts = @(
+    Get-Item -LiteralPath (Join-Path $root 'ClaudeSetup.ps1')
+    Get-ChildItem -LiteralPath (Join-Path $root 'tests') -Filter '*.ps1' -File -Recurse
+)
 foreach ($script in $scripts) {
     $tokens = $null
     $errors = $null
@@ -15,9 +18,9 @@ foreach ($script in $scripts) {
     }
 }
 
-$main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw
-$batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw
-$legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw
+$main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw -Encoding UTF8
+$batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw -Encoding UTF8
+$legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Encoding UTF8
 $requiredSafetyChecks = @(
     'Get-AuthenticodeSignature',
     'Anthropic',
@@ -39,6 +42,9 @@ $requiredSafetyChecks = @(
     '[int]$VmSeconds = 120'
     'Client signature verified:'
     'VM 尚未被用户请求'
+    'DecryptFile(string path, uint reserved)'
+    'Install-ClaudeDesktopShortcut'
+    'shell:AppsFolder\$script:Aumid'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -51,6 +57,9 @@ if ($main -match 'AllowUnsigned') {
 }
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
+}
+if ($main -match 'cipher\.exe\s+/d') {
+    throw 'EFS repair must use the Unicode DecryptFile API so non-ASCII profile paths are safe.'
 }
 if ($main -match '(?s)ForceApplicationShutdown\s*=.*ForceTargetApplicationShutdown\s*=' -or
     $main -match '(?s)ForceTargetApplicationShutdown\s*=.*ForceApplicationShutdown\s*=') {
@@ -86,6 +95,12 @@ foreach ($text in $requiredBatchParts) {
 }
 if ($legacyBatch -notmatch '(?i)call\s+"%~dp0install\.bat"') {
     throw 'setup.cmd must delegate to the canonical install.bat entry point.'
+}
+if ($batch -notmatch '(?i)Recommended entry:\s*install\.bat') {
+    throw 'install.bat must visibly identify itself as the recommended entry point.'
+}
+if ($legacyBatch -notmatch '旧版兼容入口' -or $legacyBatch -notmatch '唯一推荐入口 install\.bat') {
+    throw 'setup.cmd must visibly identify itself as a legacy compatibility entry.'
 }
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY

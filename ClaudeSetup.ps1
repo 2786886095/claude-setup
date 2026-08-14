@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.0'
+$script:ToolVersion = '1.0.1'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -401,6 +401,28 @@ function Test-EncryptedPath {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     return [bool]((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::Encrypted)
+}
+
+function Invoke-EfsDecrypt {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not ('ClaudeSetup.NativeEfs' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace ClaudeSetup {
+    public static class NativeEfs {
+        [DllImport("Advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DecryptFile(string path, uint reserved);
+    }
+}
+'@
+    }
+    if (-not [ClaudeSetup.NativeEfs]::DecryptFile($Path, 0)) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $message = (New-Object ComponentModel.Win32Exception($errorCode)).Message
+        throw "无法解密 EFS 路径：$Path（Win32 $errorCode：$message）"
+    }
 }
 
 function Test-CompressedPath {
@@ -897,14 +919,25 @@ function Repair-VmStorageAttributes {
     if (Test-ReparsePoint $vmBundles) {
         throw "检测到 vm_bundles 是重解析点：$vmBundles。为避免误移动大量 VM 数据，脚本不会自动删除联接。"
     }
-    $encrypted = @(Get-ChildItem -LiteralPath $vmBundles -File -Recurse -ErrorAction SilentlyContinue |
+    $encrypted = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
-    if ((Test-EncryptedPath $vmBundles) -or $encrypted.Count -gt 0) {
+    if (Test-EncryptedPath $vmBundles) {
+        $encrypted += Get-Item -LiteralPath $vmBundles -Force
+    }
+    if ($encrypted.Count -gt 0) {
         Write-Log '正在移除 VM bundle 的 EFS 加密属性。' WARN
-        & cipher.exe /d /s:$vmBundles | Out-Null
-        $remaining = @(Get-ChildItem -LiteralPath $vmBundles -File -Recurse -ErrorAction SilentlyContinue |
+        Stop-ClaudeProcesses
+        Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+        foreach ($item in @($encrypted | Sort-Object { $_.FullName.Length } -Descending)) {
+            Invoke-EfsDecrypt -Path $item.FullName
+        }
+        $remaining = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
-        if ((Test-EncryptedPath $vmBundles) -or $remaining.Count -gt 0) { throw '无法移除 vm_bundles 或其中文件的 EFS 加密属性。' }
+        if (Test-EncryptedPath $vmBundles) {
+            $remaining += Get-Item -LiteralPath $vmBundles -Force
+        }
+        if ($remaining.Count -gt 0) { throw '无法移除 vm_bundles 或其中文件的 EFS 加密属性。' }
+        Write-Log 'VM bundle 的 EFS 加密属性已移除。' OK
     }
 }
 
@@ -958,6 +991,45 @@ function Install-CompatibleChinese {
     $signature = Test-AnthropicSignature $paths.Exe
     if (-not $signature.Valid) {
         throw '兼容汉化意外破坏了 Claude.exe 签名。请立即运行 Repair。'
+    }
+}
+
+function Install-ClaudeDesktopShortcut {
+    $paths = Get-ClaudePaths
+    if (-not $paths) { throw '创建桌面快捷方式前未找到 Claude 官方 AppX 包。' }
+    try {
+        $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+        if (-not $desktop) { throw '无法解析当前用户桌面目录。' }
+
+        $assetRoot = Join-Path $env:LOCALAPPDATA 'ClaudeSetup'
+        $iconPath = Join-Path $assetRoot 'Claude.ico'
+        New-Item -ItemType Directory -Path $assetRoot -Force | Out-Null
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $icon = [Drawing.Icon]::ExtractAssociatedIcon($paths.Exe)
+            if ($icon) {
+                $stream = [IO.File]::Open($iconPath, [IO.FileMode]::Create)
+                try { $icon.Save($stream) } finally { $stream.Dispose(); $icon.Dispose() }
+            }
+        } catch {
+            Write-Log "无法提取持久化 Claude 图标，将使用程序图标：$($_.Exception.Message)" WARN
+            $iconPath = $paths.Exe
+        }
+
+        $shortcutPath = Join-Path $desktop 'Claude.lnk'
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = Join-Path $env:WINDIR 'explorer.exe'
+        $shortcut.Arguments = "shell:AppsFolder\$script:Aumid"
+        $shortcut.WorkingDirectory = $env:USERPROFILE
+        $shortcut.Description = 'Claude Desktop（官方 AppX）'
+        $shortcut.IconLocation = "$iconPath,0"
+        $shortcut.Save()
+        Write-Log "已创建或更新桌面快捷方式：$shortcutPath" OK
+        return $shortcutPath
+    } catch {
+        Write-Log "桌面快捷方式创建失败，但不影响 Claude/Cowork：$($_.Exception.Message)" WARN
+        return $null
     }
 }
 
@@ -1048,6 +1120,7 @@ function Invoke-AutoSetup {
     Repair-IncompleteWorkspace
     Start-CoworkServices
     Install-CompatibleChinese
+    [void](Install-ClaudeDesktopShortcut)
     if (-not $SkipLaunch) {
         Start-ClaudeAppx
         if (-not (Invoke-HealthWait)) { return 3 }
@@ -1079,6 +1152,7 @@ try {
             if ($script:NeedsRestart) { Register-ResumeAfterRestart; $exitCode = 3010; break }
             [void](Repair-ClaudePackageAndSignature)
             Start-CoworkServices
+            [void](Install-ClaudeDesktopShortcut)
             if (-not $SkipLaunch) { Start-ClaudeAppx }
         }
         'Repair' {
@@ -1089,6 +1163,7 @@ try {
             Repair-VmStorageAttributes
             Repair-IncompleteWorkspace
             Start-CoworkServices
+            [void](Install-ClaudeDesktopShortcut)
             if (-not $SkipLaunch) {
                 Start-ClaudeAppx
                 if (-not (Invoke-HealthWait)) { $exitCode = 3 }

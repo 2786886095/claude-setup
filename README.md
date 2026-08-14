@@ -2,11 +2,15 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
+> **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
+>
+> `setup.cmd` 只是旧版兼容入口，会自动转交给 `install.bat`；不要把两个文件各运行一次。
+
 ## 下载
 
 不使用 Git：
 
-- [下载稳定版一键安装包 ZIP](https://github.com/2786886095/claude-setup/releases/latest/download/claude-setup-windows.zip)
+- [下载稳定版一键安装包 ZIP（解压后双击 `install.bat`）](https://github.com/2786886095/claude-setup/releases/latest/download/claude-setup-windows.zip)
 - [下载 main 分支源码 ZIP](https://github.com/2786886095/claude-setup/archive/refs/heads/main.zip)
 
 使用 Git（代码块右上角可直接复制）：
@@ -39,6 +43,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
+- 安装或修复成功后，在当前用户桌面创建或更新 `Claude.lnk`；快捷方式使用稳定的官方 AppX 启动标识，Claude 自动更新后仍然有效。
 - 启动后必须验证本轮 Claude/Cowork 官方签名握手与 RPC；若用户已请求 Cowork VM，再等待最多 120 秒验证 VM、网络和 API。尚未进入 Cowork 时明确标记为“深度检测延期”，不把未启动的 VM 误判为故障。
 
 ## 一键使用

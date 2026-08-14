@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions
 chcp 65001 >nul 2>&1
+title Claude Setup - Recommended installer - install.bat
 cd /d "%~dp0"
 
 set "CLAUDE_SETUP_PS1=%~dp0ClaudeSetup.ps1"
@@ -22,7 +23,10 @@ if errorlevel 1 (
     exit /b %errorlevel%
 )
 
-echo Starting Claude Desktop and Cowork setup...
+echo ============================================================
+echo  Recommended entry: install.bat
+echo  Installing or repairing Claude Desktop and Cowork...
+echo ============================================================
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_PS1%" -Action Auto
 set "CLAUDE_SETUP_EXIT=%errorlevel%"
 
