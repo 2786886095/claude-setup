@@ -29,7 +29,15 @@
 
 ## `EXDEV: cross-device link not permitted`
 
-通常是 `%TEMP%` 与 `%LOCALAPPDATA%` 位于不同磁盘。脚本把用户级 TEMP/TMP 设置回 `%LOCALAPPDATA%\Temp`，不修改系统级 TEMP。
+可能是 `%TEMP%` 与 `%LOCALAPPDATA%` 位于不同磁盘，也可能是官方 MSIX 把同一个 C 盘上的 Roaming 与 LocalCache 暴露为不同的虚拟文件系统。脚本会修复真实跨盘的用户级 TEMP/TMP；不会创建 junction/symlink，因为 Claude 会拒绝重解析点，而且公开问题报告确认这种方式不能绕过 MSIX 边界。
+
+## `UNKNOWN: unknown error, copyfile rootfs.vhdx.tmp -> rootfs.vhdx`
+
+这表示新版 Claude 已在 `rename` 失败后尝试 `copyFile`，但 Windows MSIX 虚拟化仍阻止最终提交。它不是下载速度、C 盘空间或 EFS 的同义错误。
+
+Auto 模式会检查 package LocalCache 与真实 `%APPDATA%` 两个 bundle 目录，读取近期 Cowork 日志，并从本轮已验证 Anthropic 数字签名的官方 MSIX 中解析当前 VM manifest。仅当 `.tmp` 文件的 SHA-256 与 manifest 完全一致时，脚本才会停止 Claude、原子转正文件、同步两条路径并写入 `.<文件名>.origin`；校验不一致、仍被写入、带 EFS 或位于重解析点中的文件一律不处理。旧的加密 bundle 备份不会删除。
+
+相关上游问题：[anthropics/claude-code#36642](https://github.com/anthropics/claude-code/issues/36642)、[#51384](https://github.com/anthropics/claude-code/issues/51384)、[#66778](https://github.com/anthropics/claude-code/issues/66778)。
 
 ## `CoworkVMService` 不存在
 

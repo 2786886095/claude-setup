@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.9'
+$script:ToolVersion = '1.0.10'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -33,6 +33,9 @@ $script:LogPath = $null
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:NeedsRestart = $false
 $script:InstallationCandidateCache = $null
+$script:VmCommitAttempted = @{}
+$script:VmManifestCache = $null
+$script:OfficialMsixPath = $null
 
 function Write-Log {
     param(
@@ -489,6 +492,251 @@ function Get-VmBundleStatus {
     }
 }
 
+function Get-OfficialVmManifest {
+    param([string]$AsarPath)
+    $useCache = -not [bool]$AsarPath
+    if ($useCache -and $script:VmManifestCache) { return $script:VmManifestCache }
+    $content = $null
+    if ($useCache -and $script:OfficialMsixPath -and (Test-Path -LiteralPath $script:OfficialMsixPath -PathType Leaf)) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::OpenRead($script:OfficialMsixPath)
+        try {
+            $entry = $archive.GetEntry('app/resources/app.asar')
+            if (-not $entry) { throw '官方 MSIX 缺少 app/resources/app.asar。' }
+            $entryStream = $entry.Open()
+            $memory = New-Object IO.MemoryStream
+            try {
+                $entryStream.CopyTo($memory)
+                $content = [Text.Encoding]::UTF8.GetString($memory.ToArray())
+            } finally {
+                $entryStream.Dispose()
+                $memory.Dispose()
+            }
+        } finally {
+            $archive.Dispose()
+        }
+    } elseif (-not $AsarPath) {
+        $paths = Get-ClaudePaths
+        if (-not $paths) { throw '无法读取 VM manifest：Claude 官方 MSIX 不存在。' }
+        $AsarPath = $paths.Asar
+    }
+    if (-not $content) {
+        if (-not (Test-Path -LiteralPath $AsarPath -PathType Leaf)) { throw "app.asar 不存在：$AsarPath" }
+        $content = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($AsarPath))
+    }
+    $anchor = $content.IndexOf('Cowork VM bundle manifest.', [StringComparison]::Ordinal)
+    if ($anchor -lt 0) { throw '官方 app.asar 中没有 Cowork VM bundle manifest。' }
+    $tail = $content.Substring($anchor)
+    $versionMatch = [regex]::Match($tail, 'versions:\[\{sha:`(?<sha>[0-9a-f]{40})`', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $versionMatch.Success) { throw '无法从官方 app.asar 解析当前 VM bundle 版本。' }
+
+    $currentStart = $anchor + $versionMatch.Index
+    $nextVersion = $content.IndexOf('},{sha:`', $currentStart + $versionMatch.Length, [StringComparison]::Ordinal)
+    $currentEnd = if ($nextVersion -gt $currentStart) { $nextVersion } else { [Math]::Min($content.Length, $currentStart + 30000) }
+    $currentBlock = $content.Substring($currentStart, $currentEnd - $currentStart)
+    $windowsIndex = $currentBlock.IndexOf('win32:{', [StringComparison]::Ordinal)
+    if ($windowsIndex -lt 0) { throw '当前 VM manifest 没有 Windows 文件列表。' }
+    $windowsBlock = $currentBlock.Substring($windowsIndex)
+    $architecture = Get-NativeArchitecture
+    $architectureMatch = [regex]::Match(
+        $windowsBlock,
+        ('{0}:\[(?<files>.*?)\]' -f [regex]::Escape($architecture)),
+        [Text.RegularExpressions.RegexOptions]::Singleline
+    )
+    if (-not $architectureMatch.Success) { throw "当前 VM manifest 不支持 $architecture。" }
+
+    $files = New-Object System.Collections.Generic.List[object]
+    $fileMatches = [regex]::Matches(
+        $architectureMatch.Groups['files'].Value,
+        '\{name:`(?<name>[^`]+)`,checksum:`(?<checksum>[0-9a-f]{64})`(?<rest>.*?)\}',
+        [Text.RegularExpressions.RegexOptions]::Singleline
+    )
+    foreach ($match in $fileMatches) {
+        $rawMatch = [regex]::Match($match.Groups['rest'].Value, 'rawChecksum:`(?<checksum>[0-9a-f]{64})`')
+        $runtimeChecksum = if ($rawMatch.Success) { $rawMatch.Groups['checksum'].Value } else { $match.Groups['checksum'].Value }
+        $files.Add([pscustomobject]@{
+            Name = $match.Groups['name'].Value
+            Checksum = $match.Groups['checksum'].Value.ToLowerInvariant()
+            RuntimeChecksum = $runtimeChecksum.ToLowerInvariant()
+        })
+    }
+    if ($files.Count -eq 0) { throw '当前 VM manifest 的 Windows 文件列表为空。' }
+    $result = [pscustomobject]@{
+        Sha = $versionMatch.Groups['sha'].Value.ToLowerInvariant()
+        Architecture = $architecture
+        Files = $files.ToArray()
+    }
+    if ($useCache) { $script:VmManifestCache = $result }
+    return $result
+}
+
+function Get-VmBundleCandidateDirectories {
+    $paths = Get-ClaudePaths
+    if (-not $paths) { return @() }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($userData in @($paths.LocalUserData, $paths.RoamingUserData)) {
+        $bundle = [IO.Path]::GetFullPath((Join-Path $userData 'vm_bundles\claudevm.bundle'))
+        if ($seen.Add($bundle)) { $result.Add($bundle) }
+    }
+    return $result.ToArray()
+}
+
+function Test-FileExclusiveAccess {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Get-VmCommitFailureNames {
+    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $logs = @(
+        (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
+        (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log')
+    )
+    foreach ($log in $logs) {
+        if (-not (Test-Path -LiteralPath $log -PathType Leaf)) { continue }
+        foreach ($line in (Get-Content -LiteralPath $log -Tail 800 -ErrorAction SilentlyContinue)) {
+            $match = [regex]::Match($line, "copyfile '[^']*[\\/](?<name>rootfs\.vhdx|vmlinuz|initrd)\.tmp' -> '[^']*[\\/]\k<name>'", [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($match.Success) { [void]$names.Add($match.Groups['name'].Value) }
+        }
+    }
+    return ,$names
+}
+
+function Sync-VerifiedVmFile {
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$ExpectedHash,
+        [Parameter(Mandatory)][string]$BundleSha,
+        [Parameter(Mandatory)][string[]]$BundleDirectories
+    )
+    if ($Name -notin @('rootfs.vhdx', 'vmlinuz', 'initrd')) { throw "拒绝接管非 manifest VM 文件：$Name" }
+    $source = [IO.Path]::GetFullPath($SourcePath)
+    $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+    if ($sourceItem.PSIsContainer -or ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        ($sourceItem.Attributes -band [IO.FileAttributes]::Encrypted)) {
+        throw "VM 临时文件不是普通未加密文件：$source"
+    }
+    if (-not (Test-FileExclusiveAccess $source)) { return $false }
+
+    $allowedDirectories = @($BundleDirectories | ForEach-Object { [IO.Path]::GetFullPath($_) } | Select-Object -Unique)
+    $sourceDirectory = [IO.Path]::GetDirectoryName($source)
+    if (-not ($allowedDirectories | Where-Object { $_.Equals($sourceDirectory, [StringComparison]::OrdinalIgnoreCase) })) {
+        throw "VM 临时文件不属于 Claude 的候选 bundle：$source"
+    }
+    if ((Split-Path -Leaf $source) -notin @($Name, "$Name.tmp")) { throw "VM 临时文件名不符合预期：$source" }
+
+    $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($sourceHash -ne $ExpectedHash.ToLowerInvariant()) {
+        Write-Log "保留但不接管校验值不匹配的 VM 临时文件：$source" WARN
+        return $false
+    }
+
+    $orderedDirectories = @($sourceDirectory) + @($allowedDirectories | Where-Object { -not $_.Equals($sourceDirectory, [StringComparison]::OrdinalIgnoreCase) })
+    $verifiedFinal = $null
+    foreach ($directory in $orderedDirectories) {
+        $parent = Split-Path -Parent $directory
+        if ((Test-ReparsePoint $parent) -or (Test-EncryptedPath $parent)) {
+            throw "VM 目标父目录不安全（重解析点或加密）：$parent"
+        }
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        if ((Test-ReparsePoint $directory) -or (Test-EncryptedPath $directory)) {
+            throw "VM 目标目录不安全（重解析点或加密）：$directory"
+        }
+
+        $final = Join-Path $directory $Name
+        if (Test-Path -LiteralPath $final) {
+            $finalHash = (Get-FileHash -LiteralPath $final -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($finalHash -ne $ExpectedHash.ToLowerInvariant()) {
+                throw "目标 VM 文件已存在但校验值不同，拒绝覆盖：$final"
+            }
+        } elseif ($source.Equals((Join-Path $directory "$Name.tmp"), [StringComparison]::OrdinalIgnoreCase)) {
+            Move-Item -LiteralPath $source -Destination $final
+            $verifiedFinal = $final
+        } else {
+            if (-not $verifiedFinal) { $verifiedFinal = $source }
+            $targetRoot = [IO.Path]::GetPathRoot($final)
+            $targetDrive = Get-PSDrive -Name $targetRoot.TrimEnd('\').TrimEnd(':') -ErrorAction SilentlyContinue
+            $requiredFree = [int64]$sourceItem.Length + 512MB
+            if ($targetDrive -and $targetDrive.Free -lt $requiredFree) {
+                throw "同步 $Name 需要 $([math]::Round($requiredFree/1GB,1)) GB 临时空间，但 $targetRoot 仅剩 $([math]::Round($targetDrive.Free/1GB,1)) GB。"
+            }
+            Copy-Item -LiteralPath $verifiedFinal -Destination $final
+            $copiedHash = (Get-FileHash -LiteralPath $final -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($copiedHash -ne $ExpectedHash.ToLowerInvariant()) {
+                Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
+                throw "同步后的 VM 文件校验失败：$final"
+            }
+        }
+        if (-not $verifiedFinal) { $verifiedFinal = $final }
+    }
+
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    foreach ($directory in $orderedDirectories) {
+        $origin = Join-Path $directory ".$Name.origin"
+        [IO.File]::WriteAllText($origin, $BundleSha, $utf8NoBom)
+    }
+    Write-Log "已接管并同步官方校验通过的 $Name；manifest=$BundleSha" OK
+    return $true
+}
+
+function Repair-MsixVmCommitFailure {
+    param([Parameter(Mandatory)]$State)
+    $manifest = Get-OfficialVmManifest
+    $bundleDirectories = @(Get-VmBundleCandidateDirectories)
+    if ($bundleDirectories.Count -eq 0) { return $false }
+    $failureNames = Get-VmCommitFailureNames
+
+    foreach ($file in $manifest.Files) {
+        if ($file.Name -notin @('rootfs.vhdx', 'vmlinuz', 'initrd')) { continue }
+        $activeFinal = Join-Path ([string]$State.OriginalPath) $file.Name
+        $activeOrigin = Join-Path ([string]$State.OriginalPath) ".$($file.Name).origin"
+        if ((Test-Path -LiteralPath $activeFinal) -and (Test-Path -LiteralPath $activeOrigin) -and
+            ((Get-Content -LiteralPath $activeOrigin -Raw -ErrorAction SilentlyContinue).Trim() -eq $manifest.Sha)) { continue }
+
+        $sources = New-Object System.Collections.Generic.List[string]
+        foreach ($directory in $bundleDirectories) {
+            $temp = Join-Path $directory "$($file.Name).tmp"
+            if ($failureNames.Contains($file.Name) -and (Test-Path -LiteralPath $temp -PathType Leaf)) { $sources.Add($temp) }
+        }
+        foreach ($directory in $bundleDirectories) {
+            $final = Join-Path $directory $file.Name
+            if (Test-Path -LiteralPath $final -PathType Leaf) { $sources.Add($final) }
+        }
+
+        foreach ($source in @($sources | Select-Object -Unique)) {
+            $item = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+            if (-not $item -or -not (Test-FileExclusiveAccess $source)) { continue }
+            $attemptKey = "$source|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
+            if ($script:VmCommitAttempted.ContainsKey($attemptKey)) { continue }
+            $script:VmCommitAttempted[$attemptKey] = $true
+
+            Write-Log "检测到 MSIX 已校验但未能落盘的 $($file.Name)，将按官方 manifest 复核后接管。" WARN
+            Stop-ClaudeProcesses
+            Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
+            $promoted = $false
+            try {
+                $promoted = Sync-VerifiedVmFile -SourcePath $source -Name $file.Name -ExpectedHash $file.RuntimeChecksum -BundleSha $manifest.Sha -BundleDirectories $bundleDirectories
+            } finally {
+                Start-CoworkServices
+                if (-not $promoted) { Start-ClaudeAppx }
+            }
+            if ($promoted) { return $true }
+        }
+    }
+    return $false
+}
+
 function Start-SafeVmBundleRebuild {
     param([Parameter(Mandatory)][string]$Reason)
     $paths = Get-ClaudePaths
@@ -572,14 +820,20 @@ function Test-RebuildRestartCompleted {
 function Wait-ForRebuiltVmBundle {
     param(
         [Parameter(Mandatory)]$State,
-        [int]$Seconds = 300
+        [int]$Seconds = 1200
     )
-    Write-Log '请在已启动的 Claude 中进入 Cowork；脚本等待新 VM bundle 与 sessiondata.vhdx，最长 5 分钟。' WARN
+    Write-Log '请在已启动的 Claude 中进入 Cowork；脚本等待并修复 MSIX VM 落盘问题，最长 20 分钟。' WARN
     $deadline = (Get-Date).AddSeconds($Seconds)
     $nextProgress = Get-Date
     while ((Get-Date) -lt $deadline) {
         $status = Get-VmBundleStatus -BundlePath $State.OriginalPath
         if ($status.Ready) { return $true }
+        if (Repair-MsixVmCommitFailure -State $State) {
+            Start-ClaudeAppx
+            Write-Log '已重新启动 Claude 继续下载剩余 VM 文件；如未自动进入，请再次点击 Cowork。' WARN
+            Start-Sleep -Seconds 5
+            continue
+        }
         if ((Get-Date) -ge $nextProgress) {
             $encryptedNames = @($status.Encrypted | Select-Object -ExpandProperty Name -Unique)
             Write-Log "等待重建：缺少=$($status.Missing -join ',')；加密运行项=$($encryptedNames -join ',')；重解析点=$($status.ReparsePoint)" INFO
@@ -618,6 +872,8 @@ function Get-RecentCoworkErrors {
         'VHDX file not found',
         'FILE_ENCRYPTED',
         'EXDEV',
+        'UNKNOWN: unknown error, copyfile',
+        'rootfs.vhdx.tmp',
         'API reachability',
         'VM service not running',
         'Missing HCS'
@@ -676,7 +932,8 @@ function Invoke-Diagnostics {
     }
 
     if ($vmp -and $vmp.State -eq 'Enabled') { Add-Finding 'virtual-machine-platform' 'Pass' 'Virtual Machine Platform 已启用' }
-    else { Add-Finding 'virtual-machine-platform' 'Fail' 'Virtual Machine Platform 未启用' }
+    elseif ($vmp) { Add-Finding 'virtual-machine-platform' 'Fail' 'Virtual Machine Platform 未启用' }
+    else { Add-Finding 'virtual-machine-platform' 'Warning' '当前权限下无法读取 Virtual Machine Platform 状态' '普通用户诊断不会把读取失败误判为未启用。' }
 
     $launchType = Get-HypervisorLaunchType
     if ($launchType -and $launchType -ne 'Auto') { Add-Finding 'hypervisor-launch' 'Fail' "hypervisorlaunchtype=$launchType" '应设置为 Auto 并重新启动。' }
@@ -711,6 +968,11 @@ function Invoke-Diagnostics {
         Add-Finding 'temp-volume' 'Fail' "TEMP ($tempRoot) 与 LocalAppData ($localRoot) 跨盘" 'Claude 可能在移动 rootfs.vhdx 时遇到 EXDEV。'
     } else {
         Add-Finding 'temp-volume' 'Pass' 'TEMP 与 LocalAppData 位于同一卷'
+    }
+    if ($localRoot) {
+        $driveName = $localRoot.TrimEnd(':')
+        $drive = Get-PSDrive -Name $driveName -ErrorAction SilentlyContinue
+        if ($drive) { Add-Finding 'system-drive-free' 'Info' "系统卷剩余 $([math]::Round($drive.Free / 1GB, 1)) GB" }
     }
 
     if ($package) {
@@ -756,6 +1018,24 @@ function Invoke-Diagnostics {
             $file = Join-Path $bundle $name
             if (Test-Path -LiteralPath $file) { Add-Finding "vhdx-$name" 'Pass' "$name 存在" ((Get-Item -LiteralPath $file).Length.ToString()) }
             else { Add-Finding "vhdx-$name" 'Warning' "$name 不存在" '全新安装尚未启动 Cowork 时属于正常；已有错误时需要重建 workspace。' }
+        }
+
+        $bundleCandidates = @(Get-VmBundleCandidateDirectories)
+        for ($index = 0; $index -lt $bundleCandidates.Count; $index++) {
+            $candidate = $bundleCandidates[$index]
+            $label = if ($index -eq 0) { 'package-localcache' } else { 'real-roaming' }
+            if (Test-Path -LiteralPath $candidate) {
+                $inventory = @(Get-ChildItem -LiteralPath $candidate -Force -File -ErrorAction SilentlyContinue |
+                    Sort-Object Name |
+                    ForEach-Object { '{0}={1} bytes [{2}]' -f $_.Name, $_.Length, $_.Attributes })
+                Add-Finding "vm-path-$label" 'Info' "$label VM 路径存在：$candidate" ($inventory -join "`r`n")
+            } else {
+                Add-Finding "vm-path-$label" 'Info' "$label VM 路径不存在：$candidate"
+            }
+        }
+        $commitFailures = Get-VmCommitFailureNames
+        if ($commitFailures.Count -gt 0) {
+            Add-Finding 'msix-vm-commit' 'Warning' "检测到 MSIX VM 临时文件落盘失败：$(@($commitFailures) -join ', ')" 'Auto 模式会仅接管与官方 manifest SHA-256 完全匹配的临时文件。'
         }
     } else {
         if ($selectedInstallation) {
@@ -918,6 +1198,8 @@ function Download-OfficialClaude {
         throw "下载架构不匹配：需要 $arch，得到 $($manifest.Architecture)。"
     }
     Write-Log "官方 MSIX 验证通过：Claude $($manifest.Version)，SHA-256 $((Get-FileHash $destination -Algorithm SHA256).Hash)" OK
+    $script:OfficialMsixPath = $destination
+    $script:VmManifestCache = $null
     return [pscustomobject]@{ Path = $destination; Manifest = $manifest }
 }
 

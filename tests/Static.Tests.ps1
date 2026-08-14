@@ -63,6 +63,16 @@ $requiredSafetyChecks = @(
     '$source.GetPixel($x, $y).A'
     '$destinationBounds'
     'Test-VmRuntimeEfsItem'
+    'Get-OfficialVmManifest'
+    'Get-VmCommitFailureNames'
+    'Sync-VerifiedVmFile'
+    'Repair-MsixVmCommitFailure'
+    'Cowork VM bundle manifest.'
+    'RuntimeChecksum'
+    'OfficialMsixPath'
+    'app/resources/app.asar'
+    'UNKNOWN: unknown error, copyfile'
+    '最长 20 分钟'
     'Start-SafeVmBundleRebuild'
     'Wait-ForRebuiltVmBundle'
     'Complete-VmBundleRebuild'
@@ -249,6 +259,59 @@ try {
             (Split-Path -Leaf $resolvedStatusRoot) -like 'ClaudeSetupStatic-*') {
             Remove-Item -LiteralPath $resolvedStatusRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    $manifestRoot = Join-Path ([IO.Path]::GetTempPath()) ("ClaudeSetupManifest-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $manifestRoot -Force | Out-Null
+        $fixtureAsar = Join-Path $manifestRoot 'app.asar'
+        $sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        $rootHash = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        $kernelHash = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+        $initrdHash = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+        $nextSha = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+        $fixture = 'binary-prefix Cowork VM bundle manifest. fixture,versions:[{sha:`' + $sha + '`,publishedAt:`2026-08-14`,files:{unix:{x64:[]},win32:{arm64:[],x64:[{name:`rootfs.vhdx`,checksum:`' + $rootHash + '`,progressStart:0,progressEnd:80},{name:`vmlinuz`,checksum:`' + $kernelHash + '`,progressStart:80,progressEnd:90},{name:`initrd`,checksum:`' + $initrdHash + '`,progressStart:90,progressEnd:100}]}}},{sha:`' + $nextSha + '`,files:{}}] binary-suffix'
+        [IO.File]::WriteAllText($fixtureAsar, $fixture, (New-Object Text.UTF8Encoding($false)))
+        $fixtureManifest = Get-OfficialVmManifest -AsarPath $fixtureAsar
+        if ($fixtureManifest.Sha -ne $sha -or $fixtureManifest.Architecture -ne 'x64' -or $fixtureManifest.Files.Count -ne 3) {
+            throw 'Official VM manifest fixture parsing failed.'
+        }
+        if (($fixtureManifest.Files | Where-Object Name -eq 'rootfs.vhdx').RuntimeChecksum -ne $rootHash) {
+            throw 'Official VM runtime checksum parsing failed.'
+        }
+
+        $bundleOne = Join-Path $manifestRoot 'package-localcache\claudevm.bundle'
+        $bundleTwo = Join-Path $manifestRoot 'real-roaming\claudevm.bundle'
+        New-Item -ItemType Directory -Path $bundleOne, $bundleTwo -Force | Out-Null
+        $tempKernel = Join-Path $bundleOne 'vmlinuz.tmp'
+        [IO.File]::WriteAllBytes($tempKernel, [Text.Encoding]::UTF8.GetBytes('verified-kernel-fixture'))
+        $tempKernelHash = (Get-FileHash -LiteralPath $tempKernel -Algorithm SHA256).Hash.ToLowerInvariant()
+        if (-not (Sync-VerifiedVmFile -SourcePath $tempKernel -Name 'vmlinuz' -ExpectedHash $tempKernelHash -BundleSha $sha -BundleDirectories @($bundleOne, $bundleTwo))) {
+            throw 'Verified VM temp synchronization did not run.'
+        }
+        foreach ($directory in @($bundleOne, $bundleTwo)) {
+            $published = Join-Path $directory 'vmlinuz'
+            $origin = Join-Path $directory '.vmlinuz.origin'
+            if (-not (Test-Path -LiteralPath $published) -or
+                (Get-FileHash -LiteralPath $published -Algorithm SHA256).Hash.ToLowerInvariant() -ne $tempKernelHash -or
+                (Get-Content -LiteralPath $origin -Raw).Trim() -ne $sha) {
+                throw "Verified VM file publication failed in $directory."
+            }
+        }
+        if (Test-Path -LiteralPath $tempKernel) { throw 'A verified same-directory temp file must be atomically promoted.' }
+
+        $badTemp = Join-Path $bundleOne 'initrd.tmp'
+        [IO.File]::WriteAllBytes($badTemp, [Text.Encoding]::UTF8.GetBytes('unverified-initrd-fixture'))
+        if (Sync-VerifiedVmFile -SourcePath $badTemp -Name 'initrd' -ExpectedHash $initrdHash -BundleSha $sha -BundleDirectories @($bundleOne, $bundleTwo)) {
+            throw 'A VM temp file with the wrong SHA-256 must never be published.'
+        }
+        if (-not (Test-Path -LiteralPath $badTemp) -or
+            (Test-Path -LiteralPath (Join-Path $bundleOne 'initrd')) -or
+            (Test-Path -LiteralPath (Join-Path $bundleOne '.initrd.origin'))) {
+            throw 'A rejected VM temp file must remain untouched and unpublished.'
+        }
+    } finally {
+        Remove-Item -LiteralPath $manifestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     $currentCandidates = @(Get-ClaudeInstallationCandidates)

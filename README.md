@@ -39,6 +39,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 检查 BIOS/UEFI 虚拟化、HCS/HNS、Hypervisor 启动设置；
 - 检测 Claude 位于非系统 AppX 卷的情况；
 - 修复 TEMP 与 LocalAppData 跨盘造成的 `EXDEV`；
+- 修复 Windows 11 build 26200 等环境中官方 MSIX 虚拟化导致的 `UNKNOWN ... copyfile rootfs.vhdx.tmp -> rootfs.vhdx`：只接管与刚下载、签名有效的官方 MSIX manifest SHA-256 完全一致的 `rootfs.vhdx`、`vmlinuz` 和 `initrd` 临时文件，并同步 package LocalCache 与真实 Roaming 两条路径；
 - 检测 EFS 加密、目录联接与 `rootfs.vhdx/sessiondata.vhdx`；
 - EFS 修复只阻断实际 VM 目录、`*.vhdx`、`initrd` 和 `vmlinuz`；Claude 自带的 `.origin` 完整性元数据、`.zst` 下载归档和状态标记会保留并记为信息，避免 Win32 87 误报。
 - 若真实 VM 文件无法用当前账户标准解密，脚本不会删除或覆盖它们：仅在父目录不继承加密且磁盘空间充足时，把整个 `claudevm.bundle` 同卷重命名为时间戳备份，注册一次性重启续跑，再由官方 Claude 重建。
@@ -79,6 +80,8 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 5. 重启后启动官方 Claude。请进入 Cowork，让官方客户端下载并创建新的 `rootfs.vhdx` 与 `sessiondata.vhdx`；
 6. 只有新 bundle 文件齐全、运行文件未加密且 Cowork 健康检查通过，脚本才结束重建状态。
 
+若官方 Claude 在临时文件已经完成校验后仍因 MSIX 文件系统虚拟化无法将 `.tmp` 提交为正式文件，脚本会停止 Claude 冻结该临时文件，从刚下载且 Anthropic 签名有效的 MSIX 中读取当前 VM manifest，重新计算 SHA-256。只有完全匹配时才原子转正、写入对应 `.origin` 并同步两条官方数据路径；不匹配文件原样保留且不会发布。随后脚本重新启动 Claude，继续处理下一个官方 VM 文件。该流程不会修改 `Claude.exe` 或 `app.asar`。
+
 加密备份永远不会由脚本自动删除。确认 Cowork 长期正常后，用户可以自行处理备份。
 
 也可以在管理员 PowerShell 中运行：
@@ -109,6 +112,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 | Virtual Machine Platform 未启用 | 自动启用，注册重启后继续 |
 | Claude 在非系统 AppX 卷 | 优先使用 `Move-AppxPackage` 移动；失败则停止并报告，不删除用户数据 |
 | TEMP 与 LocalAppData 跨盘 | 恢复用户 TEMP/TMP 到 `%LOCALAPPDATA%\Temp` |
+| `UNKNOWN ... copyfile rootfs.vhdx.tmp` | 按签名有效的官方 MSIX manifest 复核临时文件，校验一致后转正并同步 LocalCache/Roaming |
 | VM 目录使用 EFS | 尝试解密 |
 | VM 目录是 junction/reparse point | 停止并报告，避免误删大体积 VM 数据 |
 | VDI/虚拟机 | 警告需要嵌套虚拟化 |
