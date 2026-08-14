@@ -45,7 +45,7 @@ $requiredSafetyChecks = @(
     'DecryptFile(string path, uint reserved)'
     'Install-ClaudeDesktopShortcut'
     'shell:AppsFolder\$script:Aumid'
-    'Test-IgnorableEncryptedMarker'
+    'Test-VmRuntimeEfsItem'
 )
 foreach ($text in $requiredSafetyChecks) {
     if (-not $main.Contains($text)) {
@@ -142,14 +142,16 @@ try {
         throw 'A missing default installation path must require automatic installation.'
     }
 
-    $originMarker = [pscustomobject]@{ PSIsContainer = $false; Length = 0; Name = '.rootfs.vhdx.zst.origin' }
+    $originMarker = [pscustomobject]@{ PSIsContainer = $false; Length = 64; Name = '.rootfs.vhdx.zst.origin' }
     $runtimeDisk = [pscustomobject]@{ PSIsContainer = $false; Length = 8447328256; Name = 'rootfs.vhdx' }
-    $nonEmptyOrigin = [pscustomobject]@{ PSIsContainer = $false; Length = 1; Name = '.rootfs.vhdx.origin' }
-    if (-not (Test-IgnorableEncryptedMarker $originMarker)) {
-        throw 'A zero-byte Claude .origin marker must not block Cowork EFS repair.'
+    $compressedArchive = [pscustomobject]@{ PSIsContainer = $false; Length = 1337; Name = 'rootfs.vhdx.zst' }
+    $kernel = [pscustomobject]@{ PSIsContainer = $false; Length = 1337; Name = 'vmlinuz' }
+    $directory = [pscustomobject]@{ PSIsContainer = $true; Length = $null; Name = 'claudevm.bundle' }
+    if ((Test-VmRuntimeEfsItem $originMarker) -or (Test-VmRuntimeEfsItem $compressedArchive)) {
+        throw 'Claude metadata and download archives must not block Cowork EFS repair.'
     }
-    if ((Test-IgnorableEncryptedMarker $runtimeDisk) -or (Test-IgnorableEncryptedMarker $nonEmptyOrigin)) {
-        throw 'Runtime disks and non-empty metadata must never be ignored by EFS repair.'
+    if (-not (Test-VmRuntimeEfsItem $runtimeDisk) -or -not (Test-VmRuntimeEfsItem $kernel) -or -not (Test-VmRuntimeEfsItem $directory)) {
+        throw 'VM directories, VHDX files, initrd, and vmlinuz must remain strict EFS repair targets.'
     }
 
     $currentCandidates = @(Get-ClaudeInstallationCandidates)

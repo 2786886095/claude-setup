@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.2'
+$script:ToolVersion = '1.0.3'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -425,10 +425,10 @@ namespace ClaudeSetup {
     }
 }
 
-function Test-IgnorableEncryptedMarker {
+function Test-VmRuntimeEfsItem {
     param([Parameter(Mandatory)]$Item)
-    if ($Item.PSIsContainer -or $Item.Length -ne 0) { return $false }
-    return $Item.Name -match '^\..+\.origin$|^\.(cowork-adopted|auto_reinstall_attempted)$'
+    if ($Item.PSIsContainer) { return $true }
+    return $Item.Name -like '*.vhdx' -or $Item.Name -in @('initrd', 'vmlinuz')
 }
 
 function Test-CompressedPath {
@@ -556,17 +556,17 @@ function Invoke-Diagnostics {
         elseif (Test-Path -LiteralPath $bundle) { Add-Finding 'vm-reparse' 'Pass' 'vm_bundles 不是重解析点' }
 
         $encryptedVmFiles = @()
-        $ignoredEncryptedMarkers = @()
+        $nonRuntimeEncryptedFiles = @()
         if (Test-Path -LiteralPath $bundle) {
             $allEncryptedVmFiles = @(Get-ChildItem -LiteralPath $bundle -Force -File -Recurse -ErrorAction SilentlyContinue |
                 Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
-            $ignoredEncryptedMarkers = @($allEncryptedVmFiles | Where-Object { Test-IgnorableEncryptedMarker $_ })
-            $encryptedVmFiles = @($allEncryptedVmFiles | Where-Object { -not (Test-IgnorableEncryptedMarker $_) })
+            $encryptedVmFiles = @($allEncryptedVmFiles | Where-Object { Test-VmRuntimeEfsItem $_ })
+            $nonRuntimeEncryptedFiles = @($allEncryptedVmFiles | Where-Object { -not (Test-VmRuntimeEfsItem $_) })
         }
         if ((Test-EncryptedPath $bundle) -or $encryptedVmFiles.Count -gt 0) {
             Add-Finding 'vm-encryption' 'Fail' "VM bundle 或其中 $($encryptedVmFiles.Count) 个文件启用了 EFS 加密" 'HCS 无法挂载加密的 VHDX。'
-        } elseif ($ignoredEncryptedMarkers.Count -gt 0) {
-            Add-Finding 'vm-encryption' 'Info' "仅有 $($ignoredEncryptedMarkers.Count) 个零字节 Claude 元数据标记带加密属性" '这些 .origin/状态标记不是 HCS 挂载的 VHDX，不阻断 Cowork。'
+        } elseif ($nonRuntimeEncryptedFiles.Count -gt 0) {
+            Add-Finding 'vm-encryption' 'Info' "仅有 $($nonRuntimeEncryptedFiles.Count) 个 Claude 元数据或下载归档带加密属性" '这些 .origin/.zst/状态文件不是 HCS 直接使用的运行文件，不阻断 Cowork。'
         } elseif (Test-Path -LiteralPath $bundle) {
             Add-Finding 'vm-encryption' 'Pass' 'VM bundle 及其文件未启用 EFS 加密'
         }
@@ -932,23 +932,25 @@ function Repair-VmStorageAttributes {
     }
     $allEncrypted = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted })
-    $ignoredMarkers = @($allEncrypted | Where-Object { Test-IgnorableEncryptedMarker $_ })
-    $encrypted = @($allEncrypted | Where-Object { -not (Test-IgnorableEncryptedMarker $_) })
+    $nonRuntimeEncrypted = @($allEncrypted | Where-Object { -not (Test-VmRuntimeEfsItem $_) })
+    $encrypted = @($allEncrypted | Where-Object { Test-VmRuntimeEfsItem $_ })
     if (Test-EncryptedPath $vmBundles) {
         $encrypted += Get-Item -LiteralPath $vmBundles -Force
     }
-    if ($ignoredMarkers.Count -gt 0) {
-        Write-Log "检测到 $($ignoredMarkers.Count) 个零字节 .origin/状态标记带加密属性；它们不是 VM 磁盘，保留且不阻断安装。" INFO
+    if ($nonRuntimeEncrypted.Count -gt 0) {
+        Write-Log "检测到 $($nonRuntimeEncrypted.Count) 个 .origin/.zst/状态文件带加密属性；它们不是 HCS 运行文件，保留且不阻断安装。" INFO
     }
     if ($encrypted.Count -gt 0) {
         Write-Log '正在移除 VM bundle 的 EFS 加密属性。' WARN
         Stop-ClaudeProcesses
         Stop-Service CoworkVMService -Force -ErrorAction SilentlyContinue
         foreach ($item in @($encrypted | Sort-Object { $_.FullName.Length } -Descending)) {
+            $length = if ($item.PSIsContainer) { '-' } else { [string]$item.Length }
+            Write-Log "EFS 运行目标：$($item.FullName)；大小=$length；属性=$($item.Attributes)" INFO
             Invoke-EfsDecrypt -Path $item.FullName
         }
         $remaining = @(Get-ChildItem -LiteralPath $vmBundles -Force -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { ($_.Attributes -band [IO.FileAttributes]::Encrypted) -and -not (Test-IgnorableEncryptedMarker $_) })
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::Encrypted) -and (Test-VmRuntimeEfsItem $_) })
         if (Test-EncryptedPath $vmBundles) {
             $remaining += Get-Item -LiteralPath $vmBundles -Force
         }
