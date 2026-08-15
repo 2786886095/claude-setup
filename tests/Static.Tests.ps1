@@ -111,6 +111,9 @@ $requiredSafetyChecks = @(
     'Assert-VmRebuildState'
     'Resolve-VmRebuildState'
     'Archive-SupersededVmRebuildState'
+    'Test-AbandonedLegacyVmRebuildState'
+    'Archive-AbandonedVmRebuildState'
+    'vm-rebuild-state-abandoned'
     'state-history'
     'vm-rebuild-active.json'
     'claudevm.bundle.backup-'
@@ -132,7 +135,7 @@ if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
 }
 $storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
@@ -165,6 +168,20 @@ $archiveBlock = $main.Substring($archiveStart, $archiveEnd - $archiveStart)
 if ($archiveBlock -notmatch '(?s)Move-Item.+VmRebuildStatePath.+originalArchive' -or
     $archiveBlock -match 'Remove-Item.+BackupPath') {
     throw 'Superseded rebuild state must be archived while every legacy VM backup remains untouched.'
+}
+$abandonedArchiveStart = $main.IndexOf('function Archive-AbandonedVmRebuildState')
+$abandonedArchiveEnd = $main.IndexOf('function Resolve-VmRebuildState', $abandonedArchiveStart)
+if ($abandonedArchiveStart -lt 0 -or $abandonedArchiveEnd -le $abandonedArchiveStart) { throw 'Unable to isolate abandoned-state archival.' }
+$abandonedArchiveBlock = $main.Substring($abandonedArchiveStart, $abandonedArchiveEnd - $abandonedArchiveStart)
+if ($abandonedArchiveBlock -notmatch '(?s)Get-VmRebuildStatePathShape.*?Test-Path.+Bundle.*?Test-Path.+Backup' -or
+    $abandonedArchiveBlock -notmatch '(?s)Get-VmRebuildState.*?OriginalPath.*?BackupPath.*?Status' -or
+    $abandonedArchiveBlock -notmatch '(?s)Move-Item.+VmRebuildStatePath.+originalArchive' -or
+    $abandonedArchiveBlock -match 'Remove-Item.+(BackupPath|PreviousBackupPath)') {
+    throw 'Abandoned-state handling may archive only the state record and must never delete or fabricate a legacy backup.'
+}
+if ($main -notmatch '(?s)function Test-AbandonedLegacyVmRebuildState.*?Test-ClaudeCoreSignatures' -or
+    $main -notmatch '(?s)function Test-AbandonedLegacyVmRebuildState.*?CurrentRunHealthy.*?CurrentVirtualDisk1772') {
+    throw 'Abandoned-state classification must require valid core signatures and current independent VM health.'
 }
 if ($main -notmatch '(?s)function Repair-MsixVmCommitFailure.*?Get-VmRebuildProtectionEvidence.*?if \(\$protection\.Suspected\).*?return \$false.*?Get-OfficialVmManifest') {
     throw 'MSIX VM commit repair must fail closed before any manifest-based external write when AppX protection is suspected.'
@@ -504,6 +521,74 @@ try {
                 -not ($historyFiles.Name -match '\.original\.json$') -or
                 -not ($historyFiles.Name -match '\.superseded\.json$')) {
                 throw 'Superseded-state archival must preserve both the original state and legacy VM backup.'
+            }
+        } finally {
+            $script:VmRebuildStatePath = $savedStatePath
+            $script:VmRebuildStateHistoryRoot = $savedHistoryRoot
+        }
+
+        $missingBackup = Join-Path $legacyVmBundles 'claudevm.bundle.backup-missing'
+        $abandonedState = [pscustomobject]@{
+            SchemaVersion = 1
+            Status = 'Rebuilding'
+            OriginalPath = $legacyBundle
+            BackupPath = $missingBackup
+        }
+        $validSignatures = [pscustomobject]@{ Valid = $true }
+        $invalidSignatures = [pscustomobject]@{ Valid = $false }
+        if (Test-AbandonedLegacyVmRebuildState -State $legacyState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures) {
+            throw 'A still-present legacy backup must use the Superseded branch, never the Abandoned branch.'
+        }
+        if (-not (Test-AbandonedLegacyVmRebuildState -State $abandonedState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures)) {
+            throw 'A missing legacy AppX bundle and backup must be archivable only when the current independent VM is verified healthy.'
+        }
+        if (Test-AbandonedLegacyVmRebuildState -State $abandonedState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $invalidSignatures) {
+            throw 'An abandoned legacy state must remain fail-closed when current Claude signatures are invalid.'
+        }
+        if (Test-AbandonedLegacyVmRebuildState -State $abandonedState -Paths $independentPaths -LifecycleEvidence $unhealthyLifecycle -CoreSignatures $validSignatures) {
+            throw 'An abandoned legacy state must remain fail-closed when the current VM is unhealthy.'
+        }
+        New-Item -ItemType Directory -Path $legacyBundle -Force | Out-Null
+        if (Test-AbandonedLegacyVmRebuildState -State $abandonedState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures) {
+            throw 'The abandoned-state branch requires both the legacy active bundle and backup to be absent.'
+        }
+        Remove-Item -LiteralPath $legacyBundle -Force
+
+        $savedStatePath = $script:VmRebuildStatePath
+        $savedHistoryRoot = $script:VmRebuildStateHistoryRoot
+        try {
+            $script:VmRebuildStatePath = Join-Path $statusRoot 'vm-rebuild-abandoned-active.json'
+            $script:VmRebuildStateHistoryRoot = Join-Path $statusRoot 'abandoned-state-history'
+            $abandonedState | ConvertTo-Json | Set-Content -LiteralPath $script:VmRebuildStatePath -Encoding UTF8
+            [void](Archive-AbandonedVmRebuildState -State $abandonedState -CurrentActiveUserData $independentData -SkipResumeCleanup)
+            $abandonedHistory = @(Get-ChildItem -LiteralPath $script:VmRebuildStateHistoryRoot -Filter '*.json' -File)
+            $abandonedRecord = @($abandonedHistory | Where-Object Name -match '\.abandoned\.json$')
+            if ((Test-Path -LiteralPath $script:VmRebuildStatePath) -or $abandonedHistory.Count -ne 2 -or
+                $abandonedRecord.Count -ne 1 -or (Test-Path -LiteralPath $missingBackup) -or
+                @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz' | Where-Object { -not (Test-Path -LiteralPath (Join-Path $independentBundle $_)) }).Count -gt 0) {
+                throw 'Abandoned-state archival must preserve the current VM and must never fabricate a missing legacy backup.'
+            }
+            $abandonedReceipt = Get-Content -LiteralPath $abandonedRecord[0].FullName -Raw | ConvertFrom-Json
+            if ($abandonedReceipt.Status -ne 'Abandoned' -or $abandonedReceipt.OriginalPathPresent -or
+                $abandonedReceipt.BackupPathPresent -or -not $abandonedReceipt.CurrentVmHealthy -or
+                $abandonedReceipt.CurrentActiveUserData -ne $independentData) {
+                throw 'Abandoned-state receipt does not accurately describe the verified missing-backup disposition.'
+            }
+        } finally {
+            $script:VmRebuildStatePath = $savedStatePath
+            $script:VmRebuildStateHistoryRoot = $savedHistoryRoot
+        }
+
+        $savedStatePath = $script:VmRebuildStatePath
+        $savedHistoryRoot = $script:VmRebuildStateHistoryRoot
+        try {
+            $script:VmRebuildStatePath = Join-Path $statusRoot 'vm-rebuild-resolve-active.json'
+            $script:VmRebuildStateHistoryRoot = Join-Path $statusRoot 'resolve-state-history'
+            $abandonedState | ConvertTo-Json | Set-Content -LiteralPath $script:VmRebuildStatePath -Encoding UTF8
+            $resolvedState = Resolve-VmRebuildState -State $abandonedState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures -SkipResumeCleanup
+            if ($null -ne $resolvedState -or (Test-Path -LiteralPath $script:VmRebuildStatePath) -or
+                @(Get-ChildItem -LiteralPath $script:VmRebuildStateHistoryRoot -Filter '*.abandoned.json' -File).Count -ne 1) {
+                throw 'Resolve-VmRebuildState must archive a verified abandoned state and allow Auto to continue.'
             }
         } finally {
             $script:VmRebuildStatePath = $savedStatePath

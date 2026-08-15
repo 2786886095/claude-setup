@@ -2,7 +2,7 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
-> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.1.1 还会安全归档已被健康独立 VM 取代的旧重建状态，只处理 VM 关键 EFS，并避免让已恢复的历史 0x1772 触发解密。已经运行旧版的用户请保留所有 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
+> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.1.2 还会区分“备份仍存在的 Superseded 状态”与“旧活动目录和备份均消失的 Abandoned 状态”，只处理 VM 关键 EFS，并避免让已恢复的历史 0x1772 触发解密。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
 
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
@@ -48,7 +48,7 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 一旦存在 AppX 应用受保护存储证据，立即禁止对包私有目录执行 `DecryptFileW`、bundle 归档/重建和外部解压/写入接管；自动修复改为使用非虚拟化独立数据目录；
 - 识别 `CreateVirtualDisk failed: 0x1772`。只有路径位于安全的非 AppX `LocalAppData`、已被 Claude 明确选用、当前用户可读，且当前 0x1772 尚未被后续完整成功序列覆盖时，才把 VM 关键路径上的 0x4000 分类为可解密的普通用户 EFS；
 - 将 EFS 自动修复严格限制为数据根目录、`vm_bundles`、`claudevm.bundle` 及 `rootfs.vhdx`、`sessiondata.vhdx`、`smol-bin.vhdx`、`initrd`、`vmlinuz`；会话、输出、上传、配置和缓存只报告，不解密；
-- 识别 v1.0.x 遗留的 `vm-rebuild-active.json`。只有旧状态精确属于 Claude AppX 私有目录、旧备份仍安全存在，并且当前独立 VM 完整且日志证明健康时，才将原状态和 Superseded 记录归档到 `%ProgramData%\ClaudeSetup\state-history`；旧 bundle 备份永不删除；
+- 识别 v1.0.x 遗留的 `vm-rebuild-active.json`。旧备份存在时，只有旧状态精确属于 Claude AppX 私有目录且当前独立 VM 完整健康，才归档为 Superseded，并永久保留旧备份；旧活动目录与备份均已不存在时，还必须复核当前 VM 关键 EFS、完整成功日志及 Claude/cowork-svc 的 Anthropic 签名，才归档为 Abandoned。两种记录都进入 `%ProgramData%\ClaudeSetup\state-history`；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
@@ -117,6 +117,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 | 历史 0x1772 后已有完整成功序列 | 只记为历史信息，不触发解密或诊断失败 |
 | 只有会话/输出等非 VM 文件使用 EFS | 只报告数量，保留用户加密，不阻断 Cowork |
 | 旧重建状态指向 AppX，当前健康 VM 位于 Claude-3p | 原状态归档为 Superseded，旧 bundle 备份保持不动 |
+| 旧状态仍在，但旧活动目录与备份均已不存在 | 仅在当前独立 VM 完整健康且双签名有效时归档为 Abandoned；不会伪造备份保留记录 |
 | VM 目录是 junction/reparse point | 停止并报告，避免误删大体积 VM 数据 |
 | VDI/虚拟机 | 警告需要嵌套虚拟化 |
 | 企业 AppLocker/策略阻止 | 停止并输出报告，不绕过安全策略 |

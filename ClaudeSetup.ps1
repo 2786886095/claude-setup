@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.1.1'
+$script:ToolVersion = '1.1.2'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -1106,7 +1106,7 @@ function Save-VmRebuildState {
     $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:VmRebuildStatePath -Encoding UTF8
 }
 
-function Get-VmRebuildStateSafePaths {
+function Get-VmRebuildStatePathShape {
     param([Parameter(Mandatory)]$State)
     if (-not $State.PSObject.Properties['SchemaVersion'] -or [int]$State.SchemaVersion -ne 1) {
         throw '不支持的 VM 重建状态版本。'
@@ -1126,9 +1126,17 @@ function Get-VmRebuildStateSafePaths {
         (Split-Path -Leaf $stateBackup) -notlike 'claudevm.bundle.backup-*') {
         throw "VM 重建状态的备份路径不安全：$stateBackup"
     }
-    if (-not (Test-Path -LiteralPath $stateBackup -PathType Container)) { throw "VM 重建备份丢失或不是目录：$stateBackup" }
-    if (Test-ReparsePoint $stateBackup) { throw "VM 重建备份变成了重解析点：$stateBackup" }
     return [pscustomobject]@{ Bundle = $stateBundle; Backup = $stateBackup; VmBundles = $vmBundles }
+}
+
+function Get-VmRebuildStateSafePaths {
+    param([Parameter(Mandatory)]$State)
+    $statePaths = Get-VmRebuildStatePathShape $State
+    if (-not (Test-Path -LiteralPath $statePaths.Backup -PathType Container)) {
+        throw "VM 重建备份丢失或不是目录：$($statePaths.Backup)"
+    }
+    if (Test-ReparsePoint $statePaths.Backup) { throw "VM 重建备份变成了重解析点：$($statePaths.Backup)" }
+    return $statePaths
 }
 
 function Assert-VmRebuildState {
@@ -1169,6 +1177,38 @@ function Test-SupersedableLegacyVmRebuildState {
     return [bool]($lifecycle.CurrentRunHealthy -and -not $lifecycle.CurrentVirtualDisk1772)
 }
 
+function Test-AbandonedLegacyVmRebuildState {
+    param(
+        [Parameter(Mandatory)]$State,
+        $Paths,
+        $LifecycleEvidence,
+        $CoreSignatures
+    )
+    try { $statePaths = Get-VmRebuildStatePathShape $State } catch { return $false }
+    if (-not $State.PSObject.Properties['Status'] -or [string]$State.Status -notin @('AwaitingRestart', 'Rebuilding')) {
+        return $false
+    }
+    if ((Test-Path -LiteralPath $statePaths.Bundle) -or (Test-Path -LiteralPath $statePaths.Backup)) { return $false }
+    $paths = if ($Paths) { $Paths } else { Get-ClaudePaths }
+    if (-not $paths -or -not $paths.PSObject.Properties['PackageLocalUserData'] -or
+        -not (Test-IsAppxPrivatePath $statePaths.Bundle)) { return $false }
+    $expectedLegacyBundle = [IO.Path]::GetFullPath((Join-Path $paths.PackageLocalUserData 'vm_bundles\claudevm.bundle'))
+    if (-not $statePaths.Bundle.Equals($expectedLegacyBundle, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not (Test-SafeIndependentClaudeUserDataPath $paths.ActiveUserData) -or
+        (Test-IsAppxPrivatePath $paths.ActiveUserData) -or
+        $paths.ActiveUserDataSource -eq 'PackageLocalCache:default') { return $false }
+    $currentBundle = [IO.Path]::GetFullPath((Join-Path $paths.ActiveUserData 'vm_bundles\claudevm.bundle'))
+    $status = Get-VmBundleStatus -BundlePath $currentBundle
+    if (-not $status.Ready -or @(Get-ClaudeVmCriticalEfsItems $paths.ActiveUserData).Count -gt 0) { return $false }
+    $lifecycle = if ($LifecycleEvidence) { $LifecycleEvidence } else {
+        $protection = Get-ClaudeUserDataProtectionEvidence -UserDataPath $paths.ActiveUserData
+        [pscustomobject]@{ CurrentRunHealthy = $protection.CurrentRunHealthy; CurrentVirtualDisk1772 = $protection.VirtualDisk1772 }
+    }
+    if (-not $lifecycle.CurrentRunHealthy -or $lifecycle.CurrentVirtualDisk1772) { return $false }
+    $signatures = if ($CoreSignatures) { $CoreSignatures } else { Test-ClaudeCoreSignatures }
+    return [bool]($signatures -and $signatures.Valid)
+}
+
 function Archive-SupersededVmRebuildState {
     param(
         [Parameter(Mandatory)]$State,
@@ -1202,16 +1242,75 @@ function Archive-SupersededVmRebuildState {
     return $supersededRecord
 }
 
+function Archive-AbandonedVmRebuildState {
+    param(
+        [Parameter(Mandatory)]$State,
+        [string]$CurrentActiveUserData,
+        [switch]$SkipResumeCleanup
+    )
+    $statePaths = Get-VmRebuildStatePathShape $State
+    if ((Test-Path -LiteralPath $statePaths.Bundle) -or (Test-Path -LiteralPath $statePaths.Backup)) {
+        throw '孤立状态归档前发现旧活动目录或备份重新出现；保持状态并停止。'
+    }
+    $onDiskState = Get-VmRebuildState
+    if (-not $onDiskState -or [string]$onDiskState.OriginalPath -ne [string]$State.OriginalPath -or
+        [string]$onDiskState.BackupPath -ne [string]$State.BackupPath -or [string]$onDiskState.Status -ne [string]$State.Status) {
+        throw '孤立状态在归档前发生变化；保持最新状态并停止。'
+    }
+    New-Item -ItemType Directory -Path $script:VmRebuildStateHistoryRoot -Force | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $nonce = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $originalArchive = Join-Path $script:VmRebuildStateHistoryRoot "vm-rebuild-$stamp-$nonce.original.json"
+    $abandonedRecord = Join-Path $script:VmRebuildStateHistoryRoot "vm-rebuild-$stamp-$nonce.abandoned.json"
+    Move-Item -LiteralPath $script:VmRebuildStatePath -Destination $originalArchive
+    try {
+        [pscustomobject]@{
+            SchemaVersion = 2
+            Status = 'Abandoned'
+            AbandonedReason = 'Legacy AppX bundle and backup no longer exist; current independent VM is verified healthy'
+            PreviousOriginalPath = [string]$State.OriginalPath
+            PreviousBackupPath = [string]$State.BackupPath
+            OriginalPathPresent = $false
+            BackupPathPresent = $false
+            CurrentActiveUserData = $CurrentActiveUserData
+            CurrentVmHealthy = $true
+            OriginalStateArchive = $originalArchive
+            ArchivedAt = (Get-Date).ToUniversalTime().ToString('o')
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $abandonedRecord -Encoding UTF8
+    } catch {
+        if ((Test-Path -LiteralPath $originalArchive) -and -not (Test-Path -LiteralPath $script:VmRebuildStatePath)) {
+            Move-Item -LiteralPath $originalArchive -Destination $script:VmRebuildStatePath
+        }
+        throw
+    }
+    if (-not $SkipResumeCleanup) { Remove-ResumeAfterRestart }
+    Write-Log "孤立的旧 VM 重建状态已归档：$abandonedRecord" OK
+    Write-Log '旧状态引用的活动目录和备份均已不存在；没有伪造备份保留记录，也未修改当前健康 VM。' INFO
+    return $abandonedRecord
+}
+
 function Resolve-VmRebuildState {
-    $state = Get-VmRebuildState
+    param(
+        $State,
+        $Paths,
+        $LifecycleEvidence,
+        $CoreSignatures,
+        [switch]$SkipResumeCleanup
+    )
+    $state = if ($PSBoundParameters.ContainsKey('State')) { $State } else { Get-VmRebuildState }
     if (-not $state) { return $null }
     try {
         Assert-VmRebuildState $state
         return $state
     } catch {
         $validationError = $_.Exception.Message
-        if (Test-SupersedableLegacyVmRebuildState $state) {
-            [void](Archive-SupersededVmRebuildState $state)
+        if (Test-SupersedableLegacyVmRebuildState -State $state -Paths $Paths -LifecycleEvidence $LifecycleEvidence) {
+            [void](Archive-SupersededVmRebuildState -State $state -SkipResumeCleanup:$SkipResumeCleanup)
+            return $null
+        }
+        if (Test-AbandonedLegacyVmRebuildState -State $state -Paths $Paths -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures) {
+            $paths = if ($Paths) { $Paths } else { Get-ClaudePaths }
+            [void](Archive-AbandonedVmRebuildState -State $state -CurrentActiveUserData $paths.ActiveUserData -SkipResumeCleanup:$SkipResumeCleanup)
             return $null
         }
         throw $validationError
@@ -1986,7 +2085,29 @@ function Invoke-Diagnostics {
 
     Add-Finding 'os' 'Info' "$($os.Caption) $($os.Version), build $($os.BuildNumber)" "$($computer.Manufacturer) $($computer.Model)"
     if ($rebuildState) {
-        Add-Finding 'vm-rebuild-state' 'Warning' "VM bundle 安全重建进行中：$($rebuildState.Status)" "备份：$($rebuildState.BackupPath)`r`n活动路径：$($rebuildState.OriginalPath)"
+        $abandonedVerified = $false
+        try { $abandonedVerified = Test-AbandonedLegacyVmRebuildState $rebuildState } catch {}
+        $statePaths = $null
+        try { $statePaths = Get-VmRebuildStatePathShape $rebuildState } catch {}
+        $statePresenceKnown = $false
+        $stateBundlePresent = $false
+        $stateBackupPresent = $false
+        if ($statePaths) {
+            try {
+                $stateBundlePresent = Test-Path -LiteralPath $statePaths.Bundle
+                $stateBackupPresent = Test-Path -LiteralPath $statePaths.Backup
+                $statePresenceKnown = $true
+            } catch {}
+        }
+        if ($abandonedVerified) {
+            Add-Finding 'vm-rebuild-state-abandoned' 'Warning' '检测到孤立的旧版 VM 重建状态；当前独立 VM 健康' "Auto 对该孤立状态只会归档到 state-history 并清理旧 RunOnce，不会借此卸载 Claude 或修改当前 VM；归档后继续常规安装验证流程。`r`n旧活动路径：$($rebuildState.OriginalPath)`r`n旧备份路径：$($rebuildState.BackupPath)"
+        } elseif ($statePresenceKnown -and -not $stateBundlePresent -and -not $stateBackupPresent) {
+            Add-Finding 'vm-rebuild-state-orphaned-unverified' 'Warning' '检测到孤立的旧版 VM 重建状态，但当前环境未满足自动归档条件' "旧活动目录和备份均不存在；Auto 将保持失效保护。请检查当前 VM 完整性、EFS、日志健康状态和 Anthropic 签名。`r`n旧活动路径：$($rebuildState.OriginalPath)`r`n旧备份路径：$($rebuildState.BackupPath)"
+        } elseif ($statePresenceKnown -and (-not $stateBundlePresent -or -not $stateBackupPresent)) {
+            Add-Finding 'vm-rebuild-state-incomplete' 'Warning' '旧版 VM 重建状态引用的活动目录或备份不完整' "Auto 不会猜测缺失内容并将停止。`r`n备份：$($rebuildState.BackupPath)`r`n活动路径：$($rebuildState.OriginalPath)"
+        } else {
+            Add-Finding 'vm-rebuild-state' 'Warning' "VM bundle 安全重建进行中：$($rebuildState.Status)" "备份：$($rebuildState.BackupPath)`r`n活动路径：$($rebuildState.OriginalPath)"
+        }
     }
     if ([version]$os.Version -ge [version]'10.0') {
         Add-Finding 'os-support' 'Pass' 'Windows 10/11 版本范围受 Claude Desktop 支持'

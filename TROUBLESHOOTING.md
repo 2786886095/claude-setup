@@ -95,4 +95,6 @@
 
 自动解密范围只包括活动数据根目录、`vm_bundles`、`claudevm.bundle` 和五个 VM 运行文件。会话 `.jsonl`、`local-agent-mode-sessions`、`claude-code-sessions`、outputs、uploads、配置及缓存即使使用 EFS，也只显示为 Info，不会阻断 Cowork 或被自动解密。
 
-若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.1.1 会在严格核对旧路径、旧备份、当前 VM 文件和完整成功日志后，把原状态和 Superseded 记录归档到 `%ProgramData%\ClaudeSetup\state-history`。任何旧 `claudevm.bundle.backup-*` 都保持不动；证据不完整时继续失效保护。
+若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.1.2 会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和旧备份均已不存在时，只有当前 VM 完整、VM 关键路径无 EFS、完整成功日志成立且 Claude/cowork-svc 双签名有效，才归档为 Abandoned。若只缺一侧、路径异常或任一健康证据不足，Auto 继续失效保护并停止。
+
+Diagnose 会把已经验证的孤立状态明确显示为“当前独立 VM 健康，Auto 对该状态只执行归档和旧 RunOnce 清理，随后继续常规安装验证”；无法验证的孤立状态会单独提示缺少的健康或签名条件，不再误称重建仍在正常进行。
