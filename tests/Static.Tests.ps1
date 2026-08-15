@@ -60,6 +60,9 @@ $requiredSafetyChecks = @(
     '--user-data-dir'
     'CreateVirtualDisk failed: 0x1772'
     'Get-ClaudeUserDataProtectionKind'
+    'Get-ClaudeVmLifecycleEvidence'
+    'Get-ClaudeVmCriticalEfsItems'
+    'Get-ClaudeNonVmEncryptedItems'
     'Repair-ConfirmedIndependentUserDataEfs'
     '[int]$HandshakeSeconds = 45'
     '[int]$VmSeconds = 120'
@@ -106,6 +109,9 @@ $requiredSafetyChecks = @(
     'Wait-ForRebuiltVmBundle'
     'Complete-VmBundleRebuild'
     'Assert-VmRebuildState'
+    'Resolve-VmRebuildState'
+    'Archive-SupersededVmRebuildState'
+    'state-history'
     'vm-rebuild-active.json'
     'claudevm.bundle.backup-'
     'BackupBytes'
@@ -126,7 +132,7 @@ if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
 }
 $storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
@@ -149,8 +155,16 @@ $efsEnd = $main.IndexOf('function Test-VmRuntimeEfsItem', $efsStart)
 if ($efsStart -lt 0 -or $efsEnd -le $efsStart) { throw 'Unable to isolate safe independent EFS repair.' }
 $efsBlock = $main.Substring($efsStart, $efsEnd - $efsStart)
 if ($efsBlock -notmatch "Kind -ne 'ConfirmedUserEfs'" -or $efsBlock -notmatch 'Invoke-EfsDecrypt' -or
-    $efsBlock -notmatch 'Get-ClaudeEncryptedItems') {
-    throw 'EFS repair must require the confirmed independent-user-data classification and verify the result.'
+    $efsBlock -notmatch 'Get-ClaudeVmCriticalEfsItems' -or $efsBlock -match 'foreach.+NonVmItems') {
+    throw 'EFS repair must require confirmed current evidence, decrypt only VM-critical items, and verify only that scope.'
+}
+$archiveStart = $main.IndexOf('function Archive-SupersededVmRebuildState')
+$archiveEnd = $main.IndexOf('function Resolve-VmRebuildState', $archiveStart)
+if ($archiveStart -lt 0 -or $archiveEnd -le $archiveStart) { throw 'Unable to isolate superseded-state archival.' }
+$archiveBlock = $main.Substring($archiveStart, $archiveEnd - $archiveStart)
+if ($archiveBlock -notmatch '(?s)Move-Item.+VmRebuildStatePath.+originalArchive' -or
+    $archiveBlock -match 'Remove-Item.+BackupPath') {
+    throw 'Superseded rebuild state must be archived while every legacy VM backup remains untouched.'
 }
 if ($main -notmatch '(?s)function Repair-MsixVmCommitFailure.*?Get-VmRebuildProtectionEvidence.*?if \(\$protection\.Suspected\).*?return \$false.*?Get-OfficialVmManifest') {
     throw 'MSIX VM commit repair must fail closed before any manifest-based external write when AppX protection is suspected.'
@@ -297,11 +311,20 @@ try {
         (Test-SafeIndependentClaudeUserDataPath (Join-Path $env:LOCALAPPDATA 'Packages\Claude_test\LocalCache\Claude'))) {
         throw 'Independent user-data path safety classification failed.'
     }
-    if ((Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $true -AppxError $false -SafeIndependentPath $false -IsConfigured $false -CurrentUserReadable $true -VirtualDisk1772 $false -ToolManaged $false) -ne 'AppxProtected' -or
-        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $false -SafeIndependentPath $true -IsConfigured $true -CurrentUserReadable $true -VirtualDisk1772 $true -ToolManaged $false) -ne 'ConfirmedUserEfs' -or
-        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $true -SafeIndependentPath $true -IsConfigured $true -CurrentUserReadable $true -VirtualDisk1772 $true -ToolManaged $false) -ne 'ConfirmedUserEfs' -or
-        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $false -SafeIndependentPath $true -IsConfigured $false -CurrentUserReadable $true -VirtualDisk1772 $true -ToolManaged $false) -ne 'EncryptedUnknown') {
+    if ((Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $true -AppxError $false -SafeIndependentPath $false -IsConfigured $false -CurrentUserReadable $true -VirtualDisk1772 $false) -ne 'AppxProtected' -or
+        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $false -SafeIndependentPath $true -IsConfigured $true -CurrentUserReadable $true -VirtualDisk1772 $true) -ne 'ConfirmedUserEfs' -or
+        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $true -SafeIndependentPath $true -IsConfigured $true -CurrentUserReadable $true -VirtualDisk1772 $true) -ne 'ConfirmedUserEfs' -or
+        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $false -SafeIndependentPath $true -IsConfigured $true -CurrentUserReadable $true -VirtualDisk1772 $false) -ne 'EncryptedUnknown' -or
+        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $false -SafeIndependentPath $true -IsConfigured $false -CurrentUserReadable $true -VirtualDisk1772 $true) -ne 'EncryptedUnknown') {
         throw 'AppX-protected versus confirmed user-EFS classification failed.'
+    }
+
+    $scopeFixture = Join-Path $env:LOCALAPPDATA 'Claude-3p-scope-fixture'
+    if (-not (Test-ClaudeVmCriticalEfsPath -UserDataPath $scopeFixture -CandidatePath $scopeFixture) -or
+        -not (Test-ClaudeVmCriticalEfsPath -UserDataPath $scopeFixture -CandidatePath (Join-Path $scopeFixture 'vm_bundles\claudevm.bundle\sessiondata.vhdx')) -or
+        (Test-ClaudeVmCriticalEfsPath -UserDataPath $scopeFixture -CandidatePath (Join-Path $scopeFixture 'local-agent-mode-sessions\session.jsonl')) -or
+        (Test-ClaudeVmCriticalEfsPath -UserDataPath $scopeFixture -CandidatePath (Join-Path $scopeFixture 'vm_bundles\claudevm.bundle\rootfs.vhdx.zst'))) {
+        throw 'VM-critical EFS scope must exclude sessions, caches, archives, and other user files.'
     }
 
     $mockCandidates = @(
@@ -371,6 +394,50 @@ try {
             throw 'AppX protected-storage evidence detection failed.'
         }
 
+        $current1772Log = Join-Path $statusRoot 'current-1772.log'
+        [IO.File]::WriteAllLines($current1772Log, @(
+            '2026-08-15T01:00:00Z CreateVirtualDisk failed: 0x1772',
+            '2026-08-15T01:00:01Z retry scheduled'
+        ))
+        $current1772 = Get-ClaudeVmLifecycleEvidence -LogPaths @($current1772Log)
+        if (-not $current1772.CurrentVirtualDisk1772 -or -not $current1772.HistoricalVirtualDisk1772 -or $current1772.CurrentRunHealthy) {
+            throw 'An unresolved latest 0x1772 must remain current repair evidence.'
+        }
+
+        $resolved1772Log = Join-Path $statusRoot 'resolved-1772.log'
+        [IO.File]::WriteAllLines($resolved1772Log, @(
+            '2026/08/15 01:00:00 CreateVirtualDisk failed: 0x1772',
+            '2026/08/15 01:01:00 VM started successfully',
+            '2026/08/15 01:01:01 sdk-daemon is ready',
+            '2026/08/15 01:01:02 Network status: CONNECTED',
+            '2026/08/15 01:01:03 API reachability: REACHABLE'
+        ))
+        $resolved1772 = Get-ClaudeVmLifecycleEvidence -LogPaths @($resolved1772Log)
+        if ($resolved1772.CurrentVirtualDisk1772 -or -not $resolved1772.FailureResolvedByLaterSuccess -or -not $resolved1772.CurrentRunHealthy) {
+            throw 'A complete success sequence after 0x1772 must classify the failure as resolved history.'
+        }
+
+        $ambiguousFailureLog = Join-Path $statusRoot 'ambiguous-failure.log'
+        $ambiguousSuccessLog = Join-Path $statusRoot 'ambiguous-success.log'
+        [IO.File]::WriteAllText($ambiguousFailureLog, 'CreateVirtualDisk failed: 0x1772')
+        [IO.File]::WriteAllLines($ambiguousSuccessLog, @('VM started successfully', 'sdk-daemon is ready', 'Network status: CONNECTED', 'API reachability: REACHABLE'))
+        $ambiguous1772 = Get-ClaudeVmLifecycleEvidence -LogPaths @($ambiguousFailureLog, $ambiguousSuccessLog)
+        if (-not $ambiguous1772.CurrentVirtualDisk1772) {
+            throw 'Cross-log events without timestamps are ambiguous and must fail closed.'
+        }
+
+        [IO.File]::WriteAllText($ambiguousFailureLog, '2026/08/15 01:00:00 CreateVirtualDisk failed: 0x1772')
+        [IO.File]::WriteAllLines($ambiguousSuccessLog, @(
+            '2026/08/15 01:01:00 VM started successfully',
+            '2026/08/15 01:01:01 sdk-daemon is ready',
+            '2026/08/15 01:01:02 Network status: CONNECTED',
+            '2026/08/15 01:01:03 API reachability: REACHABLE'
+        ))
+        $timestampedCrossLog = Get-ClaudeVmLifecycleEvidence -LogPaths @($ambiguousFailureLog, $ambiguousSuccessLog)
+        if ($timestampedCrossLog.CurrentVirtualDisk1772 -or -not $timestampedCrossLog.FailureResolvedByLaterSuccess) {
+            throw 'Timestamped cross-log success evidence must resolve an older 0x1772.'
+        }
+
         $profileSource = Join-Path $statusRoot 'profile-source'
         $profileTarget = Join-Path $statusRoot 'profile-target'
         New-Item -ItemType Directory -Path (Join-Path $profileSource 'vm_bundles'), (Join-Path $profileSource 'Cache'), (Join-Path $profileSource 'Local Storage') -Force | Out-Null
@@ -384,6 +451,63 @@ try {
             (Test-Path -LiteralPath (Join-Path $profileTarget 'vm_bundles')) -or
             (Test-Path -LiteralPath (Join-Path $profileTarget 'Cache'))) {
             throw 'Independent profile migration must retain configuration while excluding VM and cache data.'
+        }
+
+        $legacyVmBundles = Join-Path $statusRoot 'AppData\Local\Packages\Claude_test\LocalCache\Roaming\Claude\vm_bundles'
+        $legacyBundle = Join-Path $legacyVmBundles 'claudevm.bundle'
+        $legacyBackup = Join-Path $legacyVmBundles 'claudevm.bundle.backup-20260814-095944'
+        New-Item -ItemType Directory -Path $legacyBackup -Force | Out-Null
+        $independentData = Join-Path $statusRoot 'Claude-3p'
+        $independentBundle = Join-Path $independentData 'vm_bundles\claudevm.bundle'
+        New-Item -ItemType Directory -Path $independentBundle -Force | Out-Null
+        foreach ($name in @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz')) {
+            New-Item -ItemType File -Path (Join-Path $independentBundle $name) -Force | Out-Null
+        }
+        $legacyState = [pscustomobject]@{
+            SchemaVersion = 1
+            Status = 'Rebuilding'
+            OriginalPath = $legacyBundle
+            BackupPath = $legacyBackup
+        }
+        $independentPaths = [pscustomobject]@{
+            ActiveUserData = $independentData
+            ActiveUserDataSource = 'Environment:User'
+            PackageLocalUserData = Split-Path -Parent (Split-Path -Parent $legacyBundle)
+        }
+        $healthyLifecycle = [pscustomobject]@{ CurrentRunHealthy = $true; CurrentVirtualDisk1772 = $false }
+        if (-not (Test-SupersedableLegacyVmRebuildState -State $legacyState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle)) {
+            throw 'A structurally healthy independent VM must safely supersede a valid legacy AppX rebuild state.'
+        }
+        $unhealthyLifecycle = [pscustomobject]@{ CurrentRunHealthy = $false; CurrentVirtualDisk1772 = $true }
+        if (Test-SupersedableLegacyVmRebuildState -State $legacyState -Paths $independentPaths -LifecycleEvidence $unhealthyLifecycle) {
+            throw 'A legacy rebuild state must remain active when current independent VM health is not proven.'
+        }
+        $unsafeLegacyState = [pscustomobject]@{
+            SchemaVersion = 1
+            Status = 'Rebuilding'
+            OriginalPath = (Join-Path $statusRoot 'unrelated\vm_bundles\claudevm.bundle')
+            BackupPath = (Join-Path $statusRoot 'unrelated\vm_bundles\claudevm.bundle.backup-1')
+        }
+        if (Test-SupersedableLegacyVmRebuildState -State $unsafeLegacyState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle) {
+            throw 'A rebuild state outside Claude AppX private data must never be auto-superseded.'
+        }
+        $savedStatePath = $script:VmRebuildStatePath
+        $savedHistoryRoot = $script:VmRebuildStateHistoryRoot
+        try {
+            $script:VmRebuildStatePath = Join-Path $statusRoot 'vm-rebuild-active.json'
+            $script:VmRebuildStateHistoryRoot = Join-Path $statusRoot 'state-history'
+            $legacyState | ConvertTo-Json | Set-Content -LiteralPath $script:VmRebuildStatePath -Encoding UTF8
+            [void](Archive-SupersededVmRebuildState -State $legacyState -SkipResumeCleanup)
+            $historyFiles = @(Get-ChildItem -LiteralPath $script:VmRebuildStateHistoryRoot -Filter '*.json' -File)
+            if ((Test-Path -LiteralPath $script:VmRebuildStatePath) -or $historyFiles.Count -ne 2 -or
+                -not (Test-Path -LiteralPath $legacyBackup) -or
+                -not ($historyFiles.Name -match '\.original\.json$') -or
+                -not ($historyFiles.Name -match '\.superseded\.json$')) {
+                throw 'Superseded-state archival must preserve both the original state and legacy VM backup.'
+            }
+        } finally {
+            $script:VmRebuildStatePath = $savedStatePath
+            $script:VmRebuildStateHistoryRoot = $savedHistoryRoot
         }
     } finally {
         $resolvedStatusRoot = [IO.Path]::GetFullPath($statusRoot)

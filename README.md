@@ -2,7 +2,7 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
-> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.1.0 在保持该边界的基础上，新增物理路径复核、官方卸载重装回退和非 AppX 独立数据目录修复。已经运行旧版的用户请保留所有 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
+> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.1.1 还会安全归档已被健康独立 VM 取代的旧重建状态，只处理 VM 关键 EFS，并避免让已恢复的历史 0x1772 触发解密。已经运行旧版的用户请保留所有 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
 
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
@@ -46,7 +46,9 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 诊断 Windows 11 build 26200 等环境中的 `UNKNOWN ... copyfile`、`ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)` 与 `CreateVirtualDisk` 失败；
 - 检测 Encrypted(0x4000)、目录联接与 `rootfs.vhdx/sessiondata.vhdx`，但不再把 AppX 包私有目录中的 0x4000 自动等同于可解密的经典 EFS；
 - 一旦存在 AppX 应用受保护存储证据，立即禁止对包私有目录执行 `DecryptFileW`、bundle 归档/重建和外部解压/写入接管；自动修复改为使用非虚拟化独立数据目录；
-- 识别 `CreateVirtualDisk failed: 0x1772`。只有路径位于安全的非 AppX `LocalAppData`、已被 Claude 明确选用、当前用户可读，且存在 0x1772 或工具创建状态时，才把 0x4000 分类为可解密的普通用户 EFS；
+- 识别 `CreateVirtualDisk failed: 0x1772`。只有路径位于安全的非 AppX `LocalAppData`、已被 Claude 明确选用、当前用户可读，且当前 0x1772 尚未被后续完整成功序列覆盖时，才把 VM 关键路径上的 0x4000 分类为可解密的普通用户 EFS；
+- 将 EFS 自动修复严格限制为数据根目录、`vm_bundles`、`claudevm.bundle` 及 `rootfs.vhdx`、`sessiondata.vhdx`、`smol-bin.vhdx`、`initrd`、`vmlinuz`；会话、输出、上传、配置和缓存只报告，不解密；
+- 识别 v1.0.x 遗留的 `vm-rebuild-active.json`。只有旧状态精确属于 Claude AppX 私有目录、旧备份仍安全存在，并且当前独立 VM 完整且日志证明健康时，才将原状态和 Superseded 记录归档到 `%ProgramData%\ClaudeSetup\state-history`；旧 bundle 备份永不删除；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
@@ -79,7 +81,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 因此最新版绝不修改包私有 bundle：命中 0x4000、`UNKNOWN ... copyfile`、显式 409/0x199 或 `CreateVirtualDisk failed: 0x199` 时，不解密、不移动 bundle、不创建硬链接、不转正 `.tmp/.partial`、不向目录写 `.origin`。Auto/Repair 会把可保留的登录与配置迁移到 `%LOCALAPPDATA%\Claude-3p`，跳过 `vm_bundles`、缓存、日志和临时下载，然后设置用户级 `CLAUDE_USER_DATA_DIR`。
 
-独立目录中的加密也不会被盲目处理。只有分类器确认它是当前用户可读的普通 EFS，并命中 `CreateVirtualDisk failed: 0x1772` 或工具创建标记时，才停止 Claude/Cowork、调用 Unicode `DecryptFileW` 并逐项复核。AppX 私有路径、WindowsApps、重解析点和类型不明的加密一律保持原样。
+独立目录中的加密也不会被盲目处理。只有分类器确认 VM 关键路径属于当前用户可读的普通 EFS，并命中尚未被后续 `VM started successfully`、`sdk-daemon is ready`、`Network CONNECTED`、`API REACHABLE` 完整序列覆盖的当前 0x1772 时，才停止 Claude/Cowork、调用 Unicode `DecryptFileW` 并逐项复核。会话 `.jsonl`、输出、上传、配置和缓存保持原样；AppX 私有路径、WindowsApps、重解析点和类型不明的加密同样不会被修改。
 
 也可以在管理员 PowerShell 中运行：
 
@@ -112,6 +114,9 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 | `UNKNOWN ... copyfile *.zst.*.partial` 或 `*.tmp` | 包私有目录保持原样，切换至独立数据目录重新下载 VM |
 | 包私有 VM 带 Encrypted(0x4000) | 视为 AppX 受保护候选，绝不解密 |
 | 独立目录出现 `CreateVirtualDisk 0x1772` | 满足全部安全证据后解除普通用户 EFS并复核 |
+| 历史 0x1772 后已有完整成功序列 | 只记为历史信息，不触发解密或诊断失败 |
+| 只有会话/输出等非 VM 文件使用 EFS | 只报告数量，保留用户加密，不阻断 Cowork |
+| 旧重建状态指向 AppX，当前健康 VM 位于 Claude-3p | 原状态归档为 Superseded，旧 bundle 备份保持不动 |
 | VM 目录是 junction/reparse point | 停止并报告，避免误删大体积 VM 数据 |
 | VDI/虚拟机 | 警告需要嵌套虚拟化 |
 | 企业 AppLocker/策略阻止 | 停止并输出报告，不绕过安全策略 |

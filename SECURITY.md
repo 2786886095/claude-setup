@@ -8,15 +8,17 @@
 
 `v1.1.0` 增加一条与包私有存储隔离的恢复路径：迁移非 VM 用户配置到 `%LOCALAPPDATA%\Claude-3p`，设置 `CLAUDE_USER_DATA_DIR`，由 Claude 在独立目录重新创建 VM。包私有旧目录仍保持只读。只有独立目录同时满足路径、配置来源、当前用户可读和 0x1772/工具状态证据时，才允许通过 Unicode `DecryptFileW` 解除普通用户 EFS。
 
+`v1.1.1` 收紧上述恢复路径：工具创建状态不再替代当前 0x1772 证据；已被后续完整 VM/Daemon/Network/API 成功序列覆盖的 0x1772 只作为历史信息。自动解密仅限 VM 关键路径，非 VM 会话和用户文件保持原样。若旧 `vm-rebuild-active.json` 精确指向 Claude AppX 私有 bundle，而当前 `%LOCALAPPDATA%\Claude-3p` 的完整 VM 已有健康证据，工具会把原状态及 Superseded 记录移动到 `state-history`，但绝不删除、解密或硬链接旧 `claudevm.bundle.backup-*`。
+
 ## 已运行旧版本怎么办
 
 1. 停止反复运行旧版安装器；不要删除任何 `claudevm.bundle.backup-*`、`foreignjunk` 或 `%ProgramData%\ClaudeSetup` 状态文件。
 2. 不要运行来源不明的 `fix_commit.bat`。仅凭文件名或 12 位哈希前缀不能证明 `.tmp/.partial` 完整。
 3. 不要把活动 VHDX 硬链接到唯一备份。NTFS 硬链接是同一文件的多个路径；通过活动路径发生的内容或属性变化也作用于“备份”，因此它不再是独立回滚副本。
 4. 使用最新版 `diagnose.cmd` 收集只读报告，并同时保留 `C:\ProgramData\Claude\Logs\cowork-service.log`。
-5. 若报告命中 `CreateVirtualDisk failed: 0x199` 且 `sessiondata.vhdx` 缺失，可使用 v1.1.0 的独立数据目录恢复路径；若迁移或后续健康验证失败，请保留报告并向 Anthropic 反馈。
+5. 若报告命中 `CreateVirtualDisk failed: 0x199` 且 `sessiondata.vhdx` 缺失，可使用 v1.1.1 的独立数据目录恢复路径；若迁移或后续健康验证失败，请保留报告并向 Anthropic 反馈。
 
-本项目目前不会自动恢复旧版移动的 bundle。安全恢复必须先证明候选目录、官方 MSIX manifest、全部必需文件和日志状态一致，再选择不会破坏独立备份的目录级回滚方案。
+本项目不会自动恢复或删除旧版移动的 bundle。v1.1.1 只能在当前独立 VM 完整且健康已证实时归档阻断流程的旧状态文件；旧 bundle 继续作为独立恢复证据保留。真正的内容恢复仍必须先证明候选目录、官方 MSIX manifest、全部必需文件和日志状态一致，再选择不会破坏独立备份的目录级回滚方案。
 
 ## 技术依据
 

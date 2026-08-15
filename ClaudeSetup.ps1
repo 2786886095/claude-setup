@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.1.0'
+$script:ToolVersion = '1.1.1'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -29,6 +29,7 @@ $script:DownloadsRoot = Join-Path $script:Root 'downloads'
 $script:ProgramDataRoot = Join-Path $env:ProgramData 'ClaudeSetup'
 $script:BackupRoot = Join-Path $script:ProgramDataRoot 'backups'
 $script:VmRebuildStatePath = Join-Path $script:ProgramDataRoot 'vm-rebuild-active.json'
+$script:VmRebuildStateHistoryRoot = Join-Path $script:ProgramDataRoot 'state-history'
 $script:LogPath = $null
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:NeedsRestart = $false
@@ -735,6 +736,62 @@ function Get-ClaudeEncryptedItems {
     return $items.ToArray()
 }
 
+function Test-ClaudeVmCriticalEfsPath {
+    param(
+        [Parameter(Mandatory)][string]$UserDataPath,
+        [Parameter(Mandatory)][string]$CandidatePath
+    )
+    $full = ConvertTo-ClaudeUserDataPath $UserDataPath
+    $candidate = ConvertTo-ClaudeUserDataPath $CandidatePath
+    if (-not $full -or -not $candidate) { return $false }
+    $vmBundles = Join-Path $full 'vm_bundles'
+    $bundle = Join-Path $vmBundles 'claudevm.bundle'
+    foreach ($criticalPath in @(
+        $full,
+        $vmBundles,
+        $bundle,
+        (Join-Path $bundle 'rootfs.vhdx'),
+        (Join-Path $bundle 'sessiondata.vhdx'),
+        (Join-Path $bundle 'smol-bin.vhdx'),
+        (Join-Path $bundle 'initrd'),
+        (Join-Path $bundle 'vmlinuz')
+    )) {
+        if ($candidate.Equals([IO.Path]::GetFullPath($criticalPath), [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-ClaudeVmCriticalEfsItems {
+    param([Parameter(Mandatory)][string]$Path)
+    $full = ConvertTo-ClaudeUserDataPath $Path
+    if (-not $full -or -not (Test-Path -LiteralPath $full)) { return @() }
+    $bundle = Join-Path $full 'vm_bundles\claudevm.bundle'
+    $criticalPaths = @(
+        $full,
+        (Join-Path $full 'vm_bundles'),
+        $bundle,
+        (Join-Path $bundle 'rootfs.vhdx'),
+        (Join-Path $bundle 'sessiondata.vhdx'),
+        (Join-Path $bundle 'smol-bin.vhdx'),
+        (Join-Path $bundle 'initrd'),
+        (Join-Path $bundle 'vmlinuz')
+    )
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($criticalPath in @($criticalPaths | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $criticalPath)) { continue }
+        $item = Get-Item -LiteralPath $criticalPath -Force
+        if ($item.Attributes -band [IO.FileAttributes]::Encrypted) { $items.Add($item) }
+    }
+    return $items.ToArray()
+}
+
+function Get-ClaudeNonVmEncryptedItems {
+    param([Parameter(Mandatory)][string]$Path)
+    $critical = @{}
+    foreach ($item in @(Get-ClaudeVmCriticalEfsItems $Path)) { $critical[$item.FullName] = $true }
+    return @(Get-ClaudeEncryptedItems $Path | Where-Object { -not $critical.ContainsKey($_.FullName) })
+}
+
 function Test-ClaudeEncryptedFilesReadable {
     param([object[]]$Items)
     foreach ($item in @($Items | Where-Object { -not $_.PSIsContainer })) {
@@ -757,15 +814,93 @@ function Get-ClaudeUserDataProtectionKind {
         [bool]$SafeIndependentPath,
         [bool]$IsConfigured,
         [bool]$CurrentUserReadable,
-        [bool]$VirtualDisk1772,
-        [bool]$ToolManaged
+        [bool]$VirtualDisk1772
     )
     if ($EncryptedCount -le 0) { return 'None' }
     if ($IsAppxPrivate -or ($AppxError -and -not $SafeIndependentPath)) { return 'AppxProtected' }
-    if ($SafeIndependentPath -and $IsConfigured -and $CurrentUserReadable -and ($VirtualDisk1772 -or $ToolManaged)) {
+    if ($SafeIndependentPath -and $IsConfigured -and $CurrentUserReadable -and $VirtualDisk1772) {
         return 'ConfirmedUserEfs'
     }
     return 'EncryptedUnknown'
+}
+
+function Get-ClaudeVmLifecycleEvidence {
+    param([Parameter(Mandatory)][string[]]$LogPaths)
+    $events = New-Object System.Collections.Generic.List[object]
+    $kindPatterns = [ordered]@{
+        VirtualDisk1772 = '(?i)CreateVirtualDisk failed:\s*0x0*1772\b'
+        VmStarted = '(?i)(VM started successfully|HCS VM:\s*Running|compute system.+Running)'
+        DaemonReady = '(?i)(sdk-daemon (?:is )?ready|daemon ready)'
+        NetworkConnected = '(?i)Network(?: status)?\s*[:=]\s*CONNECTED\b'
+        ApiReachable = '(?i)API(?: reachability)?\s*[:=]\s*REACHABLE\b'
+    }
+    foreach ($path in @($LogPaths | Where-Object { $_ } | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $lines = @(Get-Content -LiteralPath $path -Tail 1200 -ErrorAction SilentlyContinue)
+        for ($index = 0; $index -lt $lines.Count; $index++) {
+            $line = [string]$lines[$index]
+            $eventTime = $null
+            $timeMatch = [regex]::Match($line, '(?<timestamp>\d{4}[-/]\d{2}[-/]\d{2}[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?)')
+            if ($timeMatch.Success) {
+                $parsed = [DateTimeOffset]::MinValue
+                if ([DateTimeOffset]::TryParse($timeMatch.Groups['timestamp'].Value, [ref]$parsed)) { $eventTime = $parsed }
+            }
+            foreach ($entry in $kindPatterns.GetEnumerator()) {
+                if ($line -match $entry.Value) {
+                    $events.Add([pscustomobject]@{ Kind = $entry.Key; Path = $path; Index = $index; Time = $eventTime; Line = $line })
+                }
+            }
+        }
+    }
+
+    $successKinds = @('VmStarted', 'DaemonReady', 'NetworkConnected', 'ApiReachable')
+    $failures = @($events | Where-Object Kind -eq 'VirtualDisk1772')
+    $resolvedFailures = New-Object System.Collections.Generic.List[object]
+    $unresolvedFailures = New-Object System.Collections.Generic.List[object]
+    foreach ($failure in $failures) {
+        $complete = $true
+        foreach ($kind in $successKinds) {
+            $later = @($events | Where-Object {
+                $_.Kind -eq $kind -and (
+                    ($_.Path -eq $failure.Path -and $_.Index -gt $failure.Index) -or
+                    ($null -ne $_.Time -and $null -ne $failure.Time -and $_.Time -gt $failure.Time)
+                )
+            })
+            if ($later.Count -eq 0) { $complete = $false; break }
+        }
+        if ($complete) { $resolvedFailures.Add($failure) } else { $unresolvedFailures.Add($failure) }
+    }
+
+    $healthyWithoutFailure = $false
+    if ($failures.Count -eq 0) {
+        foreach ($path in @($events.Path | Select-Object -Unique)) {
+            $pathEvents = @($events | Where-Object Path -eq $path)
+            if (@($successKinds | Where-Object { $_ -notin $pathEvents.Kind }).Count -eq 0) {
+                $healthyWithoutFailure = $true
+                break
+            }
+        }
+        if (-not $healthyWithoutFailure) {
+            $healthyWithoutFailure = @($successKinds | Where-Object { $_ -notin $events.Kind }).Count -eq 0 -and
+                @($events | Where-Object { $_.Kind -in $successKinds -and $null -eq $_.Time }).Count -eq 0
+        }
+    }
+
+    $latestTimes = @{}
+    foreach ($kind in $successKinds) {
+        $latest = @($events | Where-Object { $_.Kind -eq $kind -and $null -ne $_.Time } | Sort-Object Time -Descending | Select-Object -First 1)
+        $latestTimes[$kind] = if ($latest.Count -gt 0) { $latest[0].Time.ToString('o') } else { $null }
+    }
+    return [pscustomobject]@{
+        CurrentVirtualDisk1772 = $unresolvedFailures.Count -gt 0
+        HistoricalVirtualDisk1772 = $failures.Count -gt 0
+        FailureResolvedByLaterSuccess = $resolvedFailures.Count -gt 0
+        CurrentRunHealthy = [bool]($healthyWithoutFailure -or ($failures.Count -gt 0 -and $unresolvedFailures.Count -eq 0))
+        LatestVmStartedAt = $latestTimes.VmStarted
+        LatestDaemonReadyAt = $latestTimes.DaemonReady
+        LatestNetworkConnectedAt = $latestTimes.NetworkConnected
+        LatestApiReachableAt = $latestTimes.ApiReachable
+    }
 }
 
 function Get-ClaudeUserDataProtectionEvidence {
@@ -775,21 +910,22 @@ function Get-ClaudeUserDataProtectionEvidence {
         [string[]]$NodeLogPaths
     )
     $full = ConvertTo-ClaudeUserDataPath $UserDataPath
-    $items = @(Get-ClaudeEncryptedItems $full)
+    $items = @(Get-ClaudeVmCriticalEfsItems $full)
+    $nonVmItems = @(Get-ClaudeNonVmEncryptedItems $full)
     if (-not $NodeLogPaths) {
-        $NodeLogPaths = @(
-            (Join-Path $full 'logs\cowork_vm_node.log'),
-            (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
-            (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log')
-        )
+        # Storage classification follows the active user-data root only. Old AppX/Roaming
+        # logs are diagnostics, not proof that the current independent VM still fails.
+        $NodeLogPaths = @((Join-Path $full 'logs\cowork_vm_node.log'))
     }
-    $text = @($NodeLogPaths + @($ServiceLogPath) | Select-Object -Unique | ForEach-Object {
+    $logPaths = @($NodeLogPaths + @($ServiceLogPath) | Select-Object -Unique)
+    $text = @($logPaths | ForEach-Object {
         if ($_ -and (Test-Path -LiteralPath $_ -PathType Leaf)) {
             (Get-Content -LiteralPath $_ -Tail 1200 -ErrorAction SilentlyContinue) -join "`n"
         }
     }) -join "`n"
     $appxError = [bool]($text -match '(?i)(ERROR_APPX_FILE_NOT_ENCRYPTED|Win32\s+409|\b0x0*199\b)')
-    $virtualDisk1772 = [bool]($text -match '(?i)CreateVirtualDisk failed:\s*0x0*1772\b')
+    $lifecycle = Get-ClaudeVmLifecycleEvidence -LogPaths $logPaths
+    $virtualDisk1772 = [bool]$lifecycle.CurrentVirtualDisk1772
     $isAppxPrivate = Test-IsAppxPrivatePath $full
     $safeIndependent = Test-SafeIndependentClaudeUserDataPath $full
     $configured = Get-ConfiguredClaudeUserData
@@ -800,12 +936,15 @@ function Get-ClaudeUserDataProtectionEvidence {
     $readable = Test-ClaudeEncryptedFilesReadable $items
     $kind = Get-ClaudeUserDataProtectionKind -EncryptedCount $items.Count -IsAppxPrivate $isAppxPrivate `
         -AppxError $appxError -SafeIndependentPath $safeIndependent -IsConfigured $isConfigured `
-        -CurrentUserReadable $readable -VirtualDisk1772 $virtualDisk1772 -ToolManaged $toolManaged
+        -CurrentUserReadable $readable -VirtualDisk1772 $virtualDisk1772
     return [pscustomobject]@{
         Path = $full
         Kind = $kind
         EncryptedCount = $items.Count
         Items = $items
+        TotalEncryptedCount = $items.Count + $nonVmItems.Count
+        NonVmEncryptedCount = $nonVmItems.Count
+        NonVmItems = $nonVmItems
         IsAppxPrivate = $isAppxPrivate
         SafeIndependentPath = $safeIndependent
         IsConfigured = $isConfigured
@@ -813,6 +952,13 @@ function Get-ClaudeUserDataProtectionEvidence {
         CurrentUserReadable = $readable
         AppxError = $appxError
         VirtualDisk1772 = $virtualDisk1772
+        HistoricalVirtualDisk1772 = $lifecycle.HistoricalVirtualDisk1772
+        FailureResolvedByLaterSuccess = $lifecycle.FailureResolvedByLaterSuccess
+        CurrentRunHealthy = $lifecycle.CurrentRunHealthy
+        LatestVmStartedAt = $lifecycle.LatestVmStartedAt
+        LatestDaemonReadyAt = $lifecycle.LatestDaemonReadyAt
+        LatestNetworkConnectedAt = $lifecycle.LatestNetworkConnectedAt
+        LatestApiReachableAt = $lifecycle.LatestApiReachableAt
     }
 }
 
@@ -915,20 +1061,23 @@ function Initialize-ClaudeIndependentUserData {
 function Repair-ConfirmedIndependentUserDataEfs {
     param([Parameter(Mandatory)][string]$UserDataPath)
     $evidence = Get-ClaudeUserDataProtectionEvidence -UserDataPath $UserDataPath
+    if ($evidence.NonVmEncryptedCount -gt 0) {
+        Write-Log "检测到 $($evidence.NonVmEncryptedCount) 个与 VM 无关的 EFS 项；保留用户加密，不参与自动修复。" INFO
+    }
     if ($evidence.EncryptedCount -eq 0) { return $true }
     if ($evidence.Kind -ne 'ConfirmedUserEfs') {
         Write-Log "数据目录带 Encrypted(0x4000)，但证据不足以确认普通用户 EFS，拒绝解密：$($evidence.Path)；分类=$($evidence.Kind)" WARN
         return $false
     }
-    Write-Log "确认独立数据目录属于当前用户可读的普通 EFS（共 $($evidence.EncryptedCount) 项），准备安全解密。" WARN
+    Write-Log "确认独立数据目录的 VM 关键路径属于当前用户可读的普通 EFS（共 $($evidence.EncryptedCount) 项），准备精确解密。" WARN
     Stop-ClaudeProcesses
     Stop-CoworkVmServiceAndWait
     $directories = @($evidence.Items | Where-Object PSIsContainer | Sort-Object { $_.FullName.Length })
     $files = @($evidence.Items | Where-Object { -not $_.PSIsContainer })
     foreach ($item in @($directories + $files)) { Invoke-EfsDecrypt -Path $item.FullName }
-    $remaining = @(Get-ClaudeEncryptedItems $evidence.Path)
-    if ($remaining.Count -gt 0) { throw "普通 EFS 解密后仍有 $($remaining.Count) 个加密项：$($evidence.Path)" }
-    Write-Log '独立 Claude 数据目录的普通 EFS 已解除并复核。' OK
+    $remaining = @(Get-ClaudeVmCriticalEfsItems $evidence.Path)
+    if ($remaining.Count -gt 0) { throw "VM 关键路径解密后仍有 $($remaining.Count) 个加密项：$($evidence.Path)" }
+    Write-Log '独立 Claude 数据目录的 VM 关键 EFS 已解除并复核；非 VM 用户文件保持原样。' OK
     return $true
 }
 
@@ -957,24 +1106,116 @@ function Save-VmRebuildState {
     $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:VmRebuildStatePath -Encoding UTF8
 }
 
-function Assert-VmRebuildState {
+function Get-VmRebuildStateSafePaths {
     param([Parameter(Mandatory)]$State)
-    if ([int]$State.SchemaVersion -ne 1) { throw '不支持的 VM 重建状态版本。' }
-    $paths = Get-ClaudePaths
-    if (-not $paths) { throw '无法验证 VM 重建状态：Claude 官方 AppX 不存在。' }
-    $vmBundles = [IO.Path]::GetFullPath((Join-Path $paths.LocalUserData 'vm_bundles'))
-    $expectedBundle = [IO.Path]::GetFullPath((Join-Path $vmBundles 'claudevm.bundle'))
+    if (-not $State.PSObject.Properties['SchemaVersion'] -or [int]$State.SchemaVersion -ne 1) {
+        throw '不支持的 VM 重建状态版本。'
+    }
+    foreach ($property in @('OriginalPath', 'BackupPath')) {
+        if (-not $State.PSObject.Properties[$property] -or -not [string]$State.$property) {
+            throw "VM 重建状态缺少 $property。"
+        }
+    }
     $stateBundle = [IO.Path]::GetFullPath([string]$State.OriginalPath)
     $stateBackup = [IO.Path]::GetFullPath([string]$State.BackupPath)
-    if (-not $stateBundle.Equals($expectedBundle, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "VM 重建状态的活动路径不属于当前 Claude：$stateBundle"
+    $vmBundles = [IO.Path]::GetDirectoryName($stateBundle)
+    if ((Split-Path -Leaf $stateBundle) -ne 'claudevm.bundle' -or (Split-Path -Leaf $vmBundles) -ne 'vm_bundles') {
+        throw "VM 重建状态的活动路径不是 Claude bundle：$stateBundle"
     }
     if (-not ([IO.Path]::GetDirectoryName($stateBackup)).Equals($vmBundles, [StringComparison]::OrdinalIgnoreCase) -or
         (Split-Path -Leaf $stateBackup) -notlike 'claudevm.bundle.backup-*') {
         throw "VM 重建状态的备份路径不安全：$stateBackup"
     }
-    if (-not (Test-Path -LiteralPath $stateBackup)) { throw "VM 重建备份丢失：$stateBackup" }
+    if (-not (Test-Path -LiteralPath $stateBackup -PathType Container)) { throw "VM 重建备份丢失或不是目录：$stateBackup" }
     if (Test-ReparsePoint $stateBackup) { throw "VM 重建备份变成了重解析点：$stateBackup" }
+    return [pscustomobject]@{ Bundle = $stateBundle; Backup = $stateBackup; VmBundles = $vmBundles }
+}
+
+function Assert-VmRebuildState {
+    param([Parameter(Mandatory)]$State)
+    $statePaths = Get-VmRebuildStateSafePaths $State
+    $paths = Get-ClaudePaths
+    if (-not $paths) { throw '无法验证 VM 重建状态：Claude 官方 AppX 不存在。' }
+    $vmBundles = [IO.Path]::GetFullPath((Join-Path $paths.LocalUserData 'vm_bundles'))
+    $expectedBundle = [IO.Path]::GetFullPath((Join-Path $vmBundles 'claudevm.bundle'))
+    if (-not $statePaths.Bundle.Equals($expectedBundle, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "VM 重建状态的活动路径不属于当前 Claude：$($statePaths.Bundle)"
+    }
+}
+
+function Test-SupersedableLegacyVmRebuildState {
+    param(
+        [Parameter(Mandatory)]$State,
+        $Paths,
+        $LifecycleEvidence
+    )
+    try { $statePaths = Get-VmRebuildStateSafePaths $State } catch { return $false }
+    $paths = if ($Paths) { $Paths } else { Get-ClaudePaths }
+    if (-not $paths -or -not $paths.PSObject.Properties['PackageLocalUserData'] -or
+        -not (Test-IsAppxPrivatePath $statePaths.Bundle)) { return $false }
+    $expectedLegacyBundle = [IO.Path]::GetFullPath((Join-Path $paths.PackageLocalUserData 'vm_bundles\claudevm.bundle'))
+    if (-not $statePaths.Bundle.Equals($expectedLegacyBundle, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not (Test-SafeIndependentClaudeUserDataPath $paths.ActiveUserData) -or
+        (Test-IsAppxPrivatePath $paths.ActiveUserData) -or
+        $paths.ActiveUserDataSource -eq 'PackageLocalCache:default') { return $false }
+    $currentBundle = [IO.Path]::GetFullPath((Join-Path $paths.ActiveUserData 'vm_bundles\claudevm.bundle'))
+    if ($statePaths.Bundle.Equals($currentBundle, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $status = Get-VmBundleStatus -BundlePath $currentBundle
+    if (-not $status.Ready -or @(Get-ClaudeVmCriticalEfsItems $paths.ActiveUserData).Count -gt 0) { return $false }
+    $lifecycle = if ($LifecycleEvidence) { $LifecycleEvidence } else {
+        $protection = Get-ClaudeUserDataProtectionEvidence -UserDataPath $paths.ActiveUserData
+        [pscustomobject]@{ CurrentRunHealthy = $protection.CurrentRunHealthy; CurrentVirtualDisk1772 = $protection.VirtualDisk1772 }
+    }
+    return [bool]($lifecycle.CurrentRunHealthy -and -not $lifecycle.CurrentVirtualDisk1772)
+}
+
+function Archive-SupersededVmRebuildState {
+    param(
+        [Parameter(Mandatory)]$State,
+        [switch]$SkipResumeCleanup
+    )
+    New-Item -ItemType Directory -Path $script:VmRebuildStateHistoryRoot -Force | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $nonce = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $originalArchive = Join-Path $script:VmRebuildStateHistoryRoot "vm-rebuild-$stamp-$nonce.original.json"
+    $supersededRecord = Join-Path $script:VmRebuildStateHistoryRoot "vm-rebuild-$stamp-$nonce.superseded.json"
+    Move-Item -LiteralPath $script:VmRebuildStatePath -Destination $originalArchive
+    try {
+        [pscustomobject]@{
+            SchemaVersion = 2
+            Status = 'Superseded'
+            SupersededReason = 'Active user data moved to a verified independent directory'
+            PreviousOriginalPath = [string]$State.OriginalPath
+            PreviousBackupPath = [string]$State.BackupPath
+            OriginalStateArchive = $originalArchive
+            SupersededAt = (Get-Date).ToUniversalTime().ToString('o')
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $supersededRecord -Encoding UTF8
+    } catch {
+        if ((Test-Path -LiteralPath $originalArchive) -and -not (Test-Path -LiteralPath $script:VmRebuildStatePath)) {
+            Move-Item -LiteralPath $originalArchive -Destination $script:VmRebuildStatePath
+        }
+        throw
+    }
+    if (-not $SkipResumeCleanup) { Remove-ResumeAfterRestart }
+    Write-Log "旧 VM 重建状态已被健康独立数据目录取代并归档：$supersededRecord" OK
+    Write-Log "旧 VM bundle 备份保持原样：$($State.BackupPath)" INFO
+    return $supersededRecord
+}
+
+function Resolve-VmRebuildState {
+    $state = Get-VmRebuildState
+    if (-not $state) { return $null }
+    try {
+        Assert-VmRebuildState $state
+        return $state
+    } catch {
+        $validationError = $_.Exception.Message
+        if (Test-SupersedableLegacyVmRebuildState $state) {
+            [void](Archive-SupersededVmRebuildState $state)
+            return $null
+        }
+        throw $validationError
+    }
 }
 
 function Get-VmBundleStatus {
@@ -1864,13 +2105,20 @@ function Invoke-Diagnostics {
         }
         $userDataProtection = Get-ClaudeUserDataProtectionEvidence -UserDataPath $paths.ActiveUserData
         if ($userDataProtection.Kind -eq 'ConfirmedUserEfs') {
-            Add-Finding 'user-data-efs' 'Fail' "独立数据目录有 $($userDataProtection.EncryptedCount) 个普通用户 EFS 项" 'Auto/Repair 会在停止 Claude 与 Cowork 服务后调用 Unicode DecryptFileW，并在结束后复核。'
+            Add-Finding 'user-data-efs' 'Fail' "独立数据目录有 $($userDataProtection.EncryptedCount) 个 VM 关键普通用户 EFS 项" 'Auto/Repair 只会精确处理数据根、vm_bundles、claudevm.bundle 和五个运行文件；其他用户文件保持不动。'
         } elseif ($userDataProtection.Kind -eq 'EncryptedUnknown') {
-            Add-Finding 'user-data-efs' 'Warning' "数据目录有 $($userDataProtection.EncryptedCount) 个加密项，但无法安全确认为普通 EFS" '保持原样；不会仅凭 Encrypted(0x4000) 解密。'
+            Add-Finding 'user-data-efs' 'Warning' "VM 关键路径有 $($userDataProtection.EncryptedCount) 个加密项，但无法安全确认为当前普通 EFS 故障" '保持原样；不会仅凭 Encrypted(0x4000) 或已经恢复的历史 0x1772 解密。'
         } elseif ($userDataProtection.Kind -eq 'AppxProtected') {
             Add-Finding 'user-data-efs' 'Info' '活动/候选数据命中 AppX 应用受保护加密证据' '不会调用 EFS 解密。'
         } elseif (Test-Path -LiteralPath $paths.ActiveUserData) {
-            Add-Finding 'user-data-efs' 'Pass' '活动 Claude 数据目录没有加密项'
+            Add-Finding 'user-data-efs' 'Pass' '活动 Claude 数据目录的 VM 关键路径没有 EFS 加密项'
+        }
+        if ($userDataProtection.NonVmEncryptedCount -gt 0) {
+            Add-Finding 'user-data-non-vm-efs' 'Info' "检测到 $($userDataProtection.NonVmEncryptedCount) 个非 VM 用户 EFS 项" '会话、输出、上传、配置和缓存等用户文件不阻断 Cowork，也不会被自动解密。'
+        }
+        if ($userDataProtection.HistoricalVirtualDisk1772 -and $userDataProtection.FailureResolvedByLaterSuccess -and
+            -not $userDataProtection.VirtualDisk1772) {
+            Add-Finding 'virtual-disk-1772-history' 'Info' '历史 0x1772 已被后续完整 Cowork 成功序列覆盖' '该历史错误不参与自动 EFS 修复，也不会导致诊断失败。'
         }
         if (Test-ReparsePoint (Split-Path -Parent $bundle)) { Add-Finding 'vm-reparse' 'Fail' 'vm_bundles 是重解析点/联接' 'HCS 挂载 VHDX 时可能无法解析联接。' }
         elseif (Test-Path -LiteralPath $bundle) { Add-Finding 'vm-reparse' 'Pass' 'vm_bundles 不是重解析点' }
@@ -2129,7 +2377,7 @@ function Install-OfficialClaude {
         $packageData = Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude"
         $independentData = Initialize-ClaudeIndependentUserData -SourcePaths @($packageData, (Join-Path $env:APPDATA 'Claude'))
         if (-not (Repair-ConfirmedIndependentUserDataEfs -UserDataPath $independentData) -and
-            @(Get-ClaudeEncryptedItems $independentData).Count -gt 0) {
+            @(Get-ClaudeVmCriticalEfsItems $independentData).Count -gt 0) {
             throw '独立数据目录仍含无法安全分类的加密项，禁止移除损坏 AppX 注册。'
         }
         Stop-CoworkVmServiceAndWait
@@ -2313,7 +2561,7 @@ function Repair-ExistingPackageVolume {
     Write-Log "Move-AppxPackage 失败，将执行带配置迁移保护的官方卸载重装回退：$moveError" WARN
     $independentData = Initialize-ClaudeIndependentUserData -SourcePaths @($paths.PackageLocalUserData, $paths.RoamingUserData)
     if (-not (Repair-ConfirmedIndependentUserDataEfs -UserDataPath $independentData)) {
-        $remaining = @(Get-ClaudeEncryptedItems $independentData)
+        $remaining = @(Get-ClaudeVmCriticalEfsItems $independentData)
         if ($remaining.Count -gt 0) { throw '独立数据目录仍含无法安全分类的加密项，禁止卸载现有 AppX 包。' }
     }
     if (-not (Test-Path -LiteralPath $Download.Path -PathType Leaf) -or -not (Test-AnthropicSignature $Download.Path).Valid) {
@@ -2345,7 +2593,7 @@ function Repair-ClaudeUserDataLayout {
             throw "配置的 Claude 数据目录不满足自动修复安全边界：$($paths.ActiveUserData)"
         }
         if (-not (Repair-ConfirmedIndependentUserDataEfs -UserDataPath $paths.ActiveUserData)) {
-            $remaining = @(Get-ClaudeEncryptedItems $paths.ActiveUserData)
+            $remaining = @(Get-ClaudeVmCriticalEfsItems $paths.ActiveUserData)
             if ($remaining.Count -gt 0) { throw '独立 Claude 数据目录仍有无法确认类型的加密项；保持原样并停止。' }
         }
     }
@@ -2644,8 +2892,7 @@ function Invoke-AutoSetup {
         return 3010
     }
 
-    $rebuildState = Get-VmRebuildState
-    if ($rebuildState) { Assert-VmRebuildState $rebuildState }
+    $rebuildState = Resolve-VmRebuildState
     if ($rebuildState -and $rebuildState.Status -eq 'Completed') {
         $completedStatus = Get-VmBundleStatus -BundlePath $rebuildState.OriginalPath
         if (-not $completedStatus.Ready) { throw 'VM 重建状态标记为 Completed，但活动 bundle 未通过复核。' }

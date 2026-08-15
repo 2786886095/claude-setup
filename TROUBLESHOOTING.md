@@ -89,6 +89,10 @@
 2. 路径位于当前用户的 `LocalAppData`，且不在 `Packages`/`WindowsApps` 中；
 3. 路径及父级不是重解析点；
 4. 当前用户能读取加密文件；
-5. 日志明确出现 0x1772，或目录由本工具创建并记录。
+5. 日志明确出现当前 0x1772，且它尚未被后续完整的 VM、Daemon、Network、API 成功序列覆盖。
 
 不满足任意一项时只报告，不调用 `DecryptFileW`。
+
+自动解密范围只包括活动数据根目录、`vm_bundles`、`claudevm.bundle` 和五个 VM 运行文件。会话 `.jsonl`、`local-agent-mode-sessions`、`claude-code-sessions`、outputs、uploads、配置及缓存即使使用 EFS，也只显示为 Info，不会阻断 Cowork 或被自动解密。
+
+若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.1.1 会在严格核对旧路径、旧备份、当前 VM 文件和完整成功日志后，把原状态和 Superseded 记录归档到 `%ProgramData%\ClaudeSetup\state-history`。任何旧 `claudevm.bundle.backup-*` 都保持不动；证据不完整时继续失效保护。
