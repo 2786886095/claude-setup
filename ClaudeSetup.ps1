@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.2.2'
+$script:ToolVersion = '1.2.3'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -3012,6 +3012,25 @@ function Get-DownloadFailureCode {
     return 'DOWNLOAD_UNKNOWN'
 }
 
+function Get-DownloadStagingPaths {
+    param([Parameter(Mandatory)][string]$Destination)
+    $fullDestination = [IO.Path]::GetFullPath($Destination)
+    $directory = [IO.Path]::GetDirectoryName($fullDestination)
+    $fileName = [IO.Path]::GetFileName($fullDestination)
+    $extension = [IO.Path]::GetExtension($fileName)
+    if ([string]::IsNullOrWhiteSpace($extension)) {
+        return [pscustomobject]@{
+            Partial = Join-Path $directory "$fileName.partial"
+            Previous = Join-Path $directory "$fileName.previous"
+        }
+    }
+    $stem = [IO.Path]::GetFileNameWithoutExtension($fileName)
+    return [pscustomobject]@{
+        Partial = Join-Path $directory "$stem.partial$extension"
+        Previous = Join-Path $directory "$stem.previous$extension"
+    }
+}
+
 function Invoke-HttpFileDownload {
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -3022,8 +3041,9 @@ function Invoke-HttpFileDownload {
         [scriptblock]$DownloadProvider,
         [scriptblock]$SleepProvider
     )
-    $partial = "$Destination.partial"
-    $previous = "$Destination.previous"
+    $stagingPaths = Get-DownloadStagingPaths -Destination $Destination
+    $partial = $stagingPaths.Partial
+    $previous = $stagingPaths.Previous
     $attemptHistory = New-Object System.Collections.Generic.List[object]
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
@@ -3067,17 +3087,30 @@ function Invoke-HttpFileDownload {
                 Validation = $validation
             }
         } catch {
-            $code = Get-DownloadFailureCode -Exception $_.Exception
+            $failureException = $_.Exception
+            $code = Get-DownloadFailureCode -Exception $failureException
+            $candidateLength = $null
+            $candidateSha256 = $null
+            if (Test-Path -LiteralPath $partial -PathType Leaf) {
+                try {
+                    $candidateLength = (Get-Item -LiteralPath $partial -Force).Length
+                    $candidateSha256 = (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash
+                } catch {
+                    # The original failure remains authoritative when diagnostics cannot inspect the candidate.
+                }
+            }
             $attemptHistory.Add([pscustomobject]@{
                 Attempt = $attempt
                 Code = $code
-                Message = $_.Exception.Message
+                Message = $failureException.Message
+                CandidateLength = $candidateLength
+                CandidateSha256 = $candidateSha256
                 At = (Get-Date).ToUniversalTime().ToString('o')
             })
             Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
             if ($attempt -lt $MaxAttempts) {
                 $delay = [math]::Min(30, $InitialDelaySeconds * [math]::Pow(2, $attempt - 1))
-                Write-Log "下载第 $attempt/$MaxAttempts 次失败（$code），$delay 秒后重试：$($_.Exception.Message)" WARN
+                Write-Log "下载第 $attempt/$MaxAttempts 次失败（$code），$delay 秒后重试：$($failureException.Message)" WARN
                 if ($SleepProvider) { & $SleepProvider ([int]$delay) } elseif ($delay -gt 0) { Start-Sleep -Seconds ([int]$delay) }
                 continue
             }
@@ -3089,7 +3122,7 @@ function Invoke-HttpFileDownload {
                 AttemptHistory = $attemptHistory.ToArray()
                 OccurredAt = (Get-Date).ToUniversalTime().ToString('o')
             }
-            throw "[$code] 下载在 $MaxAttempts 次尝试后失败。诊断 JSON 的 DownloadFailure 字段包含机器可读详情。最后错误：$($_.Exception.Message)"
+            throw "[$code] 下载在 $MaxAttempts 次尝试后失败。诊断 JSON 的 DownloadFailure 字段包含机器可读详情。最后错误：$($failureException.Message)"
         }
     }
 }

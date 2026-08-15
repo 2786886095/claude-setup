@@ -129,6 +129,7 @@ $requiredSafetyChecks = @(
     'MinimumLifecycleTime'
     'LifecycleFreshAfterAnchor'
     'Get-RecentCoworkErrorEvidence'
+    'Get-DownloadStagingPaths'
     'Invoke-HttpFileDownload'
     'DOWNLOAD_LENGTH_MISMATCH'
     'ConvertTo-ShareSafeDiagnosticValue'
@@ -157,8 +158,11 @@ if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'v1.2.2', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'v1.2.2', 'v1.2.3', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
+}
+if ($main -match '\$partial\s*=\s*"\$Destination\.partial"') {
+    throw 'Download staging must preserve the final package extension for Windows Authenticode detection.'
 }
 $storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
 $storageEnd = $main.IndexOf('function Repair-IncompleteWorkspace', $storageStart)
@@ -656,19 +660,58 @@ try {
             throw 'Cowork diagnostics must separate unresolved current errors, superseded history, success events, and nonfatal recovery-action warnings.'
         }
 
-        $downloadDestination = Join-Path $statusRoot 'download.bin'
+        $downloadDestination = Join-Path $statusRoot 'download.msix'
+        $downloadStaging = Get-DownloadStagingPaths -Destination $downloadDestination
+        if ([IO.Path]::GetFileName($downloadStaging.Partial) -ne 'download.partial.msix' -or
+            [IO.Path]::GetFileName($downloadStaging.Previous) -ne 'download.previous.msix' -or
+            [IO.Path]::GetDirectoryName($downloadStaging.Partial) -ne [IO.Path]::GetDirectoryName($downloadDestination)) {
+            throw 'Download staging paths must stay beside the destination and preserve its final extension.'
+        }
         $downloadCounter = [pscustomobject]@{ Value = 0 }
+        $validatedCandidate = [pscustomobject]@{ Path = $null }
         $downloadResult = Invoke-HttpFileDownload -Uri 'https://example.invalid/fixture' -Destination $downloadDestination `
             -MaxAttempts 3 -InitialDelaySeconds 0 -SleepProvider { param($ignoredDelay) } -DownloadProvider {
                 param($ignoredUri, $partialPath, $attempt)
+                if ([IO.Path]::GetExtension($partialPath) -ne '.msix') {
+                    throw 'Download provider received a staging path without the final MSIX extension.'
+                }
                 $downloadCounter.Value++
                 if ($attempt -lt 3) { throw [TimeoutException]::new('fixture timeout') }
                 [IO.File]::WriteAllBytes($partialPath, [byte[]](1, 2, 3, 4))
                 return [pscustomobject]@{ ContentLength = 4 }
+            } -ValidateDownloadedFile {
+                param($candidatePath)
+                $validatedCandidate.Path = $candidatePath
+                if ([IO.Path]::GetExtension($candidatePath) -ne '.msix') {
+                    throw 'Download validator received a staging path without the final MSIX extension.'
+                }
+                return [pscustomobject]@{ Fixture = $true }
             }
         if ($downloadResult.Attempts -ne 3 -or $downloadCounter.Value -ne 3 -or
-            (Get-Item -LiteralPath $downloadDestination).Length -ne 4 -or (Test-Path -LiteralPath "$downloadDestination.partial")) {
+            (Get-Item -LiteralPath $downloadDestination).Length -ne 4 -or
+            $validatedCandidate.Path -ne $downloadStaging.Partial -or
+            (Test-Path -LiteralPath $downloadStaging.Partial)) {
             throw 'Official file download must retry with a same-directory partial file and publish only the complete result.'
+        }
+
+        $signedFixtureSource = $null
+        foreach ($catalogCandidate in @(Get-ChildItem -LiteralPath (Join-Path $env:SystemRoot 'System32\catroot') -Filter '*.cat' -File -Recurse -ErrorAction SilentlyContinue | Sort-Object Length | Select-Object -First 20)) {
+            if ((Get-TrustedAuthenticodeSignature -Path $catalogCandidate.FullName).Status -eq 'Valid') {
+                $signedFixtureSource = $catalogCandidate.FullName
+                break
+            }
+        }
+        if (-not $signedFixtureSource) { throw 'Unable to locate a signed Windows catalog for the Authenticode extension regression fixture.' }
+        $signedFixtureBad = Join-Path $statusRoot 'fixture.cat.partial'
+        $signedFixtureGood = Join-Path $statusRoot 'fixture.partial.cat'
+        Copy-Item -LiteralPath $signedFixtureSource -Destination $signedFixtureBad -Force
+        $signedFixtureHash = (Get-FileHash -LiteralPath $signedFixtureBad -Algorithm SHA256).Hash
+        $badExtensionSignature = Get-TrustedAuthenticodeSignature -Path $signedFixtureBad
+        Move-Item -LiteralPath $signedFixtureBad -Destination $signedFixtureGood -Force
+        $goodExtensionSignature = Get-TrustedAuthenticodeSignature -Path $signedFixtureGood
+        if ($badExtensionSignature.Status -eq 'Valid' -or $goodExtensionSignature.Status -ne 'Valid' -or
+            (Get-FileHash -LiteralPath $signedFixtureGood -Algorithm SHA256).Hash -ne $signedFixtureHash) {
+            throw 'Real Windows Authenticode regression fixture must prove that the final extension controls signature format detection without changing bytes.'
         }
         $lengthMismatch = $false
         try {
@@ -685,7 +728,8 @@ try {
             $script:LastDownloadFailure.Code -ne 'DOWNLOAD_LENGTH_MISMATCH') {
             throw 'Download length mismatch must fail closed with a machine-readable reason.'
         }
-        $trustedDestination = Join-Path $statusRoot 'trusted-existing.bin'
+        $trustedDestination = Join-Path $statusRoot 'trusted-existing.msix'
+        $trustedStaging = Get-DownloadStagingPaths -Destination $trustedDestination
         [IO.File]::WriteAllBytes($trustedDestination, [byte[]](9, 9, 9))
         $trustedHash = (Get-FileHash -LiteralPath $trustedDestination -Algorithm SHA256).Hash
         $signatureRejected = $false
@@ -703,7 +747,9 @@ try {
             $signatureRejected = $_.Exception.Message -match 'DOWNLOAD_SIGNATURE_INVALID'
         }
         if (-not $signatureRejected -or (Get-FileHash -LiteralPath $trustedDestination -Algorithm SHA256).Hash -ne $trustedHash -or
-            (Test-Path -LiteralPath "$trustedDestination.partial") -or (Test-Path -LiteralPath "$trustedDestination.previous")) {
+            (Test-Path -LiteralPath $trustedStaging.Partial) -or (Test-Path -LiteralPath $trustedStaging.Previous) -or
+            -not $script:LastDownloadFailure.AttemptHistory[0].CandidateSha256 -or
+            $script:LastDownloadFailure.AttemptHistory[0].CandidateLength -ne 3) {
             throw 'Signature/identity validation must occur before publication and preserve an existing trusted download on rejection.'
         }
 

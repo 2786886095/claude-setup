@@ -18,6 +18,8 @@
 
 `v1.2.2` 不再允许 Auto 用安装前的历史成功序列归档 Abandoned 状态。Auto 在处理两条旧路径均消失的孤立状态时记录 UTC 健康锚点，启动官方 Claude 后最多等待 180 秒；`VM started`、`sdk-daemon ready`、`Network CONNECTED`、`API REACHABLE` 四项都必须不早于该锚点。归档回执明确记录 `EvidenceFreshness=CurrentExecution` 与锚点；独立的 `ResolveLegacyState` 不启动 Claude，其回执只能标记为 `HistoricalSnapshot`，不会声称属于本次运行。该版本还增加有限下载重试、同目录临时文件、Content-Length 与最终签名/身份校验、机器可读下载失败分类、日志当前/历史分段和显式分享报告脱敏。标签发布由 GitHub Actions 构建并生成 provenance attestation。
 
+`v1.2.2` 存在独立的全新安装/重装阻断回归：下载目标为 `.msix` 时，临时文件被命名为 `*.msix.partial`。Windows Authenticode 根据最后扩展名选择格式，因而会把字节完整、官方签名有效的 MSIX 返回为 `UnknownError`。请勿使用 v1.2.2 做全新安装或重装。`v1.2.3` 将同目录暂存/回滚文件改为 `*.partial.msix` / `*.previous.msix`，签名和 manifest 验证仍发生在覆盖可信缓存之前；失败历史增加候选长度与 SHA-256，便于区分重复内容和网络变化。该修复由同一官方 MSIX 的等字节扩展名对照和真实 Windows Authenticode 夹具验证，但未以卸载当前健康 Claude 的方式冒充新的破坏性 E2E。
+
 ## 已运行旧版本怎么办
 
 1. 停止反复运行旧版安装器；不要删除任何 `claudevm.bundle.backup-*`、`foreignjunk` 或 `%ProgramData%\ClaudeSetup` 状态文件。

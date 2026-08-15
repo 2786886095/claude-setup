@@ -4,6 +4,8 @@
 
 > **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.2.2 进一步把孤立状态归档绑定到本次 Auto 启动后的 VM/Daemon/Network/API 完整成功序列。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
 
+> **下载回归公告（2026-08-16）：请勿使用 v1.2.2 做全新安装或重装。** 该版把官方 MSIX 临时文件命名为 `*.msix.partial`，Windows 无法按 MSIX 格式验证其签名，导致官方下载后错误退出。v1.2.3 改为 `*.partial.msix`，在验证前保持最终扩展名，并增加真实 Windows Authenticode 回归测试。
+
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
 > `setup.cmd` 只是旧版兼容入口，会自动转交给 `install.bat`；不要把两个文件各运行一次。
@@ -189,7 +191,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 ## 验证边界
 
-仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan、孤立状态 bootstrap、新鲜度锚点、日志分段、下载重试/长度失败、分享报告脱敏和归档前证据失效。v1.2.1 曾在一台 Windows 11 build 26200 机器完成真实卸载、官方重装、Cowork VM、网络与 API E2E；v1.2.2 的改动使用隔离夹具和只读实机检查验证，不冒充新的破坏性 E2E。标签发布由 GitHub Actions 从跟踪文件构建 ZIP、生成 SHA-256 并发布 build provenance attestation，可用 `gh attestation verify claude-setup-windows.zip --repo 2786886095/claude-setup` 验证；这仍不代表所有 Windows、代理、安全软件或 ARM64 环境都已覆盖。
+仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan、孤立状态 bootstrap、新鲜度锚点、日志分段、下载重试/长度失败、真实 Windows Authenticode 扩展名行为、分享报告脱敏和归档前证据失效。v1.2.1 曾在一台 Windows 11 build 26200 机器完成真实卸载、官方重装、Cowork VM、网络与 API E2E；v1.2.2 的真实重装测试已确认失败，不能沿用 v1.2.1 的结论。v1.2.3 已用同一官方 MSIX 的等字节扩展名对照、隔离夹具和只读实机检查验证，但在发布前未再次卸载当前健康的 Claude，因此不冒充新的破坏性 E2E。标签发布由 GitHub Actions 从跟踪文件构建 ZIP、生成 SHA-256 并发布 build provenance attestation，可用 `gh attestation verify claude-setup-windows.zip --repo 2786886095/claude-setup` 验证；这仍不代表所有 Windows、代理、安全软件或 ARM64 环境都已覆盖。
 
 ## 官方资料
 

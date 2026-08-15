@@ -121,7 +121,7 @@ Diagnose 会区分当前未解决错误、已被后续完整成功序列覆盖�
 
 ## 官方下载失败
 
-官方下载最多尝试三次，使用同目录 `.partial` 文件；Content-Length（若服务器提供）、Anthropic 签名、包身份、架构和 SHA-256 全部在转正前验证，拒绝的候选不会覆盖已有可信缓存。最终失败时，诊断 JSON 的 `DownloadFailure.Code` 会区分 `DOWNLOAD_DNS`、`DOWNLOAD_PROXY`、`DOWNLOAD_TLS`、`DOWNLOAD_HTTP`、`DOWNLOAD_TIMEOUT`、`DOWNLOAD_DISK`、`DOWNLOAD_EMPTY`、`DOWNLOAD_LENGTH_MISMATCH`、`DOWNLOAD_SIGNATURE_INVALID`、`DOWNLOAD_IDENTITY_INVALID`、`DOWNLOAD_ARCHITECTURE_INVALID` 与 `DOWNLOAD_UNKNOWN`。Claude 自己下载 VM bundle 的 CDN/代理故障只能由本项目诊断和触发官方重试，工具不会把网络问题伪装成本地文件修复成功。
+官方下载最多尝试三次，并使用同目录、保持最终格式扩展名的暂存文件，例如目标 `Claude-latest-x64.msix` 对应 `Claude-latest-x64.partial.msix`。Content-Length（若服务器提供）、Anthropic 签名、包身份、架构和 SHA-256 全部在转正前验证，拒绝的候选不会覆盖已有可信缓存。请勿使用 v1.2.2 做全新安装或重装：该版的 `*.msix.partial` 命名会让 Windows Authenticode 对有效 MSIX 返回 `UnknownError`；v1.2.3 已修复。最终失败时，诊断 JSON 的 `DownloadFailure.Code` 会区分 `DOWNLOAD_DNS`、`DOWNLOAD_PROXY`、`DOWNLOAD_TLS`、`DOWNLOAD_HTTP`、`DOWNLOAD_TIMEOUT`、`DOWNLOAD_DISK`、`DOWNLOAD_EMPTY`、`DOWNLOAD_LENGTH_MISMATCH`、`DOWNLOAD_SIGNATURE_INVALID`、`DOWNLOAD_IDENTITY_INVALID`、`DOWNLOAD_ARCHITECTURE_INVALID` 与 `DOWNLOAD_UNKNOWN`，每次失败还记录候选长度和 SHA-256（若文件可读）。Claude 自己下载 VM bundle 的 CDN/代理故障只能由本项目诊断和触发官方重试，工具不会把网络问题伪装成本地文件修复成功。
 
 ## 分享诊断报告
 
