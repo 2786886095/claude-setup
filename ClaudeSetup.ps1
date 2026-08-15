@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.2.0'
+$script:ToolVersion = '1.2.1'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -42,6 +42,8 @@ $script:DefaultIndependentUserData = Join-Path $env:LOCALAPPDATA 'Claude-3p'
 $script:IndependentUserDataStatePath = Join-Path $script:ProgramDataRoot 'independent-user-data.json'
 $script:DetectedClaudeUserData = $null
 $script:SuppressConsoleLog = $false
+$script:SecurityModuleVerified = $false
+$script:WindowsPowerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 function Write-Log {
     param(
@@ -56,6 +58,30 @@ function Write-Log {
     if ($script:LogPath) {
         Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
     }
+}
+
+function Initialize-TrustedSecurityModule {
+    if ($script:SecurityModuleVerified) { return }
+    $manifest = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+        throw "Windows PowerShell 安全模块不存在：$manifest"
+    }
+    Import-Module -Name $manifest -Force -ErrorAction Stop
+    $module = Get-Module -Name Microsoft.PowerShell.Security | Where-Object {
+        $_.Path -and ([IO.Path]::GetFullPath($_.Path)).Equals([IO.Path]::GetFullPath($manifest), [StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1
+    if (-not $module) {
+        throw "Microsoft.PowerShell.Security 未从当前 PowerShell 的系统目录加载：$manifest"
+    }
+    $command = Get-Command -Name 'Microsoft.PowerShell.Security\Get-AuthenticodeSignature' -CommandType Cmdlet -ErrorAction Stop
+    if (-not $command) { throw '系统 Get-AuthenticodeSignature 命令不可用。' }
+    $script:SecurityModuleVerified = $true
+}
+
+function Get-TrustedAuthenticodeSignature {
+    param([Parameter(Mandatory)][string]$Path)
+    Initialize-TrustedSecurityModule
+    return Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $Path
 }
 
 function Add-Finding {
@@ -99,7 +125,7 @@ function Ensure-Administrator {
 
     Write-Log '安装和修复 Cowork 需要管理员权限，正在请求 UAC。' INFO
     $arguments = Get-CurrentArgumentList
-    Start-Process -FilePath 'powershell.exe' -ArgumentList ($arguments -join ' ') -Verb RunAs -WorkingDirectory $script:Root
+    Start-Process -FilePath $script:WindowsPowerShellPath -ArgumentList ($arguments -join ' ') -Verb RunAs -WorkingDirectory $script:Root
     exit 0
 }
 
@@ -528,7 +554,7 @@ function Test-AnthropicSignature {
     if (-not (Test-Path -LiteralPath $Path)) {
         return [pscustomobject]@{ Valid = $false; Status = 'Missing'; Subject = $null }
     }
-    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    $signature = Get-TrustedAuthenticodeSignature -Path $Path
     $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
     $valid = $signature.Status -eq 'Valid' -and $subject -match 'Anthropic'
     return [pscustomobject]@{ Valid = $valid; Status = [string]$signature.Status; Subject = $subject }
@@ -1130,6 +1156,37 @@ function Get-VmRebuildStatePathShape {
     return [pscustomobject]@{ Bundle = $stateBundle; Backup = $stateBackup; VmBundles = $vmBundles }
 }
 
+function Get-LegacyStateBootstrapEvidence {
+    param(
+        [Parameter(Mandatory)]$State,
+        [string]$ExpectedBundlePath
+    )
+    $reasons = New-Object System.Collections.Generic.List[string]
+    $statePaths = $null
+    try { $statePaths = Get-VmRebuildStatePathShape $State } catch { $reasons.Add($_.Exception.Message) }
+    if ($statePaths) {
+        if (-not $State.PSObject.Properties['Status'] -or [string]$State.Status -notin @('AwaitingRestart', 'Rebuilding')) {
+            $reasons.Add('状态不是 AwaitingRestart/Rebuilding。')
+        }
+        if (Test-Path -LiteralPath $statePaths.Bundle) { $reasons.Add('旧活动 bundle 仍然存在。') }
+        if (Test-Path -LiteralPath $statePaths.Backup) { $reasons.Add('旧备份仍然存在。') }
+        $expectedBundle = if ($ExpectedBundlePath) {
+            [IO.Path]::GetFullPath($ExpectedBundlePath)
+        } else {
+            [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA `
+                "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\vm_bundles\claudevm.bundle"))
+        }
+        if (-not $statePaths.Bundle.Equals($expectedBundle, [StringComparison]::OrdinalIgnoreCase)) {
+            $reasons.Add('旧状态路径与 Claude 官方包族的默认私有路径不匹配。')
+        }
+    }
+    return [pscustomobject]@{
+        Eligible = [bool]($statePaths -and $reasons.Count -eq 0)
+        Reasons = $reasons.ToArray()
+        StatePaths = $statePaths
+    }
+}
+
 function Get-VmRebuildStateSafePaths {
     param([Parameter(Mandatory)]$State)
     $statePaths = Get-VmRebuildStatePathShape $State
@@ -1258,6 +1315,35 @@ function Get-AbandonedLegacyVmRebuildEvidence {
         CoreSignaturesValid = [bool]($signatures -and $signatures.Valid)
         VerifiedAt = (Get-Date).ToUniversalTime().ToString('o')
     }
+}
+
+function Wait-AbandonedLegacyVmRebuildEvidence {
+    param(
+        [Parameter(Mandatory)]$State,
+        [int]$Seconds = 90,
+        [int]$PollMilliseconds = 5000,
+        [scriptblock]$EvidenceProvider
+    )
+    $deadline = (Get-Date).AddSeconds([math]::Max(0, $Seconds))
+    $lastReasonText = $null
+    do {
+        $evidence = if ($EvidenceProvider) {
+            & $EvidenceProvider $State
+        } else {
+            $script:DetectedClaudeUserData = $null
+            $paths = Get-ClaudePaths
+            Get-AbandonedLegacyVmRebuildEvidence -State $State -Paths $paths
+        }
+        if ($evidence -and $evidence.Eligible) { return $evidence }
+        $reasonText = if ($evidence -and $evidence.Reasons) { $evidence.Reasons -join '；' } else { '无法采集 Abandoned 安全证据。' }
+        if ($reasonText -ne $lastReasonText) {
+            Write-Log "等待孤立状态安全证据就绪：$reasonText" INFO
+            $lastReasonText = $reasonText
+        }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Milliseconds ([math]::Max(10, $PollMilliseconds))
+    } while ($true)
+    return $evidence
 }
 
 function Test-AbandonedLegacyVmRebuildState {
@@ -1392,12 +1478,20 @@ function Resolve-VmRebuildState {
             [void](Archive-SupersededVmRebuildState -State $state -SkipResumeCleanup:$SkipResumeCleanup)
             return $null
         }
-        if (Test-AbandonedLegacyVmRebuildState -State $state -Paths $Paths -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures) {
+        $abandonedEvidence = $null
+        try {
+            $abandonedEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $state -Paths $Paths `
+                -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures
+        } catch {}
+        if ($abandonedEvidence -and $abandonedEvidence.Eligible) {
             [void](Archive-AbandonedVmRebuildState -State $state -Paths $Paths -LifecycleEvidence $LifecycleEvidence `
                 -CoreSignatures $CoreSignatures -SkipResumeCleanup:$SkipResumeCleanup)
             return $null
         }
-        throw $validationError
+        $abandonedReasons = if ($abandonedEvidence -and $abandonedEvidence.Reasons) {
+            $abandonedEvidence.Reasons -join '；'
+        } else { '无法采集 Abandoned 安全证据。' }
+        throw "$validationError`r`nAbandoned 归档条件不足：$abandonedReasons"
     }
 }
 
@@ -1652,7 +1746,7 @@ function Sync-CompletedVmCompressedCache {
 function Test-TrustedNodeZstdRuntime {
     param([Parameter(Mandatory)][string]$NodePath)
     if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) { return $false }
-    $signature = Get-AuthenticodeSignature -LiteralPath $NodePath
+    $signature = Get-TrustedAuthenticodeSignature -Path $NodePath
     $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
     if ($signature.Status -ne 'Valid' -or $subject -notmatch 'OpenJS Foundation') { return $false }
     try {
@@ -2169,8 +2263,12 @@ function Invoke-Diagnostics {
 
     Add-Finding 'os' 'Info' "$($os.Caption) $($os.Version), build $($os.BuildNumber)" "$($computer.Manufacturer) $($computer.Model)"
     if ($rebuildState) {
+        $abandonedEvidence = $null
         $abandonedVerified = $false
-        try { $abandonedVerified = Test-AbandonedLegacyVmRebuildState $rebuildState } catch {}
+        try {
+            $abandonedEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $rebuildState
+            $abandonedVerified = [bool]$abandonedEvidence.Eligible
+        } catch {}
         $statePaths = $null
         try { $statePaths = Get-VmRebuildStatePathShape $rebuildState } catch {}
         $statePresenceKnown = $false
@@ -2186,7 +2284,10 @@ function Invoke-Diagnostics {
         if ($abandonedVerified) {
             Add-Finding 'vm-rebuild-state-abandoned' 'Warning' '检测到孤立的旧版 VM 重建状态；当前独立 VM 健康' "Auto 对该孤立状态只会归档到 state-history 并清理旧 RunOnce，不会借此卸载 Claude 或修改当前 VM；归档后继续常规安装验证流程。`r`n旧活动路径：$($rebuildState.OriginalPath)`r`n旧备份路径：$($rebuildState.BackupPath)"
         } elseif ($statePresenceKnown -and -not $stateBundlePresent -and -not $stateBackupPresent) {
-            Add-Finding 'vm-rebuild-state-orphaned-unverified' 'Warning' '检测到孤立的旧版 VM 重建状态，但当前环境未满足自动归档条件' "旧活动目录和备份均不存在；Auto 将保持失效保护。请检查当前 VM 完整性、EFS、日志健康状态和 Anthropic 签名。`r`n旧活动路径：$($rebuildState.OriginalPath)`r`n旧备份路径：$($rebuildState.BackupPath)"
+            $evidenceReasons = if ($abandonedEvidence -and $abandonedEvidence.Reasons) {
+                $abandonedEvidence.Reasons -join "`r`n"
+            } else { '无法采集 Abandoned 安全证据。' }
+            Add-Finding 'vm-rebuild-state-orphaned-unverified' 'Warning' '检测到孤立的旧版 VM 重建状态，但当前环境未满足自动归档条件' "旧活动目录和备份均不存在；Auto 仅在精确官方路径下先 bootstrap 官方包并限时重试，其他情况保持失效保护。`r`n拒绝原因：`r`n$evidenceReasons`r`n旧活动路径：$($rebuildState.OriginalPath)`r`n旧备份路径：$($rebuildState.BackupPath)"
         } elseif ($statePresenceKnown -and (-not $stateBundlePresent -or -not $stateBackupPresent)) {
             Add-Finding 'vm-rebuild-state-incomplete' 'Warning' '旧版 VM 重建状态引用的活动目录或备份不完整' "Auto 不会猜测缺失内容并将停止。`r`n备份：$($rebuildState.BackupPath)`r`n活动路径：$($rebuildState.OriginalPath)"
         } else {
@@ -2463,6 +2564,21 @@ function New-SetupPlanStep {
     }
 }
 
+function Get-SetupPlanExecutionAdvice {
+    param([Parameter(Mandatory)][object[]]$Steps)
+    $blockedSteps = @($Steps | Where-Object Disposition -eq 'Blocked')
+    return [pscustomobject]@{
+        RecommendedCommand = if ($blockedSteps.Count -eq 0) { '.\ClaudeSetup.ps1 -Action Auto' } else { $null }
+        BlockerResolution = @($blockedSteps | ForEach-Object {
+            [pscustomobject]@{
+                Id = $_.Id
+                Reason = $_.Reason
+                NextStep = 'Keep the affected state/data unchanged, collect Diagnose output, resolve the stated condition, and run Plan again.'
+            }
+        })
+    }
+}
+
 function Get-SetupPlan {
     $steps = New-Object System.Collections.Generic.List[object]
     $counter = [pscustomobject]@{ Value = 0 }
@@ -2517,31 +2633,6 @@ function Get-SetupPlan {
 
         $paths = $null
         try { $paths = Get-ClaudePaths } catch {}
-        $state = $null
-        try { $state = Get-VmRebuildState } catch {
-            & $addStep 'legacy-state' 'LegacyState' 'Blocked' $script:VmRebuildStatePath $_.Exception.Message 'The active state remains unchanged.' $true $false
-        }
-        if ($state) {
-            $abandonedEvidence = $null
-            try { $abandonedEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $state -Paths $paths } catch {}
-            if ($abandonedEvidence -and $abandonedEvidence.Eligible) {
-                & $addStep 'legacy-state' 'LegacyState' 'WouldChange' $script:VmRebuildStatePath 'ResolveLegacyState or Auto would archive this verified Abandoned state and clear only the ClaudeSetup RunOnce value.' 'Immediately before archival, the old paths, current five VM files, VM-critical EFS, lifecycle logs, and both Anthropic signatures are revalidated.' $true $false
-            } elseif (Test-SupersedableLegacyVmRebuildState -State $state -Paths $paths) {
-                & $addStep 'legacy-state' 'LegacyState' 'WouldChange' $script:VmRebuildStatePath 'ResolveLegacyState or Auto would archive this verified Superseded state; the legacy VM backup remains untouched.' 'Moves only the state JSON into state-history and clears only the ClaudeSetup RunOnce value.' $true $false
-            } else {
-                $activeStateValid = $false
-                try { Assert-VmRebuildState $state; $activeStateValid = $true } catch {}
-                if ($activeStateValid) {
-                    & $addStep 'legacy-state' 'LegacyState' 'Conditional' $script:VmRebuildStatePath "A current rebuild state remains active (Status=$($state.Status)); Auto would continue its documented restart/rebuild workflow." 'ResolveLegacyState leaves a current valid rebuild state unchanged.' $true $true
-                } else {
-                    $reason = if ($abandonedEvidence -and $abandonedEvidence.Reasons) { $abandonedEvidence.Reasons -join '; ' } else { 'The legacy state cannot be proved safe to archive.' }
-                    & $addStep 'legacy-state' 'LegacyState' 'Blocked' $script:VmRebuildStatePath $reason 'Fail closed; no state or backup is changed.' $true $false
-                }
-            }
-        } elseif (-not ($steps | Where-Object Id -eq 'legacy-state')) {
-            & $addStep 'legacy-state' 'LegacyState' 'NoChange' $script:VmRebuildStatePath 'No active ClaudeSetup VM rebuild state exists.' 'No system change.' $true $false
-        }
-
         $package = $null
         try { $package = Get-ClaudePackage } catch {}
         $packageReady = $false
@@ -2557,6 +2648,35 @@ function Get-SetupPlan {
         } else {
             $target = if ($package) { [string]$package.InstallLocation } else { 'Windows system AppX volume' }
             & $addStep 'official-install' 'Package' 'WouldChange' $target 'The default official Claude MSIX installation is missing, misplaced, redirected, incomplete, or has an invalid Claude.exe signature.' 'May move the package; uninstall/reinstall fallback is allowed only after profile migration and a fresh signature check.' $true $false
+        }
+        $state = $null
+        try { $state = Get-VmRebuildState } catch {
+            & $addStep 'legacy-state' 'LegacyState' 'Blocked' $script:VmRebuildStatePath $_.Exception.Message 'The active state remains unchanged.' $true $false
+        }
+        if ($state) {
+            $abandonedEvidence = $null
+            try { $abandonedEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $state -Paths $paths } catch {}
+            if ($abandonedEvidence -and $abandonedEvidence.Eligible) {
+                & $addStep 'legacy-state' 'LegacyState' 'WouldChange' $script:VmRebuildStatePath 'ResolveLegacyState or Auto would archive this verified Abandoned state and clear only the ClaudeSetup RunOnce value.' 'Immediately before archival, the old paths, current five VM files, VM-critical EFS, lifecycle logs, and both Anthropic signatures are revalidated.' $true $false
+            } elseif (Test-SupersedableLegacyVmRebuildState -State $state -Paths $paths) {
+                & $addStep 'legacy-state' 'LegacyState' 'WouldChange' $script:VmRebuildStatePath 'ResolveLegacyState or Auto would archive this verified Superseded state; the legacy VM backup remains untouched.' 'Moves only the state JSON into state-history and clears only the ClaudeSetup RunOnce value.' $true $false
+            } else {
+                $bootstrapEvidence = Get-LegacyStateBootstrapEvidence -State $state
+                if ($bootstrapEvidence.Eligible) {
+                    & $addStep 'legacy-state' 'LegacyState' 'Conditional' $script:VmRebuildStatePath 'The old bundle and backup are both absent. Auto first installs/verifies the official package, starts Claude when allowed, waits up to 90 seconds, and then re-evaluates every Abandoned condition.' 'The state is archived only after package identity, independent VM files, VM-critical EFS, lifecycle logs, and both signatures all pass; timeout leaves the state unchanged.' $true $false
+                } else {
+                    $activeStateValid = $false
+                    try { Assert-VmRebuildState $state; $activeStateValid = $true } catch {}
+                    if ($activeStateValid) {
+                        & $addStep 'legacy-state' 'LegacyState' 'Conditional' $script:VmRebuildStatePath "A current rebuild state remains active (Status=$($state.Status)); Auto would continue its documented restart/rebuild workflow." 'ResolveLegacyState leaves a current valid rebuild state unchanged.' $true $true
+                    } else {
+                        $reason = if ($abandonedEvidence -and $abandonedEvidence.Reasons) { $abandonedEvidence.Reasons -join '; ' } else { 'The legacy state cannot be proved safe to archive.' }
+                        & $addStep 'legacy-state' 'LegacyState' 'Blocked' $script:VmRebuildStatePath $reason 'Fail closed; no state or backup is changed.' $true $false
+                    }
+                }
+            }
+        } elseif (-not ($steps | Where-Object Id -eq 'legacy-state')) {
+            & $addStep 'legacy-state' 'LegacyState' 'NoChange' $script:VmRebuildStatePath 'No active ClaudeSetup VM rebuild state exists.' 'No system change.' $true $false
         }
 
         if ($paths) {
@@ -2594,6 +2714,7 @@ function Get-SetupPlan {
     $stepArray = @($steps.ToArray() | Sort-Object Order)
     $wouldChange = @($stepArray | Where-Object Disposition -eq 'WouldChange').Count
     $blocked = @($stepArray | Where-Object Disposition -eq 'Blocked').Count
+    $executionAdvice = Get-SetupPlanExecutionAdvice -Steps $stepArray
     return [pscustomobject]@{
         SchemaVersion = 1
         ToolVersion = $script:ToolVersion
@@ -2617,7 +2738,8 @@ function Get-SetupPlan {
             'A later Auto or ResolveLegacyState run revalidates all safety evidence at execution time.'
         )
         Steps = $stepArray
-        RecommendedCommand = '.\ClaudeSetup.ps1 -Action Auto'
+        RecommendedCommand = $executionAdvice.RecommendedCommand
+        BlockerResolution = $executionAdvice.BlockerResolution
     }
 }
 
@@ -3295,7 +3417,30 @@ function Invoke-AutoSetup {
         return 3010
     }
 
-    $rebuildState = Resolve-VmRebuildState
+    $rebuildState = Get-VmRebuildState
+    $packagePrepared = $false
+    if ($rebuildState) {
+        $bootstrapEvidence = Get-LegacyStateBootstrapEvidence -State $rebuildState
+        $currentAbandonedEvidence = $null
+        try { $currentAbandonedEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $rebuildState } catch {}
+        if ($bootstrapEvidence.Eligible -and (-not $currentAbandonedEvidence -or -not $currentAbandonedEvidence.Eligible)) {
+            Write-Log '检测到旧活动 bundle 与备份均已不存在；先安装并验证官方 Claude，再重新采集 Abandoned 安全证据。旧状态保持不动。' WARN
+            [void](Repair-ClaudePackageAndSignature)
+            $packagePrepared = $true
+            [void](Repair-ClaudeUserDataLayout)
+            Start-CoworkServices
+            if (-not $SkipLaunch) { Start-ClaudeAppx }
+            $evidenceWaitSeconds = if ($SkipLaunch) { 0 } else { 90 }
+            $readyEvidence = Wait-AbandonedLegacyVmRebuildEvidence -State $rebuildState -Seconds $evidenceWaitSeconds
+            if (-not $readyEvidence -or -not $readyEvidence.Eligible) {
+                $waitReasons = if ($readyEvidence -and $readyEvidence.Reasons) {
+                    $readyEvidence.Reasons -join '；'
+                } else { '无法采集 Abandoned 安全证据。' }
+                throw "官方包已安全安装，但孤立状态证据在 $evidenceWaitSeconds 秒内仍未就绪；状态未归档：$waitReasons"
+            }
+        }
+    }
+    $rebuildState = Resolve-VmRebuildState -State $rebuildState
     if ($rebuildState -and $rebuildState.Status -eq 'Completed') {
         $completedStatus = Get-VmBundleStatus -BundlePath $rebuildState.OriginalPath
         if (-not $completedStatus.Ready) { throw 'VM 重建状态标记为 Completed，但活动 bundle 未通过复核。' }
@@ -3318,7 +3463,8 @@ function Invoke-AutoSetup {
         Write-Log "检测到重启已完成，开始验证新 VM bundle；旧备份：$($rebuildState.BackupPath)" INFO
     }
 
-    $paths = Repair-ClaudePackageAndSignature
+    $paths = if ($packagePrepared) { Get-ClaudePaths } else { Repair-ClaudePackageAndSignature }
+    if (-not $paths) { throw '官方 Claude 包准备完成后仍无法解析安装路径。' }
     [void](Repair-ClaudeUserDataLayout)
     if (-not $rebuildState) {
         $stagedRebuild = Repair-VmStorageAttributes

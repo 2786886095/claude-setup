@@ -4,11 +4,22 @@ chcp 65001 >nul 2>&1
 title Claude Setup - Recommended installer - install.bat
 cd /d "%~dp0"
 
+set "CLAUDE_SETUP_WINDOWS_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%CLAUDE_SETUP_WINDOWS_POWERSHELL%" (
+    echo [ERROR] Windows PowerShell 5.1 was not found at the system path.
+    exit /b 2
+)
+set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules;%ProgramFiles%\WindowsPowerShell\Modules"
 set "CLAUDE_SETUP_PS1=%~dp0ClaudeSetup.ps1"
 set "CLAUDE_SETUP_ELEVATOR=%~dp0ElevateInstall.ps1"
 set "CLAUDE_SETUP_DIR=%~dp0"
 set "CLAUDE_SETUP_REPORTS=%~dp0reports"
 set "CLAUDE_SETUP_BOOTSTRAP_LOG=%CLAUDE_SETUP_REPORTS%\install-bootstrap.log"
+
+if /i "%CLAUDE_SETUP_VALIDATE_POWERSHELL%"=="1" (
+    "%CLAUDE_SETUP_WINDOWS_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -Command "$env:CLAUDE_SETUP_IMPORT_ONLY='1'; . $env:CLAUDE_SETUP_PS1; $null=Get-TrustedAuthenticodeSignature -Path $env:CLAUDE_SETUP_PS1"
+    exit /b %errorlevel%
+)
 
 if not exist "%CLAUDE_SETUP_REPORTS%" mkdir "%CLAUDE_SETUP_REPORTS%" >nul 2>&1
 >>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] install.bat started from "%CLAUDE_SETUP_DIR%"
@@ -34,7 +45,7 @@ goto administrator_confirmed
 :request_administrator
 echo Requesting administrator privileges...
 >>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] requesting UAC through cmd.exe helper
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_ELEVATOR%"
+"%CLAUDE_SETUP_WINDOWS_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_ELEVATOR%"
 set "CLAUDE_SETUP_ELEVATION_EXIT=%errorlevel%"
 >>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] elevated child exited with code %CLAUDE_SETUP_ELEVATION_EXIT%
 if "%CLAUDE_SETUP_ELEVATION_EXIT%"=="0" exit /b 0
@@ -53,7 +64,7 @@ echo ============================================================
 echo  Recommended entry: install.bat
 echo  Installing or repairing Claude Desktop and Cowork...
 echo ============================================================
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_PS1%" -Action Auto
+"%CLAUDE_SETUP_WINDOWS_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%CLAUDE_SETUP_PS1%" -Action Auto
 set "CLAUDE_SETUP_EXIT=%errorlevel%"
 >>"%CLAUDE_SETUP_BOOTSTRAP_LOG%" echo [%date% %time%] ClaudeSetup.ps1 exited with code %CLAUDE_SETUP_EXIT%
 

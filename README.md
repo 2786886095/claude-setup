@@ -2,7 +2,7 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
-> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.2.0 还提供严格只读的机器可读 Plan、独立遗留状态解析，并在 Abandoned 归档落盘前重新核验当前 VM、EFS、日志和双签名。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
+> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.2.1 还修复了“未安装包＋孤立旧状态”的 Auto 顺序和 PowerShell 7 父环境污染 Windows PowerShell 模块路径的问题。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
 
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
@@ -51,6 +51,8 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 识别 v1.0.x 遗留的 `vm-rebuild-active.json`。旧备份存在时，只有旧状态精确属于 Claude AppX 私有目录且当前独立 VM 完整健康，才归档为 Superseded，并永久保留旧备份；旧活动目录与备份均已不存在时，还必须复核当前 VM 关键 EFS、完整成功日志及 Claude/cowork-svc 的 Anthropic 签名，才归档为 Abandoned。两种记录都进入 `%ProgramData%\ClaudeSetup\state-history`；
 - 在任何安装或修复前可运行 `-Action Plan` 输出单个 JSON 操作计划；该动作不请求 UAC，不创建日志/报告，不下载，也不修改文件、AppX、服务、进程、环境变量、RunOnce 或 VM 状态；
 - `-Action ResolveLegacyState` 只处理已经满足安全条件的遗留状态，不进入下载、安装、服务启动或 VM 修复流程；Abandoned 在移动状态 JSON 前会重新读取状态并绑定五个 VM 文件的长度/时间、VM 关键 EFS、当前完整健康日志和双签名证据到回执；
+- 当旧状态精确指向 Claude 官方包族路径且旧活动 bundle/备份都已消失时，Auto 会先安装并验证官方包、恢复安全用户数据布局、启动 Claude，并在最多 90 秒内反复采集完整 Abandoned 证据；只有全部条件成立才归档，超时保留状态并列出每个拒绝原因；
+- `install.bat` 与 `diagnose.cmd` 固定调用 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`，仅为该子进程构造系统模块路径；不会永久覆盖用户或系统 `PSModulePath`，也不会误载 PowerShell 7/Scoop 版 `Microsoft.PowerShell.Security`；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
@@ -70,6 +72,8 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 `install.bat` 会根据退出码显示编号式下一步：需要重启时提示保留解压目录、重启、接受 UAC 和进入 Cowork；下载未完成时提示等待后再次运行；验证成功时确认桌面快捷方式和加密备份状态。
 
 UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结果，不再直接把 `.bat` 传给 `Start-Process`。提权脚本从自身所在目录定位 `install.bat`，不会把末尾带反斜杠的目录作为命令行参数传递，因此兼容中文、空格及常见特殊字符路径。`install.bat` 在运行 PowerShell 主脚本前就会写入 `reports\install-bootstrap.log`，即使 UAC 或启动器失败也能诊断。
+
+即使从 PowerShell 7、Codex、IDE 或其他带自定义 `PSModulePath` 的终端启动，批处理也会把 Windows PowerShell 5.1 子进程限制到系统模块目录。PowerShell 主脚本还会按 `$PSHOME` 绝对路径导入 `Microsoft.PowerShell.Security`，签名检查不会依赖父进程提供的同名模块。
 
 仓库通过 `.gitattributes` 强制所有 `.bat/.cmd` 使用 Windows CRLF 换行；发布测试会拒绝仅含 LF 的批处理文件，避免 `cmd.exe` 拼接行、变量截断和退出码 9009。
 
@@ -100,7 +104,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 .\ClaudeSetup.ps1 -Action Plan
 ```
 
-`Plan` 的 `Disposition` 会区分 `NoChange`、`WouldChange`、`Conditional`、`Blocked` 和 `Manual`。它反映当前只读快照，不是执行授权；随后运行 `Auto` 或 `ResolveLegacyState` 时仍会重新采集证据，不能复用旧计划绕过安全检查。`ResolveLegacyState` 需要管理员权限，只归档可严格证明为 Superseded/Abandoned 的旧状态；有效的当前重建状态保持不变。
+`Plan` 的 `Disposition` 会区分 `NoChange`、`WouldChange`、`Conditional`、`Blocked` 和 `Manual`。它反映当前只读快照，不是执行授权；随后运行 `Auto` 或 `ResolveLegacyState` 时仍会重新采集证据，不能复用旧计划绕过安全检查。`HasBlockers=true` 时 `RecommendedCommand` 为 `null`，并在 `BlockerResolution` 提供机器可读的下一步；两条旧路径都消失且可安全 bootstrap 时则标记为 `Conditional`。`ResolveLegacyState` 需要管理员权限，只归档可严格证明为 Superseded/Abandoned 的旧状态；有效的当前重建状态保持不变。
 
 如需自动重启：
 
@@ -181,7 +185,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 ## 验证边界
 
-仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、只读 Plan 快照、隔离状态夹具、归档前证据失效和发布包一致性。它们不是在每次提交中真实安装 Claude、启动 Hyper-V/Cowork、联网进入 Workspace 的端到端测试。发布 ZIP 当前由 SHA-256 校验，但尚未提供独立 Sigstore/GitHub artifact attestation；因此不能把本工具描述为已在所有 Windows 环境完成生产级 E2E 或供应链证明。
+仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan 快照、孤立状态 bootstrap/证据重试夹具、归档前证据失效和发布包一致性。v1.2.0 曾在一台 Windows 11 build 26200 机器完成真实卸载、官方重装、Cowork VM、网络与 API E2E，但这不代表每次提交或所有机器都有真实 E2E。发布 ZIP 当前由 SHA-256 校验，但尚未提供独立 Sigstore/GitHub artifact attestation；因此不能把本工具描述为已在所有 Windows 环境完成生产级 E2E 或供应链证明。
 
 ## 官方资料
 

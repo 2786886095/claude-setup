@@ -21,6 +21,7 @@ foreach ($script in $scripts) {
 $main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw -Encoding UTF8
 $batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw -Encoding UTF8
 $legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Encoding UTF8
+$diagnoseBatch = Get-Content -LiteralPath (Join-Path $root 'diagnose.cmd') -Raw -Encoding UTF8
 $elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw -Encoding UTF8
 $zstdHelperPath = Join-Path $root 'VmZstdDecompress.js'
 $zstdHelper = Get-Content -LiteralPath $zstdHelperPath -Raw -Encoding UTF8
@@ -112,9 +113,14 @@ $requiredSafetyChecks = @(
     'Resolve-VmRebuildState'
     'Invoke-ResolveLegacyState'
     'Get-SetupPlan'
+    'Get-SetupPlanExecutionAdvice'
     "'Plan'"
     "'ResolveLegacyState'"
     'Get-AbandonedLegacyVmRebuildEvidence'
+    'Get-LegacyStateBootstrapEvidence'
+    'Wait-AbandonedLegacyVmRebuildEvidence'
+    'Initialize-TrustedSecurityModule'
+    'Get-TrustedAuthenticodeSignature'
     'Archive-SupersededVmRebuildState'
     'Test-AbandonedLegacyVmRebuildState'
     'Archive-AbandonedVmRebuildState'
@@ -140,7 +146,7 @@ if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
 }
 $storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
@@ -188,6 +194,24 @@ if ($abandonedArchiveBlock -notmatch '(?s)Get-VmRebuildStatePathShape.*?Test-Pat
 if ($main -notmatch '(?s)function Get-AbandonedLegacyVmRebuildEvidence.*?Test-ClaudeCoreSignatures' -or
     $main -notmatch '(?s)function Get-AbandonedLegacyVmRebuildEvidence.*?CurrentRunHealthy.*?CurrentVirtualDisk1772') {
     throw 'Abandoned-state classification must require valid core signatures and current independent VM health.'
+}
+if ($main -notmatch '(?s)function Resolve-VmRebuildState.*?Abandoned 归档条件不足.*?abandonedReasons') {
+    throw 'Legacy-state failures must include the complete Abandoned evidence reasons.'
+}
+$autoStart = $main.IndexOf('function Invoke-AutoSetup')
+$autoEnd = $main.IndexOf("if (`$env:CLAUDE_SETUP_IMPORT_ONLY", $autoStart)
+if ($autoStart -lt 0 -or $autoEnd -le $autoStart) { throw 'Unable to isolate Invoke-AutoSetup.' }
+$autoBlock = $main.Substring($autoStart, $autoEnd - $autoStart)
+$autoBootstrapIndex = $autoBlock.IndexOf('Get-LegacyStateBootstrapEvidence')
+$autoPackageIndex = $autoBlock.IndexOf('Repair-ClaudePackageAndSignature')
+$autoWaitIndex = $autoBlock.IndexOf('Wait-AbandonedLegacyVmRebuildEvidence')
+$autoResolveIndex = $autoBlock.IndexOf('Resolve-VmRebuildState')
+if ($autoBootstrapIndex -lt 0 -or $autoPackageIndex -lt $autoBootstrapIndex -or
+    $autoWaitIndex -lt $autoPackageIndex -or $autoResolveIndex -lt $autoWaitIndex) {
+    throw 'Auto must bootstrap and verify the official package, wait for full evidence, and only then resolve an orphaned legacy state.'
+}
+if ($main -notmatch '(?s)function Get-SetupPlanExecutionAdvice.*?RecommendedCommand.*?blockedSteps\.Count -eq 0' -or $main -notmatch 'BlockerResolution =') {
+    throw 'Plan must suppress the Auto recommendation and provide machine-readable resolution data when blockers exist.'
 }
 
 $mainTokens = $null
@@ -280,7 +304,10 @@ $requiredBatchParts = @(
     '%~dp0ClaudeSetup.ps1',
     'fltmc.exe',
     'ElevateInstall.ps1',
-    '-Action Auto'
+    '-Action Auto',
+    '%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe',
+    'PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules',
+    'CLAUDE_SETUP_VALIDATE_POWERSHELL'
 )
 foreach ($text in $requiredBatchParts) {
     if (-not $batch.Contains($text)) {
@@ -289,6 +316,10 @@ foreach ($text in $requiredBatchParts) {
 }
 if ($legacyBatch -notmatch '(?i)call\s+"%~dp0install\.bat"') {
     throw 'setup.cmd must delegate to the canonical install.bat entry point.'
+}
+if ($diagnoseBatch -notmatch '%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe' -or
+    $diagnoseBatch -notmatch 'PSModulePath=%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\Modules') {
+    throw 'diagnose.cmd must use the same isolated system Windows PowerShell chain as install.bat.'
 }
 if ($batch -notmatch '(?i)Recommended entry:\s*install\.bat') {
     throw 'install.bat must visibly identify itself as the recommended entry point.'
@@ -315,6 +346,9 @@ if ($batch -notmatch 'CLAUDE_SETUP_ELEVATION_EXIT%"=="194" exit /b 194' -or
 if ($batch -match '(?i)-(BatchPath|WorkingDirectory)') {
     throw 'install.bat must not pass filesystem paths through the UAC helper command line.'
 }
+if ($batch -match '(?i)\bsetx(?:\.exe)?\b') {
+    throw 'install.bat must isolate PSModulePath only for its child process, never persist it with setx.'
+}
 foreach ($required in @('$PSScriptRoot', '$env:ComSpec', '-Verb RunAs', '-Wait', '-PassThru', '/d /c', 'ValidateOnly')) {
     if (-not $elevator.Contains($required)) { throw "ElevateInstall.ps1 is missing: $required" }
 }
@@ -330,9 +364,27 @@ try {
     New-Item -ItemType Directory -Path $elevationTestRoot -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Destination $elevationTestRoot
     Copy-Item -LiteralPath (Join-Path $root 'install.bat') -Destination $elevationTestRoot
+    Copy-Item -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Destination $elevationTestRoot
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $elevationTestRoot 'ElevateInstall.ps1') -ValidateOnly
     if ($LASTEXITCODE -ne 0) {
         throw "Elevation helper path validation failed with exit code $LASTEXITCODE."
+    }
+    $previousModulePath = $env:PSModulePath
+    $previousValidationMode = $env:CLAUDE_SETUP_VALIDATE_POWERSHELL
+    try {
+        $env:PSModulePath = 'C:\ClaudeSetupPollutedModulePath;D:\environment\scoop\apps\pwsh\current\Modules'
+        $env:CLAUDE_SETUP_VALIDATE_POWERSHELL = '1'
+        $validationCommand = '""{0}""' -f (Join-Path $root 'install.bat')
+        & $env:ComSpec /d /c $validationCommand
+        if ($LASTEXITCODE -ne 0) {
+            throw "PowerShell 7 -> cmd.exe -> Windows PowerShell security-module isolation failed with exit code $LASTEXITCODE."
+        }
+        if ($env:PSModulePath -notlike 'C:\ClaudeSetupPollutedModulePath*') {
+            throw 'install.bat must not permanently overwrite the parent/user PSModulePath.'
+        }
+    } finally {
+        $env:PSModulePath = $previousModulePath
+        $env:CLAUDE_SETUP_VALIDATE_POWERSHELL = $previousValidationMode
     }
 } finally {
     Remove-Item -LiteralPath $elevationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -392,6 +444,19 @@ try {
     }
     if ($arm64Url -ne 'https://claude.ai/api/desktop/win32/arm64/msix/latest/redirect') {
         throw "Unexpected ARM64 download URL: $arm64Url"
+    }
+    $blockedAdvice = Get-SetupPlanExecutionAdvice -Steps @(
+        [pscustomobject]@{ Id = 'legacy-state'; Disposition = 'Blocked'; Reason = 'fixture blocker' }
+    )
+    if ($blockedAdvice.RecommendedCommand -or @($blockedAdvice.BlockerResolution).Count -ne 1 -or
+        $blockedAdvice.BlockerResolution[0].Id -ne 'legacy-state') {
+        throw 'A blocked Plan must not recommend Auto and must return machine-readable blocker resolution.'
+    }
+    $clearAdvice = Get-SetupPlanExecutionAdvice -Steps @(
+        [pscustomobject]@{ Id = 'package'; Disposition = 'WouldChange'; Reason = 'fixture change' }
+    )
+    if ($clearAdvice.RecommendedCommand -ne '.\ClaudeSetup.ps1 -Action Auto' -or @($clearAdvice.BlockerResolution).Count -ne 0) {
+        throw 'A Plan without blockers must retain the canonical Auto recommendation.'
     }
     if ((Get-VolumeRoot 'C:\Users\Example\AppData') -ne 'C:') {
         throw 'Volume-root detection failed for C:.'
@@ -623,6 +688,35 @@ try {
         }
         $validSignatures = [pscustomobject]@{ Valid = $true }
         $invalidSignatures = [pscustomobject]@{ Valid = $false }
+        $bootstrapEvidence = Get-LegacyStateBootstrapEvidence -State $abandonedState -ExpectedBundlePath $legacyBundle
+        if (-not $bootstrapEvidence.Eligible) {
+            throw "An orphaned official-package state with both referenced paths absent must permit package bootstrap: $($bootstrapEvidence.Reasons -join '; ')"
+        }
+        if ((Get-LegacyStateBootstrapEvidence -State $unsafeLegacyState -ExpectedBundlePath $legacyBundle).Eligible) {
+            throw 'Package bootstrap must reject a legacy state outside the exact Claude package-family path.'
+        }
+        $evidenceCounter = [pscustomobject]@{ Value = 0 }
+        $waitingEvidence = [pscustomobject]@{ Eligible = $false; Reasons = @('process and lifecycle evidence not ready') }
+        $readyEvidence = [pscustomobject]@{ Eligible = $true; Reasons = @() }
+        $waitResult = Wait-AbandonedLegacyVmRebuildEvidence -State $abandonedState -Seconds 1 -PollMilliseconds 10 -EvidenceProvider {
+            param($ignoredState)
+            $evidenceCounter.Value++
+            if ($evidenceCounter.Value -lt 3) { return $waitingEvidence }
+            return $readyEvidence
+        }
+        if (-not $waitResult.Eligible -or $evidenceCounter.Value -lt 3) {
+            throw 'Fresh-install evidence waiting must retry without weakening the final predicate.'
+        }
+        $detailedFailure = $null
+        try {
+            [void](Resolve-VmRebuildState -State $abandonedState -Paths $independentPaths `
+                -LifecycleEvidence $healthyLifecycle -CoreSignatures $invalidSignatures -SkipResumeCleanup)
+        } catch {
+            $detailedFailure = $_.Exception.Message
+        }
+        if ($detailedFailure -notmatch 'Abandoned 归档条件不足' -or $detailedFailure -notmatch '签名无效') {
+            throw "Resolve-VmRebuildState must report all failed Abandoned evidence: $detailedFailure"
+        }
         if (Test-AbandonedLegacyVmRebuildState -State $legacyState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures) {
             throw 'A still-present legacy backup must use the Superseded branch, never the Abandoned branch.'
         }

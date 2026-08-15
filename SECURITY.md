@@ -14,15 +14,17 @@
 
 `v1.2.0` 缩小判定与执行之间的竞态窗口：Abandoned 分类通过后，归档函数会重新读取磁盘状态，并在移动状态 JSON 的最后一刻再次复核旧路径不存在、当前五个 VM 文件的长度与最后写入时间、VM 关键 EFS 数量、当前完整健康序列及 Claude.exe/cowork-svc.exe 双签名。回执保存该证据快照；任一项变化都保持活动状态并停止。该版本还增加零写入 `-Action Plan` 和只执行状态解析的 `-Action ResolveLegacyState`。
 
+`v1.2.1` 修复卸载官方包后孤立状态阻断重新安装的问题。只有状态结构、状态阶段、Claude 官方包族默认私有路径以及“旧活动 bundle/引用备份均不存在”全部成立，Auto 才允许先安装签名有效的官方包；旧状态在此期间保持原样。安装后会启动官方 Claude 并等待最多 90 秒，每次都重新核验独立路径、五个 VM 文件、VM 关键 EFS、完整健康日志和双签名，超时后输出全部拒绝原因并停止。该版本还固定使用系统 Windows PowerShell 5.1，并按 `$PSHOME` 绝对路径加载安全模块，避免父级 PowerShell 7/Scoop `PSModulePath` 污染签名检查；用户环境变量不会被永久修改。
+
 ## 已运行旧版本怎么办
 
 1. 停止反复运行旧版安装器；不要删除任何 `claudevm.bundle.backup-*`、`foreignjunk` 或 `%ProgramData%\ClaudeSetup` 状态文件。
 2. 不要运行来源不明的 `fix_commit.bat`。仅凭文件名或 12 位哈希前缀不能证明 `.tmp/.partial` 完整。
 3. 不要把活动 VHDX 硬链接到唯一备份。NTFS 硬链接是同一文件的多个路径；通过活动路径发生的内容或属性变化也作用于“备份”，因此它不再是独立回滚副本。
 4. 使用最新版 `diagnose.cmd` 收集只读报告，并同时保留 `C:\ProgramData\Claude\Logs\cowork-service.log`。
-5. 若报告命中 `CreateVirtualDisk failed: 0x199` 且 `sessiondata.vhdx` 缺失，可使用 v1.2.0 的独立数据目录恢复路径；若迁移或后续健康验证失败，请保留报告并向 Anthropic 反馈。
+5. 若报告命中 `CreateVirtualDisk failed: 0x199` 且 `sessiondata.vhdx` 缺失，可使用 v1.2.1 的独立数据目录恢复路径；若迁移或后续健康验证失败，请保留报告并向 Anthropic 反馈。
 
-本项目不会自动恢复或删除旧版移动的 bundle。v1.2.0 只能在当前独立 VM 完整且健康已证实时归档阻断流程的旧状态文件：实际存在的旧 bundle 继续作为独立恢复证据保留；若旧活动目录与备份都已不存在，Abandoned 记录会如实写入两个 `Present=false` 并附带最后一刻的验证快照，不会伪造恢复证据。真正的内容恢复仍必须先证明候选目录、官方 MSIX manifest、全部必需文件和日志状态一致，再选择不会破坏独立备份的目录级回滚方案。
+本项目不会自动恢复或删除旧版移动的 bundle。v1.2.1 只能在当前独立 VM 完整且健康已证实时归档阻断流程的旧状态文件：实际存在的旧 bundle 继续作为独立恢复证据保留；若旧活动目录与备份都已不存在，Abandoned 记录会如实写入两个 `Present=false` 并附带最后一刻的验证快照，不会伪造恢复证据。真正的内容恢复仍必须先证明候选目录、官方 MSIX manifest、全部必需文件和日志状态一致，再选择不会破坏独立备份的目录级回滚方案。
 
 ## 技术依据
 

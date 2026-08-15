@@ -95,7 +95,7 @@
 
 自动解密范围只包括活动数据根目录、`vm_bundles`、`claudevm.bundle` 和五个 VM 运行文件。会话 `.jsonl`、`local-agent-mode-sessions`、`claude-code-sessions`、outputs、uploads、配置及缓存即使使用 EFS，也只显示为 Info，不会阻断 Cowork 或被自动解密。
 
-若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.2.0 会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和旧备份均已不存在时，只有当前 VM 完整、VM 关键路径无 EFS、完整成功日志成立且 Claude/cowork-svc 双签名有效，才归档为 Abandoned。Abandoned 落盘前会重新核验全部证据，并把五个 VM 文件的长度/时间、EFS、日志和签名快照写入回执。若只缺一侧、路径异常或任一健康证据不足，工具继续失效保护并停止。
+若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.2.1 会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和引用备份均已不存在时，Auto 先安装/验证官方包并最多等待 90 秒，再要求当前 VM 完整、VM 关键路径无 EFS、完整成功日志成立且 Claude/cowork-svc 双签名有效，才归档为 Abandoned。Abandoned 落盘前还会重新核验全部证据，并把五个 VM 文件的长度/时间、EFS、日志和签名快照写入回执。若只缺一侧、路径异常或任一健康证据不足，工具保持状态、列出全部拒绝原因并停止。
 
 Diagnose 会把已经验证的孤立状态明确显示为“当前独立 VM 健康，Auto 对该状态只执行归档和旧 RunOnce 清理，随后继续常规安装验证”；无法验证的孤立状态会单独提示缺少的健康或签名条件，不再误称重建仍在正常进行。
 
@@ -112,3 +112,9 @@ Diagnose 会把已经验证的孤立状态明确显示为“当前独立 VM 健�
 ```
 
 该动作不会下载或安装 Claude。状态不是可证明的 Superseded/Abandoned 时会保持原文件并报错；若它仍是有效的当前重建状态，则原样保留并正常退出。
+
+## 从 PowerShell 7、Codex 或 IDE 运行时签名模块无法加载
+
+若旧版出现 `Microsoft.PowerShell.Security could not be loaded`、`ObjectSecurity TypeData` 重复或 `Get-AuthenticodeSignature` 不可用，不代表 Claude 签名已经损坏。常见原因是 PowerShell 7 父进程经 `cmd.exe` 把自己的 `PSModulePath` 传给 Windows PowerShell 5.1。
+
+v1.2.1 的 `install.bat` 使用系统绝对路径启动 Windows PowerShell，并只在该批处理进程内设置系统模块路径；`ClaudeSetup.ps1` 也按 `$PSHOME` 绝对路径导入安全模块。它不会调用 `setx`，不会永久覆盖用户/系统 `PSModulePath`。请使用最新版完整 ZIP 中的 `install.bat`，不要单独复制旧批处理与新脚本混用。
