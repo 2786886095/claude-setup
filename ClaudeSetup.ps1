@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.0.14'
+$script:ToolVersion = '1.1.0'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -37,6 +37,9 @@ $script:VmCommitAttempted = @{}
 $script:VmManifestCache = $null
 $script:OfficialMsixPath = $null
 $script:AppxProtectionLogEmitted = $false
+$script:DefaultIndependentUserData = Join-Path $env:LOCALAPPDATA 'Claude-3p'
+$script:IndependentUserDataStatePath = Join-Path $script:ProgramDataRoot 'independent-user-data.json'
+$script:DetectedClaudeUserData = $null
 
 function Write-Log {
     param(
@@ -125,6 +128,154 @@ function Get-PendingRestart {
 
 function Get-AppxSystemVolume {
     return Get-AppxVolume | Where-Object { $_.IsSystemVolume } | Select-Object -First 1
+}
+
+function Convert-FinalPathToDosPath {
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Path.Substring(8)
+    }
+    if ($Path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $Path.Substring(4)
+    }
+    return $Path
+}
+
+function Get-FinalPath {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    if (-not ('ClaudeSetup.NativePath' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace ClaudeSetup {
+    public static class NativePath {
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint FILE_SHARE_DELETE = 0x00000004;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes,
+            uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(
+            SafeFileHandle file, StringBuilder filePath, uint filePathLength, uint flags);
+        public static string Resolve(string path) {
+            using (SafeFileHandle handle = CreateFileW(path, 0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, IntPtr.Zero,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                var buffer = new StringBuilder(32768);
+                uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+                if (length == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (length >= buffer.Capacity) throw new InvalidOperationException("Resolved path exceeds Win32 buffer.");
+                return buffer.ToString();
+            }
+        }
+    }
+}
+'@
+    }
+    try {
+        return Convert-FinalPathToDosPath ([ClaudeSetup.NativePath]::Resolve([IO.Path]::GetFullPath($Path)))
+    } catch {
+        Write-Log "无法解析最终物理路径 $Path：$($_.Exception.Message)" WARN
+        return $null
+    }
+}
+
+function Get-AppxPackageLocationInfo {
+    param([Parameter(Mandatory)]$Package)
+    $registered = if ($Package.InstallLocation) { [IO.Path]::GetFullPath([string]$Package.InstallLocation).TrimEnd('\') } else { $null }
+    $physical = if ($registered) { Get-FinalPath $registered } else { $null }
+    if ($physical) { $physical = [IO.Path]::GetFullPath($physical).TrimEnd('\') }
+    return [pscustomobject]@{
+        RegisteredPath = $registered
+        PhysicalPath = $physical
+        ResolutionSucceeded = [bool]$physical
+        IsRedirected = [bool]($physical -and -not $physical.Equals($registered, [StringComparison]::OrdinalIgnoreCase))
+        RegisteredVolume = Get-VolumeRoot $registered
+        PhysicalVolume = Get-VolumeRoot $physical
+    }
+}
+
+function Set-SystemAppxDefaultVolume {
+    $systemVolume = Get-AppxSystemVolume
+    if (-not $systemVolume) { throw 'Windows 没有报告系统 AppX 卷。' }
+    $defaultVolume = Get-AppxDefaultVolume -ErrorAction SilentlyContinue
+    if (-not $defaultVolume -or
+        -not ([string]$defaultVolume.PackageStorePath).Equals([string]$systemVolume.PackageStorePath, [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not (Get-Command Set-AppxDefaultVolume -ErrorAction SilentlyContinue)) {
+            throw '当前 Windows 不提供 Set-AppxDefaultVolume，无法保证 Claude 重装到系统卷。'
+        }
+        Write-Log "正在把默认 AppX 安装卷改为系统卷：$($systemVolume.PackageStorePath)" INFO
+        Set-AppxDefaultVolume -Volume $systemVolume -Confirm:$false
+        $defaultVolume = Get-AppxDefaultVolume -ErrorAction Stop
+        if (-not ([string]$defaultVolume.PackageStorePath).Equals([string]$systemVolume.PackageStorePath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "设置默认 AppX 系统卷后复核失败：$($defaultVolume.PackageStorePath)"
+        }
+        Write-Log '默认 AppX 安装卷已设置并复核为系统卷。' OK
+    }
+    return $systemVolume
+}
+
+function Test-IsAppxPrivatePath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try { $full = [IO.Path]::GetFullPath($Path) } catch { return $false }
+    return $full -match '(?i)\\AppData\\Local\\Packages\\[^\\]+\\(?:LocalCache|LocalState|RoamingState)(?:\\|$)'
+}
+
+function ConvertTo-ClaudeUserDataPath {
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    try {
+        $expanded = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+        if (-not [IO.Path]::IsPathRooted($expanded)) { return $null }
+        return [IO.Path]::GetFullPath($expanded).TrimEnd('\')
+    } catch { return $null }
+}
+
+function Get-ClaudeUserDataPathFromCommandLine {
+    param([string]$CommandLine)
+    if (-not $CommandLine) { return $null }
+    $match = [regex]::Match($CommandLine, '(?i)(?:^|\s)--user-data-dir(?:=|\s+)(?:"(?<quoted>[^"]+)"|(?<bare>[^\s]+))')
+    if (-not $match.Success) { return $null }
+    $value = if ($match.Groups['quoted'].Success) { $match.Groups['quoted'].Value } else { $match.Groups['bare'].Value }
+    return ConvertTo-ClaudeUserDataPath $value
+}
+
+function Get-ClaudeProcessUserDataArgument {
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" -ErrorAction SilentlyContinue)) {
+        $commandLine = [string]$process.CommandLine
+        if (-not $commandLine) { continue }
+        $resolved = Get-ClaudeUserDataPathFromCommandLine $commandLine
+        if ($resolved) { return [pscustomobject]@{ Path = $resolved; Source = "Process:$($process.ProcessId):--user-data-dir" } }
+    }
+    return $null
+}
+
+function Get-ConfiguredClaudeUserData {
+    if ($script:DetectedClaudeUserData) { return $script:DetectedClaudeUserData }
+    $processArgument = Get-ClaudeProcessUserDataArgument
+    if ($processArgument) { $script:DetectedClaudeUserData = $processArgument; return $processArgument }
+    foreach ($scope in @('User', 'Process')) {
+        $value = if ($scope -eq 'User') {
+            [Environment]::GetEnvironmentVariable('CLAUDE_USER_DATA_DIR', [EnvironmentVariableTarget]::User)
+        } else { $env:CLAUDE_USER_DATA_DIR }
+        $resolved = ConvertTo-ClaudeUserDataPath $value
+        if ($resolved) {
+            $script:DetectedClaudeUserData = [pscustomobject]@{ Path = $resolved; Source = "Environment:$scope" }
+            return $script:DetectedClaudeUserData
+        }
+    }
+    return $null
 }
 
 function New-ClaudeInstallationCandidate {
@@ -324,13 +475,24 @@ function Get-ClaudePackage {
     return $null
 }
 
+function Test-AppxPackageOnSystemVolume {
+    param([Parameter(Mandatory)]$Package)
+    $systemVolume = Get-AppxSystemVolume
+    if (-not $systemVolume) { return $false }
+    $packageLocation = Get-AppxPackageLocationInfo $Package
+    $systemPhysicalPath = Get-FinalPath ([string]$systemVolume.PackageStorePath)
+    $systemPhysicalVolume = if ($systemPhysicalPath) {
+        Get-VolumeRoot $systemPhysicalPath
+    } else { Get-VolumeRoot ([string]$systemVolume.PackageStorePath) }
+    if (-not $packageLocation.ResolutionSucceeded -or -not $systemPhysicalVolume) { return $false }
+    return $packageLocation.PhysicalVolume.Equals($systemPhysicalVolume, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Test-ClaudeDefaultInstallationReady {
     param($Package = (Get-ClaudePackage))
     if (-not $Package -or -not $Package.InstallLocation) { return $false }
-    $systemVolume = Get-AppxSystemVolume
-    if (-not $systemVolume) { return $false }
-    $systemRoot = Get-VolumeRoot $systemVolume.PackageStorePath
-    if (-not $Package.InstallLocation.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not (Test-AppxPackageOnSystemVolume $Package)) { return $false }
+    if ((Get-AppxPackageLocationInfo $Package).IsRedirected) { return $false }
     $exe = Join-Path $Package.InstallLocation 'app\Claude.exe'
     $asar = Join-Path $Package.InstallLocation 'app\resources\app.asar'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or -not (Test-Path -LiteralPath $asar -PathType Leaf)) { return $false }
@@ -342,13 +504,19 @@ function Get-ClaudePaths {
     if (-not $package) { return $null }
     $app = Join-Path $package.InstallLocation 'app'
     $resources = Join-Path $app 'resources'
+    $packageLocalUserData = Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude"
+    $configuredUserData = Get-ConfiguredClaudeUserData
+    $activeUserData = if ($configuredUserData) { $configuredUserData.Path } else { $packageLocalUserData }
     return [pscustomobject]@{
         Package = $package
         App = $app
         Resources = $resources
         Exe = Join-Path $app 'Claude.exe'
         Asar = Join-Path $resources 'app.asar'
-        LocalUserData = Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude"
+        LocalUserData = $activeUserData
+        ActiveUserData = $activeUserData
+        ActiveUserDataSource = if ($configuredUserData) { $configuredUserData.Source } else { 'PackageLocalCache:default' }
+        PackageLocalUserData = $packageLocalUserData
         RoamingUserData = Join-Path $env:APPDATA 'Claude'
     }
 }
@@ -362,6 +530,20 @@ function Test-AnthropicSignature {
     $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { $null }
     $valid = $signature.Status -eq 'Valid' -and $subject -match 'Anthropic'
     return [pscustomobject]@{ Valid = $valid; Status = [string]$signature.Status; Subject = $subject }
+}
+
+function Test-ClaudeCoreSignatures {
+    $paths = Get-ClaudePaths
+    if (-not $paths) { return [pscustomobject]@{ Valid = $false; Claude = $null; Cowork = $null; CoworkPath = $null } }
+    $coworkPath = Join-Path $paths.Resources 'cowork-svc.exe'
+    $claudeSignature = Test-AnthropicSignature $paths.Exe
+    $coworkSignature = Test-AnthropicSignature $coworkPath
+    return [pscustomobject]@{
+        Valid = [bool]($claudeSignature.Valid -and $coworkSignature.Valid)
+        Claude = $claudeSignature
+        Cowork = $coworkSignature
+        CoworkPath = $coworkPath
+    }
 }
 
 function Test-FirmwareVirtualization {
@@ -417,7 +599,7 @@ function Get-AppxProtectedVmEvidence {
     if (-not $BundlePath) {
         $paths = Get-ClaudePaths
         if (-not $paths) {
-            return [pscustomobject]@{ Suspected = $false; ExplicitAppxError = $false; SessionDiskError = $false; EncryptedCount = 0; CopyfileUnknown = $false; Reasons = @() }
+            return [pscustomobject]@{ Suspected = $false; ExplicitAppxError = $false; SessionDiskError = $false; VirtualDiskEfsError = $false; EncryptedCount = 0; CopyfileUnknown = $false; Reasons = @() }
         }
         $BundlePath = Join-Path $paths.LocalUserData 'vm_bundles\claudevm.bundle'
     }
@@ -447,17 +629,20 @@ function Get-AppxProtectedVmEvidence {
     $combined = "$nodeText`n$serviceText"
     $explicitAppxError = [bool]($combined -match '(?i)(ERROR_APPX_FILE_NOT_ENCRYPTED|APPX file.+not encrypted|Win32\s+409|\b0x0*199\b)')
     $sessionDiskError = [bool]($serviceText -match '(?i)CreateVirtualDisk failed:\s*0x0*199')
+    $virtualDiskEfsError = [bool]($serviceText -match '(?i)CreateVirtualDisk failed:\s*0x0*1772\b')
     $copyfileUnknown = [bool]($nodeText -match "(?i)UNKNOWN: unknown error, copyfile '.+\\vm_bundles\\claudevm\.bundle\\")
-    $isPackagePrivate = $BundlePath -match '(?i)\\AppData\\Local\\Packages\\Claude_[^\\]+\\LocalCache\\'
+    $isPackagePrivate = Test-IsAppxPrivatePath $BundlePath
     $reasons = New-Object System.Collections.Generic.List[string]
     if ($encryptedCount -gt 0 -and $isPackagePrivate) { $reasons.Add("包私有 VM 路径有 $encryptedCount 个 Encrypted(0x4000) 项") }
     if ($explicitAppxError) { $reasons.Add('日志命中 ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)') }
     if ($sessionDiskError) { $reasons.Add('Cowork 服务创建 sessiondata.vhdx 时返回 0x199') }
+    if ($virtualDiskEfsError) { $reasons.Add('Cowork 服务创建 sessiondata.vhdx 时返回 0x1772（普通 EFS 候选）') }
     if ($copyfileUnknown) { $reasons.Add('包私有 VM 路径出现 UNKNOWN copyfile 提交失败') }
     return [pscustomobject]@{
         Suspected = [bool](($encryptedCount -gt 0 -and $isPackagePrivate) -or $explicitAppxError -or $copyfileUnknown)
         ExplicitAppxError = $explicitAppxError
         SessionDiskError = $sessionDiskError
+        VirtualDiskEfsError = $virtualDiskEfsError
         EncryptedCount = $encryptedCount
         CopyfileUnknown = $copyfileUnknown
         Reasons = $reasons.ToArray()
@@ -475,6 +660,7 @@ function Get-VmRebuildProtectionEvidence {
         Suspected = [bool]($results | Where-Object Suspected)
         ExplicitAppxError = [bool]($results | Where-Object ExplicitAppxError)
         SessionDiskError = [bool]($results | Where-Object SessionDiskError)
+        VirtualDiskEfsError = [bool]($results | Where-Object VirtualDiskEfsError)
         EncryptedCount = [int](($results | Measure-Object -Property EncryptedCount -Sum).Sum)
         CopyfileUnknown = [bool]($results | Where-Object CopyfileUnknown)
         Reasons = $reasons
@@ -501,6 +687,249 @@ namespace ClaudeSetup {
         $message = (New-Object ComponentModel.Win32Exception($errorCode)).Message
         throw "无法解密 EFS 路径：$Path（Win32 $errorCode：$message）"
     }
+}
+
+function Test-SafeIndependentClaudeUserDataPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $full = ConvertTo-ClaudeUserDataPath $Path
+    $localRoot = ConvertTo-ClaudeUserDataPath $env:LOCALAPPDATA
+    if (-not $full -or -not $localRoot) { return $false }
+    if (-not $full.StartsWith($localRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (Test-IsAppxPrivatePath $full) { return $false }
+    if ($full -match '(?i)\\WindowsApps(?:\\|$)') { return $false }
+    $cursor = $full
+    while ($cursor -and $cursor.StartsWith($localRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        if ((Test-Path -LiteralPath $cursor) -and (Test-ReparsePoint $cursor)) { return $false }
+        if ($cursor.Equals($localRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $cursor = Split-Path -Parent $cursor
+    }
+    return $true
+}
+
+function Get-IndependentUserDataState {
+    if (-not (Test-Path -LiteralPath $script:IndependentUserDataStatePath -PathType Leaf)) { return $null }
+    try { return Get-Content -LiteralPath $script:IndependentUserDataStatePath -Raw | ConvertFrom-Json } catch { return $null }
+}
+
+function Save-IndependentUserDataState {
+    param([Parameter(Mandatory)][string]$Path, [string]$Source, [bool]$CreatedByTool)
+    New-Item -ItemType Directory -Path $script:ProgramDataRoot -Force | Out-Null
+    [pscustomobject]@{
+        Schema = 1
+        Path = (ConvertTo-ClaudeUserDataPath $Path)
+        Source = $Source
+        CreatedByTool = $CreatedByTool
+        CreatedAt = (Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json | Set-Content -LiteralPath $script:IndependentUserDataStatePath -Encoding UTF8
+}
+
+function Get-ClaudeEncryptedItems {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $items = New-Object System.Collections.Generic.List[object]
+    $rootItem = Get-Item -LiteralPath $Path -Force
+    if ($rootItem.Attributes -band [IO.FileAttributes]::Encrypted) { $items.Add($rootItem) }
+    foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue)) {
+        if ($item.Attributes -band [IO.FileAttributes]::Encrypted) { $items.Add($item) }
+    }
+    return $items.ToArray()
+}
+
+function Test-ClaudeEncryptedFilesReadable {
+    param([object[]]$Items)
+    foreach ($item in @($Items | Where-Object { -not $_.PSIsContainer })) {
+        $stream = $null
+        try {
+            $stream = [IO.File]::Open($item.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            if ($stream.Length -gt 0) { [void]$stream.ReadByte() }
+        } catch { return $false }
+        finally { if ($stream) { $stream.Dispose() } }
+    }
+    return $true
+}
+
+function Get-ClaudeUserDataProtectionKind {
+    param(
+        [int]$EncryptedCount,
+        [bool]$IsAppxPrivate,
+        [bool]$AppxError,
+        [bool]$SafeIndependentPath,
+        [bool]$IsConfigured,
+        [bool]$CurrentUserReadable,
+        [bool]$VirtualDisk1772,
+        [bool]$ToolManaged
+    )
+    if ($EncryptedCount -le 0) { return 'None' }
+    if ($IsAppxPrivate -or ($AppxError -and -not $SafeIndependentPath)) { return 'AppxProtected' }
+    if ($SafeIndependentPath -and $IsConfigured -and $CurrentUserReadable -and ($VirtualDisk1772 -or $ToolManaged)) {
+        return 'ConfirmedUserEfs'
+    }
+    return 'EncryptedUnknown'
+}
+
+function Get-ClaudeUserDataProtectionEvidence {
+    param(
+        [Parameter(Mandatory)][string]$UserDataPath,
+        [string]$ServiceLogPath = 'C:\ProgramData\Claude\Logs\cowork-service.log',
+        [string[]]$NodeLogPaths
+    )
+    $full = ConvertTo-ClaudeUserDataPath $UserDataPath
+    $items = @(Get-ClaudeEncryptedItems $full)
+    if (-not $NodeLogPaths) {
+        $NodeLogPaths = @(
+            (Join-Path $full 'logs\cowork_vm_node.log'),
+            (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
+            (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log')
+        )
+    }
+    $text = @($NodeLogPaths + @($ServiceLogPath) | Select-Object -Unique | ForEach-Object {
+        if ($_ -and (Test-Path -LiteralPath $_ -PathType Leaf)) {
+            (Get-Content -LiteralPath $_ -Tail 1200 -ErrorAction SilentlyContinue) -join "`n"
+        }
+    }) -join "`n"
+    $appxError = [bool]($text -match '(?i)(ERROR_APPX_FILE_NOT_ENCRYPTED|Win32\s+409|\b0x0*199\b)')
+    $virtualDisk1772 = [bool]($text -match '(?i)CreateVirtualDisk failed:\s*0x0*1772\b')
+    $isAppxPrivate = Test-IsAppxPrivatePath $full
+    $safeIndependent = Test-SafeIndependentClaudeUserDataPath $full
+    $configured = Get-ConfiguredClaudeUserData
+    $isConfigured = [bool]($configured -and $configured.Path.Equals($full, [StringComparison]::OrdinalIgnoreCase))
+    $state = Get-IndependentUserDataState
+    $statePath = if ($state) { ConvertTo-ClaudeUserDataPath ([string]$state.Path) } else { $null }
+    $toolManaged = [bool]($statePath -and $statePath.Equals($full, [StringComparison]::OrdinalIgnoreCase) -and $state.CreatedByTool)
+    $readable = Test-ClaudeEncryptedFilesReadable $items
+    $kind = Get-ClaudeUserDataProtectionKind -EncryptedCount $items.Count -IsAppxPrivate $isAppxPrivate `
+        -AppxError $appxError -SafeIndependentPath $safeIndependent -IsConfigured $isConfigured `
+        -CurrentUserReadable $readable -VirtualDisk1772 $virtualDisk1772 -ToolManaged $toolManaged
+    return [pscustomobject]@{
+        Path = $full
+        Kind = $kind
+        EncryptedCount = $items.Count
+        Items = $items
+        IsAppxPrivate = $isAppxPrivate
+        SafeIndependentPath = $safeIndependent
+        IsConfigured = $isConfigured
+        ToolManaged = $toolManaged
+        CurrentUserReadable = $readable
+        AppxError = $appxError
+        VirtualDisk1772 = $virtualDisk1772
+    }
+}
+
+function Copy-ClaudeProfileData {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { return $false }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $excludedDirectories = @(
+        'vm_bundles', 'Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'Crashpad',
+        'logs', 'blob_storage', 'CacheStorage', 'Temp', 'tmp'
+    )
+    $arguments = @(
+        $Source, $Destination, '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1',
+        '/XJ', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/XD'
+    ) + $excludedDirectories + @('/XF', '*.tmp', '*.partial', '*.lock')
+    & robocopy.exe @arguments | Out-Null
+    $code = $LASTEXITCODE
+    if ($code -ge 8) { throw "迁移 Claude 用户配置失败，robocopy 退出码 $code。原 AppX 数据未被删除。" }
+    return [bool](Get-ChildItem -LiteralPath $Destination -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
+function Publish-UserEnvironmentChange {
+    if (-not ('ClaudeSetup.NativeEnvironment' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace ClaudeSetup {
+    public static class NativeEnvironment {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(
+            IntPtr window, uint message, UIntPtr wParam, string lParam,
+            uint flags, uint timeout, out UIntPtr result);
+        public static void Broadcast() {
+            UIntPtr result;
+            SendMessageTimeout(new IntPtr(0xffff), 0x001A, UIntPtr.Zero, "Environment", 0x0002, 5000, out result);
+        }
+    }
+}
+'@
+    }
+    try { [ClaudeSetup.NativeEnvironment]::Broadcast() } catch { Write-Log "无法广播用户环境变量变更：$($_.Exception.Message)" WARN }
+}
+
+function Initialize-ClaudeIndependentUserData {
+    param(
+        [string]$TargetPath = $script:DefaultIndependentUserData,
+        [string[]]$SourcePaths
+    )
+    $target = ConvertTo-ClaudeUserDataPath $TargetPath
+    if (-not (Test-SafeIndependentClaudeUserDataPath $target)) {
+        throw "独立 Claude 数据目录不满足安全边界（必须位于 LocalAppData、非 Packages/WindowsApps、非重解析路径）：$target"
+    }
+    if (-not $SourcePaths) {
+        $paths = Get-ClaudePaths
+        $SourcePaths = if ($paths) { @($paths.PackageLocalUserData, $paths.RoamingUserData) } else { @() }
+    }
+    if (-not (Test-Path -LiteralPath $target)) {
+        $stage = "$target.staging-$([guid]::NewGuid().ToString('N'))"
+        try {
+            New-Item -ItemType Directory -Path $stage -Force | Out-Null
+            $sourceUsed = $null
+            foreach ($source in @($SourcePaths | Where-Object { $_ } | Select-Object -Unique)) {
+                if ((Test-Path -LiteralPath $source -PathType Container) -and
+                    -not (ConvertTo-ClaudeUserDataPath $source).Equals($target, [StringComparison]::OrdinalIgnoreCase)) {
+                    if (Copy-ClaudeProfileData -Source $source -Destination $stage) { $sourceUsed = $source; break }
+                }
+            }
+            if (Test-Path -LiteralPath (Join-Path $stage 'vm_bundles')) {
+                throw '安全迁移不应复制旧 VM bundle。'
+            }
+            Move-Item -LiteralPath $stage -Destination $target
+            Write-Log "已建立独立 Claude 数据目录（未复制 VM、缓存和临时文件）：$target" OK
+            Save-IndependentUserDataState -Path $target -Source $sourceUsed -CreatedByTool $true
+        } finally {
+            if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    } else {
+        if (Test-ReparsePoint $target) { throw "拒绝使用重解析点作为独立 Claude 数据目录：$target" }
+        $existingState = Get-IndependentUserDataState
+        $existingStatePath = if ($existingState) { ConvertTo-ClaudeUserDataPath ([string]$existingState.Path) } else { $null }
+        $previouslyManaged = [bool]($existingStatePath -and $existingStatePath.Equals($target, [StringComparison]::OrdinalIgnoreCase) -and $existingState.CreatedByTool)
+        if (-not (Get-ChildItem -LiteralPath $target -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+            foreach ($source in @($SourcePaths | Where-Object { $_ } | Select-Object -Unique)) {
+                if (Copy-ClaudeProfileData -Source $source -Destination $target) { break }
+            }
+        }
+        Save-IndependentUserDataState -Path $target -Source 'Existing' -CreatedByTool $previouslyManaged
+    }
+    [Environment]::SetEnvironmentVariable('CLAUDE_USER_DATA_DIR', $target, [EnvironmentVariableTarget]::User)
+    $env:CLAUDE_USER_DATA_DIR = $target
+    $script:DetectedClaudeUserData = [pscustomobject]@{ Path = $target; Source = 'Environment:User:ClaudeSetup' }
+    Publish-UserEnvironmentChange
+    Write-Log "已设置当前用户 CLAUDE_USER_DATA_DIR：$target" OK
+    return $target
+}
+
+function Repair-ConfirmedIndependentUserDataEfs {
+    param([Parameter(Mandatory)][string]$UserDataPath)
+    $evidence = Get-ClaudeUserDataProtectionEvidence -UserDataPath $UserDataPath
+    if ($evidence.EncryptedCount -eq 0) { return $true }
+    if ($evidence.Kind -ne 'ConfirmedUserEfs') {
+        Write-Log "数据目录带 Encrypted(0x4000)，但证据不足以确认普通用户 EFS，拒绝解密：$($evidence.Path)；分类=$($evidence.Kind)" WARN
+        return $false
+    }
+    Write-Log "确认独立数据目录属于当前用户可读的普通 EFS（共 $($evidence.EncryptedCount) 项），准备安全解密。" WARN
+    Stop-ClaudeProcesses
+    Stop-CoworkVmServiceAndWait
+    $directories = @($evidence.Items | Where-Object PSIsContainer | Sort-Object { $_.FullName.Length })
+    $files = @($evidence.Items | Where-Object { -not $_.PSIsContainer })
+    foreach ($item in @($directories + $files)) { Invoke-EfsDecrypt -Path $item.FullName }
+    $remaining = @(Get-ClaudeEncryptedItems $evidence.Path)
+    if ($remaining.Count -gt 0) { throw "普通 EFS 解密后仍有 $($remaining.Count) 个加密项：$($evidence.Path)" }
+    Write-Log '独立 Claude 数据目录的普通 EFS 已解除并复核。' OK
+    return $true
 }
 
 function Test-VmRuntimeEfsItem {
@@ -649,7 +1078,7 @@ function Get-VmBundleCandidateDirectories {
     if (-not $paths) { return @() }
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $result = New-Object System.Collections.Generic.List[string]
-    foreach ($userData in @($paths.LocalUserData, $paths.RoamingUserData)) {
+    foreach ($userData in @($paths.ActiveUserData, $paths.PackageLocalUserData, $paths.RoamingUserData)) {
         $bundle = [IO.Path]::GetFullPath((Join-Path $userData 'vm_bundles\claudevm.bundle'))
         if ($seen.Add($bundle)) { $result.Add($bundle) }
     }
@@ -1013,6 +1442,14 @@ function Sync-VerifiedVmFile {
 
 function Repair-MsixVmCommitFailure {
     param([Parameter(Mandatory)]$State)
+    $statePaths = @([string]$State.OriginalPath, [string]$State.BackupPath)
+    if (@($statePaths | Where-Object { Test-IsAppxPrivatePath $_ }).Count -gt 0) {
+        if (-not $script:AppxProtectionLogEmitted) {
+            Write-Log 'VM 重建状态指向 AppX 包私有目录；无论文件属性如何，都禁止外部转正、解压或同步。' ERROR
+            $script:AppxProtectionLogEmitted = $true
+        }
+        return $false
+    }
     $protection = Get-VmRebuildProtectionEvidence -State $State
     if ($protection.Suspected) {
         if (-not $script:AppxProtectionLogEmitted) {
@@ -1265,17 +1702,20 @@ function Get-RecentCoworkErrors {
         'EXDEV',
         'UNKNOWN: unknown error, copyfile',
         'CreateVirtualDisk failed: 0x199',
+        'CreateVirtualDisk failed: 0x1772',
         'ERROR_APPX_FILE_NOT_ENCRYPTED',
         'rootfs.vhdx.tmp',
         'API reachability',
         'VM service not running',
         'Missing HCS'
     )
+    $configured = Get-ConfiguredClaudeUserData
     $logs = @(
         'C:\ProgramData\Claude\Logs\cowork-service.log',
         (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
-        (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log')
-    )
+        (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log'),
+        $(if ($configured) { Join-Path $configured.Path 'logs\cowork_vm_node.log' })
+    ) | Where-Object { $_ } | Select-Object -Unique
     $results = New-Object System.Collections.Generic.List[string]
     foreach ($log in $logs) {
         if (-not (Test-Path -LiteralPath $log)) { continue }
@@ -1371,27 +1811,66 @@ function Invoke-Diagnostics {
     if ($package) {
         Add-Finding 'installation-selection' 'Pass' "已自动选择官方 MSIX：$($selectedInstallation.Path)" "候选数量：$($installations.Count)，签名：$($selectedInstallation.SignatureStatus)，Cowork：$($selectedInstallation.CoworkCapable)"
         Add-Finding 'package' 'Pass' "Claude $($package.Version) 已安装" $package.InstallLocation
-        if ($systemVolume -and -not $package.InstallLocation.StartsWith((Get-VolumeRoot $systemVolume.PackageStorePath), [StringComparison]::OrdinalIgnoreCase)) {
-            Add-Finding 'package-volume' 'Fail' 'Claude 不在系统 AppX 卷' $package.InstallLocation
+        $location = Get-AppxPackageLocationInfo $package
+        $locationDetail = "注册路径：$($location.RegisteredPath)`r`n最终物理路径：$($location.PhysicalPath)`r`n注册卷：$($location.RegisteredVolume)`r`n物理卷：$($location.PhysicalVolume)`r`n重定向：$($location.IsRedirected)"
+        if (-not $location.ResolutionSucceeded) {
+            Add-Finding 'package-physical-path' 'Fail' '无法解析 Claude AppX 的最终物理安装位置' $locationDetail
+        } elseif ($location.IsRedirected) {
+            Add-Finding 'package-physical-path' 'Fail' 'Claude AppX 注册路径包含重解析重定向' $locationDetail
         } else {
-            Add-Finding 'package-volume' 'Pass' 'Claude 位于系统 AppX 卷'
+            Add-Finding 'package-physical-path' 'Pass' 'Claude AppX 注册路径与最终物理路径一致' $locationDetail
+        }
+        if ($systemVolume -and -not (Test-AppxPackageOnSystemVolume $package)) {
+            Add-Finding 'package-volume' 'Fail' 'Claude 的最终物理位置不在系统 AppX 卷' $locationDetail
+        } else {
+            Add-Finding 'package-volume' 'Pass' 'Claude 的最终物理位置位于系统 AppX 卷' $locationDetail
         }
 
         $signature = Test-AnthropicSignature $paths.Exe
         if ($signature.Valid) { Add-Finding 'signature' 'Pass' 'Claude.exe 的 Anthropic 数字签名有效' }
         else { Add-Finding 'signature' 'Fail' "Claude.exe 签名无效：$($signature.Status)" '完整汉化修改主程序后会导致 Cowork 主动关闭 RPC 管道。' }
+        $coworkSignature = Test-AnthropicSignature (Join-Path $paths.Resources 'cowork-svc.exe')
+        if ($coworkSignature.Valid) { Add-Finding 'cowork-signature' 'Pass' 'cowork-svc.exe 的 Anthropic 数字签名有效' }
+        else { Add-Finding 'cowork-signature' 'Fail' "cowork-svc.exe 签名无效：$($coworkSignature.Status)" }
 
-        $bundle = Join-Path $paths.LocalUserData 'vm_bundles\claudevm.bundle'
-        $appxProtection = Get-AppxProtectedVmEvidence -BundlePath $bundle
+        Add-Finding 'user-data-selection' 'Info' "Claude 活动数据目录：$($paths.ActiveUserData)" "来源：$($paths.ActiveUserDataSource)`r`n包私有默认目录：$($paths.PackageLocalUserData)"
+        if (-not (Test-IsAppxPrivatePath $paths.ActiveUserData) -and (Test-SafeIndependentClaudeUserDataPath $paths.ActiveUserData)) {
+            Add-Finding 'user-data-layout' 'Pass' 'Claude 使用非虚拟化独立数据目录' $paths.ActiveUserData
+        } elseif (Test-IsAppxPrivatePath $paths.ActiveUserData) {
+            Add-Finding 'user-data-layout' 'Info' 'Claude 使用 AppX 包私有默认数据目录' $paths.ActiveUserData
+        } else {
+            Add-Finding 'user-data-layout' 'Warning' 'Claude 数据目录不满足自动修复的安全路径边界' $paths.ActiveUserData
+        }
+
+        $bundle = Join-Path $paths.ActiveUserData 'vm_bundles\claudevm.bundle'
+        $packageBundle = Join-Path $paths.PackageLocalUserData 'vm_bundles\claudevm.bundle'
+        $appxProtection = Get-AppxProtectedVmEvidence -BundlePath $packageBundle
+        $usingIndependentUserData = -not (Test-IsAppxPrivatePath $paths.ActiveUserData)
         $sessionDiskPresent = Test-Path -LiteralPath (Join-Path $bundle 'sessiondata.vhdx') -PathType Leaf
-        if ($appxProtection.SessionDiskError -and -not $sessionDiskPresent) {
+        if ($appxProtection.SessionDiskError -and $usingIndependentUserData) {
+            Add-Finding 'appx-session-vhdx-history' 'Info' '包私有旧目录含 CreateVirtualDisk 0x199；当前已切换独立数据目录' '以当前活动目录的 VM 深度健康检查为准。'
+        } elseif ($appxProtection.SessionDiskError -and -not $sessionDiskPresent) {
             Add-Finding 'appx-session-vhdx' 'Fail' 'Cowork 创建 sessiondata.vhdx 时返回 ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)' '这是 AppX 应用受保护存储与当前 Cowork VHD 创建路径的不兼容证据；本工具不会解密、移动或外部写入 bundle。请向 Anthropic 提交 cowork-service.log。'
         } elseif ($appxProtection.SessionDiskError) {
             Add-Finding 'appx-session-vhdx-history' 'Info' '历史日志含 CreateVirtualDisk 0x199，但当前 sessiondata.vhdx 已存在' '保留历史证据；以本轮 Cowork 健康检查为准。'
+        } elseif ($appxProtection.ExplicitAppxError -and $usingIndependentUserData) {
+            Add-Finding 'appx-protected-storage-history' 'Info' '包私有旧目录命中过 AppX 409，但当前已使用独立数据目录' ($appxProtection.Reasons -join "`r`n")
         } elseif ($appxProtection.ExplicitAppxError) {
             Add-Finding 'appx-protected-storage' 'Fail' '日志命中 ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)' ($appxProtection.Reasons -join "`r`n")
+        } elseif ($appxProtection.Suspected -and $usingIndependentUserData) {
+            Add-Finding 'appx-protected-storage-history' 'Info' '包私有旧目录有受保护存储迹象，当前独立数据目录不受其阻断' ($appxProtection.Reasons -join "`r`n")
         } elseif ($appxProtection.Suspected) {
             Add-Finding 'appx-protected-storage' 'Warning' '检测到 AppX 应用受保护存储迹象；已禁用自动 EFS/重建/外部写入修复' ($appxProtection.Reasons -join "`r`n")
+        }
+        $userDataProtection = Get-ClaudeUserDataProtectionEvidence -UserDataPath $paths.ActiveUserData
+        if ($userDataProtection.Kind -eq 'ConfirmedUserEfs') {
+            Add-Finding 'user-data-efs' 'Fail' "独立数据目录有 $($userDataProtection.EncryptedCount) 个普通用户 EFS 项" 'Auto/Repair 会在停止 Claude 与 Cowork 服务后调用 Unicode DecryptFileW，并在结束后复核。'
+        } elseif ($userDataProtection.Kind -eq 'EncryptedUnknown') {
+            Add-Finding 'user-data-efs' 'Warning' "数据目录有 $($userDataProtection.EncryptedCount) 个加密项，但无法安全确认为普通 EFS" '保持原样；不会仅凭 Encrypted(0x4000) 解密。'
+        } elseif ($userDataProtection.Kind -eq 'AppxProtected') {
+            Add-Finding 'user-data-efs' 'Info' '活动/候选数据命中 AppX 应用受保护加密证据' '不会调用 EFS 解密。'
+        } elseif (Test-Path -LiteralPath $paths.ActiveUserData) {
+            Add-Finding 'user-data-efs' 'Pass' '活动 Claude 数据目录没有加密项'
         }
         if (Test-ReparsePoint (Split-Path -Parent $bundle)) { Add-Finding 'vm-reparse' 'Fail' 'vm_bundles 是重解析点/联接' 'HCS 挂载 VHDX 时可能无法解析联接。' }
         elseif (Test-Path -LiteralPath $bundle) { Add-Finding 'vm-reparse' 'Pass' 'vm_bundles 不是重解析点' }
@@ -1427,7 +1906,13 @@ function Invoke-Diagnostics {
         $bundleCandidates = @(Get-VmBundleCandidateDirectories)
         for ($index = 0; $index -lt $bundleCandidates.Count; $index++) {
             $candidate = $bundleCandidates[$index]
-            $label = if ($index -eq 0) { 'package-localcache' } else { 'real-roaming' }
+            $activeBundle = [IO.Path]::GetFullPath((Join-Path $paths.ActiveUserData 'vm_bundles\claudevm.bundle'))
+            $packageLocalBundle = [IO.Path]::GetFullPath((Join-Path $paths.PackageLocalUserData 'vm_bundles\claudevm.bundle'))
+            $label = if ($candidate.Equals($activeBundle, [StringComparison]::OrdinalIgnoreCase)) {
+                'active-user-data'
+            } elseif ($candidate.Equals($packageLocalBundle, [StringComparison]::OrdinalIgnoreCase)) {
+                'package-localcache'
+            } else { 'real-roaming' }
             if (Test-Path -LiteralPath $candidate) {
                 $inventory = @(Get-ChildItem -LiteralPath $candidate -Force -File -ErrorAction SilentlyContinue |
                     Sort-Object Name |
@@ -1516,12 +2001,7 @@ function Enable-CoworkPrerequisites {
         $script:NeedsRestart = $true
     }
 
-    $systemVolume = Get-AppxSystemVolume
-    $defaultVolume = Get-AppxDefaultVolume -ErrorAction SilentlyContinue
-    if ($systemVolume -and $defaultVolume -and $defaultVolume.PackageStorePath -ne $systemVolume.PackageStorePath) {
-        Write-Log "正在把默认 AppX 安装卷改为系统卷：$($systemVolume.PackageStorePath)" INFO
-        Set-AppxDefaultVolume -Volume $systemVolume
-    }
+    [void](Set-SystemAppxDefaultVolume)
 
     $tempRoot = Get-VolumeRoot $env:TEMP
     $localRoot = Get-VolumeRoot $env:LOCALAPPDATA
@@ -1645,8 +2125,16 @@ function Install-OfficialClaude {
             (Test-Path -LiteralPath (Join-Path $registeredPackage.InstallLocation 'app\resources\app.asar') -PathType Leaf)
     }
     if ($registeredPackage -and -not $registeredCorePresent) {
-        Write-Log '发现 AppX 注册残留，但默认目录或核心文件缺失；保留应用数据后重新安装。' WARN
-        Remove-AppxPackage -Package $registeredPackage.PackageFullName -PreserveApplicationData
+        Write-Log '发现 AppX 注册残留，但默认目录或核心文件缺失；先迁移可保留的用户配置，再重新安装。' WARN
+        $packageData = Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude"
+        $independentData = Initialize-ClaudeIndependentUserData -SourcePaths @($packageData, (Join-Path $env:APPDATA 'Claude'))
+        if (-not (Repair-ConfirmedIndependentUserDataEfs -UserDataPath $independentData) -and
+            @(Get-ClaudeEncryptedItems $independentData).Count -gt 0) {
+            throw '独立数据目录仍含无法安全分类的加密项，禁止移除损坏 AppX 注册。'
+        }
+        Stop-CoworkVmServiceAndWait
+        if (-not (Test-AnthropicSignature $Download.Path).Valid) { throw '移除损坏 AppX 注册前，官方 MSIX 签名复核失败。' }
+        Remove-AppxPackage -Package $registeredPackage.PackageFullName -Confirm:$false
         $script:InstallationCandidateCache = $null
         $registeredPackage = $null
     }
@@ -1679,6 +2167,16 @@ function Install-OfficialClaude {
         try { Add-AppxPackage @parameters } catch {}
     }
     $script:InstallationCandidateCache = $null
+    $installedAfter = Get-ClaudePackage
+    if (-not $installedAfter) { throw '官方 MSIX 部署后没有检测到当前用户 Claude AppX 注册。' }
+    if (-not (Test-AppxPackageOnSystemVolume $installedAfter)) {
+        $locationAfter = Get-AppxPackageLocationInfo $installedAfter
+        throw "官方 MSIX 部署后最终物理位置仍不在系统卷：注册=$($locationAfter.RegisteredPath)；物理=$($locationAfter.PhysicalPath)"
+    }
+    $locationAfter = Get-AppxPackageLocationInfo $installedAfter
+    if ($locationAfter.IsRedirected) {
+        throw "官方 MSIX 部署后包目录仍被重解析重定向：注册=$($locationAfter.RegisteredPath)；物理=$($locationAfter.PhysicalPath)"
+    }
 }
 
 function Backup-ModifiedClaudeFiles {
@@ -1764,6 +2262,7 @@ function Repair-ClaudePackageAndSignature {
         Write-Log '未在官方默认系统 AppX 路径检测到健康 Claude，将自动下载安装。' WARN
     }
     $download = Download-OfficialClaude
+    Repair-ExistingPackageVolume -Download $download
     Install-OfficialClaude -Download $download
     $paths = Get-ClaudePaths
     if (-not $paths) { throw '安装后仍未找到 Claude AppX 包。' }
@@ -1780,25 +2279,77 @@ function Repair-ClaudePackageAndSignature {
 }
 
 function Repair-ExistingPackageVolume {
+    param($Download)
     $paths = Get-ClaudePaths
     if (-not $paths) { return }
-    $systemVolume = Get-AppxSystemVolume
-    if (-not $systemVolume) { return }
-    $systemRoot = Get-VolumeRoot $systemVolume.PackageStorePath
-    if ($paths.Package.InstallLocation.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)) { return }
+    $systemVolume = Set-SystemAppxDefaultVolume
+    $location = Get-AppxPackageLocationInfo $paths.Package
+    if ((Test-AppxPackageOnSystemVolume $paths.Package) -and -not $location.IsRedirected) { return }
 
-    Write-Log "Claude 位于非官方默认系统 AppX 路径：$($paths.Package.InstallLocation)" WARN
-    if (-not (Get-Command Move-AppxPackage -ErrorAction SilentlyContinue)) {
-        throw '当前 Windows 版本不提供 Move-AppxPackage。请先备份本地 Cowork 会话，卸载 Claude，把默认 AppX 卷设为系统卷后再运行本脚本。'
-    }
-    Write-Log '尝试使用 Windows Move-AppxPackage 移至系统卷。' INFO
+    Write-Log "Claude AppX 物理位置异常：注册=$($location.RegisteredPath)；物理=$($location.PhysicalPath)；目标=$($systemVolume.PackageStorePath)" WARN
     Stop-ClaudeProcesses
-    try {
-        Move-AppxPackage -Package $paths.Package.PackageFullName -Volume $systemVolume
-        $script:InstallationCandidateCache = $null
-    } catch {
-        throw "无法安全移动 Claude AppX 包。请先备份本地 Cowork 会话，再卸载并用本脚本重装。错误：$($_.Exception.Message)"
+    Stop-CoworkVmServiceAndWait
+    $moveError = $null
+    if (Get-Command Move-AppxPackage -ErrorAction SilentlyContinue) {
+        try {
+            Write-Log '尝试使用 Windows Move-AppxPackage 移至系统卷。' INFO
+            Move-AppxPackage -Package $paths.Package.PackageFullName -Volume $systemVolume -Confirm:$false
+            $script:InstallationCandidateCache = $null
+            $moved = Get-ClaudePackage
+            if ($moved -and (Test-AppxPackageOnSystemVolume $moved)) {
+                $movedLocation = Get-AppxPackageLocationInfo $moved
+                if (-not $movedLocation.IsRedirected) {
+                    Write-Log "Claude 已移动到系统 AppX 卷并通过物理路径复核：$($movedLocation.PhysicalPath)" OK
+                    return
+                }
+            }
+            $moveError = 'Move-AppxPackage 返回后，最终物理路径复核仍未通过。'
+        } catch { $moveError = $_.Exception.Message }
+    } else { $moveError = '当前 Windows 不提供 Move-AppxPackage。' }
+
+    if (-not $Download) {
+        throw "Claude AppX 移动失败，且尚未准备好签名有效的官方 MSIX，禁止卸载。错误：$moveError"
     }
+    Write-Log "Move-AppxPackage 失败，将执行带配置迁移保护的官方卸载重装回退：$moveError" WARN
+    $independentData = Initialize-ClaudeIndependentUserData -SourcePaths @($paths.PackageLocalUserData, $paths.RoamingUserData)
+    if (-not (Repair-ConfirmedIndependentUserDataEfs -UserDataPath $independentData)) {
+        $remaining = @(Get-ClaudeEncryptedItems $independentData)
+        if ($remaining.Count -gt 0) { throw '独立数据目录仍含无法安全分类的加密项，禁止卸载现有 AppX 包。' }
+    }
+    if (-not (Test-Path -LiteralPath $Download.Path -PathType Leaf) -or -not (Test-AnthropicSignature $Download.Path).Valid) {
+        throw '卸载前的官方 MSIX 签名复核失败，保留当前 AppX 包。'
+    }
+    Remove-AppxPackage -Package $paths.Package.PackageFullName -Confirm:$false
+    $script:InstallationCandidateCache = $null
+    if (Get-AppxPackage -Name $script:PackageName -ErrorAction SilentlyContinue) {
+        throw '卸载错位 Claude AppX 后仍检测到当前用户注册包，停止重装。'
+    }
+    Write-Log '错位 Claude AppX 已卸载；用户配置保存在独立目录，下一步使用已验证官方 MSIX 安装到系统卷。' OK
+}
+
+function Repair-ClaudeUserDataLayout {
+    $paths = Get-ClaudePaths
+    if (-not $paths) { return $null }
+    $packageBundle = Join-Path $paths.PackageLocalUserData 'vm_bundles\claudevm.bundle'
+    $appxProtection = Get-AppxProtectedVmEvidence -BundlePath $packageBundle
+    $packageBundleStatus = Get-VmBundleStatus -BundlePath $packageBundle
+    $requiresIndependentData = [bool]((-not $packageBundleStatus.Ready) -and
+        ($appxProtection.ExplicitAppxError -or $appxProtection.CopyfileUnknown -or $appxProtection.SessionDiskError))
+    if ($requiresIndependentData -and (Test-IsAppxPrivatePath $paths.ActiveUserData)) {
+        Write-Log "包私有 VM 存储命中 AppX 409/UNKNOWN 保护证据，切换到独立数据目录；原包私有数据保持不动：$($appxProtection.Reasons -join '；')" WARN
+        [void](Initialize-ClaudeIndependentUserData -SourcePaths @($paths.PackageLocalUserData, $paths.RoamingUserData))
+        $paths = Get-ClaudePaths
+    }
+    if (-not (Test-IsAppxPrivatePath $paths.ActiveUserData)) {
+        if (-not (Test-SafeIndependentClaudeUserDataPath $paths.ActiveUserData)) {
+            throw "配置的 Claude 数据目录不满足自动修复安全边界：$($paths.ActiveUserData)"
+        }
+        if (-not (Repair-ConfirmedIndependentUserDataEfs -UserDataPath $paths.ActiveUserData)) {
+            $remaining = @(Get-ClaudeEncryptedItems $paths.ActiveUserData)
+            if ($remaining.Count -gt 0) { throw '独立 Claude 数据目录仍有无法确认类型的加密项；保持原样并停止。' }
+        }
+    }
+    return $paths.ActiveUserData
 }
 
 function Repair-VmStorageAttributes {
@@ -2007,6 +2558,12 @@ function Invoke-HealthWait {
         [int]$HandshakeSeconds = 45,
         [int]$VmSeconds = 120
     )
+    $coreSignatures = Test-ClaudeCoreSignatures
+    if (-not $coreSignatures.Valid) {
+        Write-Log "深度验证前签名复核失败：Claude=$($coreSignatures.Claude.Status)，cowork-svc=$($coreSignatures.Cowork.Status)" ERROR
+        return $false
+    }
+    Write-Log 'Claude.exe 与 cowork-svc.exe 的 Anthropic 数字签名均有效。' OK
     $serviceLog = 'C:\ProgramData\Claude\Logs\cowork-service.log'
     $mainProcess = Get-Process -Name Claude -ErrorAction SilentlyContinue |
         Where-Object { $_.MainWindowHandle -ne 0 } |
@@ -2017,6 +2574,10 @@ function Invoke-HealthWait {
     $vmDeadline = $null
     $handshakePassed = $false
     $vmRequested = $false
+    $vmStarted = $false
+    $networkConnected = $false
+    $apiReachable = $false
+    $daemonReady = $false
     while ((Get-Date) -lt $handshakeDeadline -or ($vmDeadline -and (Get-Date) -lt $vmDeadline)) {
         if (Test-Path -LiteralPath $serviceLog) {
             $tail = Get-Content -LiteralPath $serviceLog -Tail 160 -ErrorAction SilentlyContinue
@@ -2025,21 +2586,27 @@ function Invoke-HealthWait {
                 $stamp = [datetime]::MinValue
                 return [datetime]::TryParse($Matches.stamp, [ref]$stamp) -and $stamp -ge $cutoff
             })
-            if ($currentRun -match 'Client signature verified:' -and $currentRun -match 'Persistent RPC: entering loop') {
+            $hasVmActivity = [bool]($currentRun -match 'Configuring VM for user=|Creating HCS compute system|Starting compute system|VM started successfully')
+            if ($currentRun -match 'Client signature verified:' -and
+                ($currentRun -match 'Persistent RPC: entering loop' -or $hasVmActivity)) {
                 if (-not $handshakePassed) {
                     $handshakePassed = $true
                     Write-Log 'Cowork 服务已验证当前 Claude 官方签名，RPC 连接正常。' OK
                 }
             }
-            if ($currentRun -match 'Configuring VM for user=|Creating HCS compute system|Starting compute system') {
+            if ($hasVmActivity) {
                 if (-not $vmRequested) {
                     $vmRequested = $true
                     $vmDeadline = (Get-Date).AddSeconds($VmSeconds)
                     Write-Log '检测到本轮已请求启动 Cowork VM，继续等待网络与 API。' INFO
                 }
             }
-            if ($vmRequested -and $currentRun -match 'API reachability: REACHABLE' -and $currentRun -match 'sdk-daemon is ready') {
-                Write-Log 'Cowork VM 网络已连接，API 可达。' OK
+            if ($currentRun -match 'VM started successfully|HCS VM:\s*Running|compute system.+Running') { $vmStarted = $true }
+            if ($currentRun -match 'Network status:\s*CONNECTED|network.+\bCONNECTED\b') { $networkConnected = $true }
+            if ($currentRun -match 'API reachability:\s*REACHABLE') { $apiReachable = $true }
+            if ($currentRun -match 'sdk-daemon is ready') { $daemonReady = $true }
+            if ($vmRequested -and $vmStarted -and $networkConnected -and $apiReachable -and $daemonReady) {
+                Write-Log 'Cowork HCS VM 已运行，网络 CONNECTED，API REACHABLE，sdk-daemon 就绪。' OK
                 return $true
             }
             if ($currentRun -match 'signature verification failed') {
@@ -2060,7 +2627,7 @@ function Invoke-HealthWait {
     if (-not $handshakePassed) {
         Write-Log "未在 $HandshakeSeconds 秒内确认本轮 Claude/Cowork 签名握手；验证失败。" ERROR
     } elseif ($vmRequested) {
-        Write-Log "本轮已请求 Cowork VM，但未在 $VmSeconds 秒内确认 API 可达；验证失败。" ERROR
+        Write-Log "本轮 Cowork VM 深度验证未完成：VM=$vmStarted，Network=$networkConnected，API=$apiReachable，Daemon=$daemonReady。" ERROR
     }
     return $false
 }
@@ -2101,8 +2668,8 @@ function Invoke-AutoSetup {
         Write-Log "检测到重启已完成，开始验证新 VM bundle；旧备份：$($rebuildState.BackupPath)" INFO
     }
 
-    Repair-ExistingPackageVolume
     $paths = Repair-ClaudePackageAndSignature
+    [void](Repair-ClaudeUserDataLayout)
     if (-not $rebuildState) {
         $stagedRebuild = Repair-VmStorageAttributes
         if ($stagedRebuild) {
@@ -2150,16 +2717,18 @@ Write-Log "Claude Setup $script:ToolVersion，Action=$Action" INFO
 Ensure-Administrator
 
 $exitCode = 0
+$actionReport = $null
 try {
     switch ($Action) {
         'Diagnose' {
-            $report = Invoke-Diagnostics
-            Show-DiagnosticSummary $report
+            $actionReport = Invoke-Diagnostics
+            Show-DiagnosticSummary $actionReport
         }
         'Install' {
             Enable-CoworkPrerequisites
             if ($script:NeedsRestart) { Register-ResumeAfterRestart; $exitCode = 3010; break }
             [void](Repair-ClaudePackageAndSignature)
+            [void](Repair-ClaudeUserDataLayout)
             Start-CoworkServices
             [void](Install-ClaudeDesktopShortcut)
             if (-not $SkipLaunch) { Start-ClaudeAppx }
@@ -2167,8 +2736,8 @@ try {
         'Repair' {
             Enable-CoworkPrerequisites
             if ($script:NeedsRestart) { Register-ResumeAfterRestart; $exitCode = 3010; break }
-            Repair-ExistingPackageVolume
             [void](Repair-ClaudePackageAndSignature)
+            [void](Repair-ClaudeUserDataLayout)
             $stagedRebuild = Repair-VmStorageAttributes
             if ($stagedRebuild) {
                 Write-Log '已完成可回滚备份。请重启 Windows；登录后运行 install.bat 继续验证。' WARN
@@ -2187,7 +2756,7 @@ try {
         'Auto' { $exitCode = Invoke-AutoSetup }
     }
 
-    $finalReport = Invoke-Diagnostics
+    $finalReport = if ($actionReport) { $actionReport } else { Invoke-Diagnostics }
     [void](Save-DiagnosticReport $finalReport)
     if ($finalReport.Findings | Where-Object { $_.Status -eq 'Fail' }) {
         Write-Log '仍有失败项，请查看诊断报告。' WARN

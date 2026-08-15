@@ -52,10 +52,22 @@ $requiredSafetyChecks = @(
     'Get-ClaudeInstallationCandidates'
     'Select-ClaudeInstallation'
     'Test-ClaudeDefaultInstallationReady'
-    'PreserveApplicationData'
+    'Get-AppxPackageLocationInfo'
+    'GetFinalPathNameByHandleW'
+    'Set-SystemAppxDefaultVolume'
+    'Initialize-ClaudeIndependentUserData'
+    'CLAUDE_USER_DATA_DIR'
+    '--user-data-dir'
+    'CreateVirtualDisk failed: 0x1772'
+    'Get-ClaudeUserDataProtectionKind'
+    'Repair-ConfirmedIndependentUserDataEfs'
     '[int]$HandshakeSeconds = 45'
     '[int]$VmSeconds = 120'
     'Client signature verified:'
+    'VM started successfully'
+    'Network status:'
+    'API reachability:'
+    'sdk-daemon is ready'
     'VM 尚未被用户请求'
     'DecryptFile(string path, uint reserved)'
     'Install-ClaudeDesktopShortcut'
@@ -108,10 +120,13 @@ foreach ($text in $requiredSafetyChecks) {
 if ($main -match 'AllowUnsigned') {
     throw 'The installer must never install an unsigned AppX package.'
 }
+if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
+    throw 'PreserveApplicationData is not valid protection for a normal signed MSIX; profile migration must complete before removal.'
+}
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
 }
 $storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
@@ -121,8 +136,27 @@ $storageBlock = $main.Substring($storageStart, $storageEnd - $storageStart)
 if ($storageBlock -match 'Invoke-EfsDecrypt|Start-SafeVmBundleRebuild|Move-Item') {
     throw 'AppX VM storage repair must not decrypt, move, or rebuild encrypted bundle data automatically.'
 }
+$volumeStart = $main.IndexOf('function Repair-ExistingPackageVolume')
+$volumeEnd = $main.IndexOf('function Repair-ClaudeUserDataLayout', $volumeStart)
+if ($volumeStart -lt 0 -or $volumeEnd -le $volumeStart) { throw 'Unable to isolate Repair-ExistingPackageVolume.' }
+$volumeBlock = $main.Substring($volumeStart, $volumeEnd - $volumeStart)
+if ($volumeBlock.IndexOf('Initialize-ClaudeIndependentUserData') -gt $volumeBlock.IndexOf('Remove-AppxPackage') -or
+    $volumeBlock -notmatch '(?s)Test-AnthropicSignature.*?Remove-AppxPackage') {
+    throw 'AppX uninstall fallback must migrate profile data and revalidate the downloaded signature before package removal.'
+}
+$efsStart = $main.IndexOf('function Repair-ConfirmedIndependentUserDataEfs')
+$efsEnd = $main.IndexOf('function Test-VmRuntimeEfsItem', $efsStart)
+if ($efsStart -lt 0 -or $efsEnd -le $efsStart) { throw 'Unable to isolate safe independent EFS repair.' }
+$efsBlock = $main.Substring($efsStart, $efsEnd - $efsStart)
+if ($efsBlock -notmatch "Kind -ne 'ConfirmedUserEfs'" -or $efsBlock -notmatch 'Invoke-EfsDecrypt' -or
+    $efsBlock -notmatch 'Get-ClaudeEncryptedItems') {
+    throw 'EFS repair must require the confirmed independent-user-data classification and verify the result.'
+}
 if ($main -notmatch '(?s)function Repair-MsixVmCommitFailure.*?Get-VmRebuildProtectionEvidence.*?if \(\$protection\.Suspected\).*?return \$false.*?Get-OfficialVmManifest') {
     throw 'MSIX VM commit repair must fail closed before any manifest-based external write when AppX protection is suspected.'
+}
+if ($main -notmatch '(?s)function Repair-MsixVmCommitFailure.*?Test-IsAppxPrivatePath.*?return \$false.*?Get-VmRebuildProtectionEvidence') {
+    throw 'MSIX VM commit repair must reject every AppX-private state path before inspecting files or writing manifest data.'
 }
 if ($main -notmatch '(?s)function Stop-CoworkVmServiceAndWait.*?WaitForStatus.*?cowork-svc') {
     throw 'Cowork service shutdown must wait for Stopped and terminate a lingering cowork-svc process.'
@@ -244,6 +278,31 @@ try {
     if ((Get-VolumeRoot 'C:\Users\Example\AppData') -ne 'C:') {
         throw 'Volume-root detection failed for C:.'
     }
+    $resolvedRoot = Get-FinalPath $root
+    if (-not $resolvedRoot -or -not ([IO.Path]::GetFullPath($resolvedRoot)).Equals([IO.Path]::GetFullPath($root), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Final physical-path resolution failed for the repository: $resolvedRoot"
+    }
+    if ((Convert-FinalPathToDosPath '\\?\C:\Users\Example') -ne 'C:\Users\Example' -or
+        (Convert-FinalPathToDosPath '\\?\UNC\server\share\folder') -ne '\\server\share\folder') {
+        throw 'Final Win32 path normalization failed.'
+    }
+    $quotedUserData = Get-ClaudeUserDataPathFromCommandLine '"C:\Program Files\WindowsApps\Claude.exe" --user-data-dir="C:\Users\Example Name\Claude-3p"'
+    if ($quotedUserData -ne 'C:\Users\Example Name\Claude-3p') {
+        throw "Quoted --user-data-dir parsing failed: $quotedUserData"
+    }
+    if (Get-ClaudeUserDataPathFromCommandLine 'Claude.exe --user-data-dir=relative\Claude') {
+        throw 'Relative --user-data-dir values must not be adopted by an elevated repair process.'
+    }
+    if (-not (Test-SafeIndependentClaudeUserDataPath (Join-Path $env:LOCALAPPDATA 'Claude-3p')) -or
+        (Test-SafeIndependentClaudeUserDataPath (Join-Path $env:LOCALAPPDATA 'Packages\Claude_test\LocalCache\Claude'))) {
+        throw 'Independent user-data path safety classification failed.'
+    }
+    if ((Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $true -AppxError $false -SafeIndependentPath $false -IsConfigured $false -CurrentUserReadable $true -VirtualDisk1772 $false -ToolManaged $false) -ne 'AppxProtected' -or
+        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $false -SafeIndependentPath $true -IsConfigured $true -CurrentUserReadable $true -VirtualDisk1772 $true -ToolManaged $false) -ne 'ConfirmedUserEfs' -or
+        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $true -SafeIndependentPath $true -IsConfigured $true -CurrentUserReadable $true -VirtualDisk1772 $true -ToolManaged $false) -ne 'ConfirmedUserEfs' -or
+        (Get-ClaudeUserDataProtectionKind -EncryptedCount 2 -IsAppxPrivate $false -AppxError $false -SafeIndependentPath $true -IsConfigured $false -CurrentUserReadable $true -VirtualDisk1772 $true -ToolManaged $false) -ne 'EncryptedUnknown') {
+        throw 'AppX-protected versus confirmed user-EFS classification failed.'
+    }
 
     $mockCandidates = @(
         [pscustomobject]@{ Type = 'EXE'; Score = 300; Version = [version]'99.0'; Path = 'C:\Fake\Newer\Claude.exe' },
@@ -282,6 +341,15 @@ try {
     $safeTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
     try {
         New-Item -ItemType Directory -Path $statusRoot -Force | Out-Null
+        $physicalPackage = Join-Path $statusRoot 'physical-package'
+        $registeredPackage = Join-Path $statusRoot 'registered-package'
+        New-Item -ItemType Directory -Path $physicalPackage -Force | Out-Null
+        New-Item -ItemType Junction -Path $registeredPackage -Target $physicalPackage | Out-Null
+        $locationFixture = Get-AppxPackageLocationInfo ([pscustomobject]@{ InstallLocation = $registeredPackage })
+        if (-not $locationFixture.ResolutionSucceeded -or -not $locationFixture.IsRedirected -or
+            -not $locationFixture.PhysicalPath.Equals($physicalPackage, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'AppX final physical-path and reparse redirection detection failed.'
+        }
         foreach ($name in @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz')) {
             New-Item -ItemType File -Path (Join-Path $statusRoot $name) -Force | Out-Null
         }
@@ -301,6 +369,21 @@ try {
         if (-not $protectedEvidence.Suspected -or -not $protectedEvidence.ExplicitAppxError -or
             -not $protectedEvidence.SessionDiskError -or -not $protectedEvidence.CopyfileUnknown) {
             throw 'AppX protected-storage evidence detection failed.'
+        }
+
+        $profileSource = Join-Path $statusRoot 'profile-source'
+        $profileTarget = Join-Path $statusRoot 'profile-target'
+        New-Item -ItemType Directory -Path (Join-Path $profileSource 'vm_bundles'), (Join-Path $profileSource 'Cache'), (Join-Path $profileSource 'Local Storage') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $profileSource 'config.json'), '{"fixture":true}')
+        [IO.File]::WriteAllText((Join-Path $profileSource 'Local Storage\session.fixture'), 'session')
+        [IO.File]::WriteAllText((Join-Path $profileSource 'vm_bundles\rootfs.vhdx'), 'must-not-copy')
+        [IO.File]::WriteAllText((Join-Path $profileSource 'Cache\cache.bin'), 'must-not-copy')
+        if (-not (Copy-ClaudeProfileData -Source $profileSource -Destination $profileTarget) -or
+            -not (Test-Path -LiteralPath (Join-Path $profileTarget 'config.json')) -or
+            -not (Test-Path -LiteralPath (Join-Path $profileTarget 'Local Storage\session.fixture')) -or
+            (Test-Path -LiteralPath (Join-Path $profileTarget 'vm_bundles')) -or
+            (Test-Path -LiteralPath (Join-Path $profileTarget 'Cache'))) {
+            throw 'Independent profile migration must retain configuration while excluding VM and cache data.'
         }
     } finally {
         $resolvedStatusRoot = [IO.Path]::GetFullPath($statusRoot)

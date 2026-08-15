@@ -11,7 +11,7 @@
 
 普通 EXE 或移动版不会被直接修改，也不会被误认为能提供 Cowork 服务；脚本会保留它们，并安装官方 MSIX。
 
-如果 AppX 注册仍存在，但默认系统路径或 `Claude.exe/resources/app.asar` 缺失，工具会把它识别为半损坏安装。支持时使用 `Remove-AppxPackage -PreserveApplicationData` 保留应用数据，再从官方 MSIX 重新注册并安装。
+如果 AppX 注册仍存在，但默认系统路径或 `Claude.exe/resources/app.asar` 缺失，工具会把它识别为半损坏安装。`PreserveApplicationData` 只适用于松散注册的开发包，不能当作普通签名 MSIX 的数据保护。工具会先把可保留配置迁移到独立目录、排除 VM/缓存/临时文件并复核官方 MSIX 签名，之后才卸载当前用户的损坏包并重装。
 
 ## `RPC pipe closed`
 
@@ -35,7 +35,7 @@
 
 这表示新版 Claude 已在 `rename` 失败后尝试 `copyFile`，但最终提交仍被 Windows 拒绝。若同时出现 Encrypted(0x4000)、`409/0x199`、`ERROR_APPX_FILE_NOT_ENCRYPTED` 或 `CreateVirtualDisk failed: 0x199`，应按 AppX 应用受保护存储故障处理，而不是下载速度或普通 EFS 问题。
 
-最新版在命中上述证据后只诊断、不改写：不会解密文件、不会归档 bundle、不会把 `.tmp/.partial` 改名转正、不会自行解压并写回，也不会用硬链接让活动 VHDX 与备份共享同一文件记录。请保留 `reports` 和 `C:\ProgramData\Claude\Logs\cowork-service.log`，向 Anthropic 反馈。
+最新版在命中上述证据后绝不改写包私有 bundle：不会解密、归档、转正 `.tmp/.partial`、自行解压写回或创建硬链接。Auto/Repair 会改用 `%LOCALAPPDATA%\Claude-3p` 独立目录，让 Claude 自己重新下载 VM；原 AppX 私有目录保留作诊断证据。
 
 相关上游问题：[anthropics/claude-code#36642](https://github.com/anthropics/claude-code/issues/36642)、[#51384](https://github.com/anthropics/claude-code/issues/51384)、[#66778](https://github.com/anthropics/claude-code/issues/66778)。
 
@@ -57,7 +57,7 @@
 
 ## 非 C 盘 WindowsApps
 
-脚本把未来 AppX 安装的默认卷设置为 Windows 系统卷，并始终把官方 Claude MSIX 安装到该卷。通常路径为 `C:\Program Files\WindowsApps\Claude_版本...`；如果 Windows 本身安装在其他盘，则使用相应系统盘。现有 Claude 包优先通过 `Move-AppxPackage` 移动；若系统版本不支持或移动失败，脚本停止并要求先备份本地 Cowork 数据，不会擅自卸载。
+脚本把未来 AppX 安装的默认卷设置为 Windows 系统卷，并始终把官方 Claude MSIX 安装到该卷。它不只比较 `InstallLocation` 字符串，还通过 `GetFinalPathNameByHandleW` 解析最终物理位置，所以能识别注册在 C 盘、实际重定向到 D 盘的包。现有 Claude 优先通过 `Move-AppxPackage` 移动；失败时先迁移配置到独立目录并复核已下载官方包，随后卸载当前用户错位包、重装并再次验证物理位置。
 
 ## 企业设备
 
@@ -80,3 +80,15 @@
 如果真实 VM 文件带 `Encrypted` 属性，而 `DecryptFileW` 返回 Win32 87，这不足以证明文件损坏；在包私有 `LocalCache` 中，它可能属于“应用程序受保护”加密。最新版绝不会再用这一组合自动触发 bundle 备份或重建。
 
 `409 (0x199)` 的系统名称是 `ERROR_APPX_FILE_NOT_ENCRYPTED`。若 `cowork-service.log` 显示 `CreateVirtualDisk failed: 0x199`，工具会标记为上游/系统兼容性失败并停止修改。不要运行未经完整哈希与版本验证的 `fix_commit.bat`，也不要把活动 VHDX 硬链接到唯一备份；硬链接两侧共享同一文件内容，活动写入会同时改变所谓备份。
+
+## `CreateVirtualDisk failed: 0x1772`
+
+这与 AppX 409 不是同一种错误。0x1772 表示目标文件/目录使用了普通 EFS，而运行 `CoworkVMService` 的 LocalSystem 没有当前用户的解密能力。工具仅在以下条件全部满足时自动解除 EFS：
+
+1. 活动数据目录来自 `CLAUDE_USER_DATA_DIR` 或 `--user-data-dir`；
+2. 路径位于当前用户的 `LocalAppData`，且不在 `Packages`/`WindowsApps` 中；
+3. 路径及父级不是重解析点；
+4. 当前用户能读取加密文件；
+5. 日志明确出现 0x1772，或目录由本工具创建并记录。
+
+不满足任意一项时只报告，不调用 `DecryptFileW`。

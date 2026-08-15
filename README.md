@@ -2,7 +2,7 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
-> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护，不再自动解密、移动或外部写入受保护 bundle。已经运行旧版的用户请保留所有 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
+> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.1.0 在保持该边界的基础上，新增物理路径复核、官方卸载重装回退和非 AppX 独立数据目录修复。已经运行旧版的用户请保留所有 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
 
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
@@ -29,7 +29,7 @@ cd claude-setup
 
 本工具按“一次性安装与修复”设计：成功运行一遍后即可删除，不常驻、不创建计划任务、不关闭或接管 Claude 官方自动更新。Claude 后续继续通过官方机制更新。
 
-Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（一般为 `C:\Program Files\WindowsApps\Claude_版本...`）。脚本不自定义安装目录；在其他磁盘发现的 EXE/移动版只作为现有安装线索，不会被选作 Cowork 主程序。
+Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（一般为 `C:\Program Files\WindowsApps\Claude_版本...`）。脚本会通过 Win32 最终路径解析检查该注册路径是否暗中重定向到其他磁盘；在其他磁盘发现的 EXE/移动版只作为现有安装线索，不会被选作 Cowork 主程序。
 
 ## 解决什么问题
 
@@ -39,11 +39,14 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 自动适配 x64 与 ARM64；
 - 检查并启用 Virtual Machine Platform；
 - 检查 BIOS/UEFI 虚拟化、HCS/HNS、Hypervisor 启动设置；
-- 检测 Claude 位于非系统 AppX 卷的情况；
+- 同时检查 AppX 注册路径与最终物理路径，识别 `C:\...` 实际重定向到 `D:\WindowsApps` 的错位；
+- 自动把默认 AppX 卷设为系统卷；`Move-AppxPackage` 失败时，只有在用户配置迁移和官方 MSIX 签名复核均成功后才卸载重装；
+- 识别用户级 `CLAUDE_USER_DATA_DIR` 与运行进程的 `--user-data-dir`；必要时迁移到 `%LOCALAPPDATA%\Claude-3p`，且不复制旧 VM、缓存或临时下载；
 - 修复 TEMP 与 LocalAppData 跨盘造成的 `EXDEV`；
 - 诊断 Windows 11 build 26200 等环境中的 `UNKNOWN ... copyfile`、`ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)` 与 `CreateVirtualDisk` 失败；
 - 检测 Encrypted(0x4000)、目录联接与 `rootfs.vhdx/sessiondata.vhdx`，但不再把 AppX 包私有目录中的 0x4000 自动等同于可解密的经典 EFS；
-- 一旦存在 AppX 应用受保护存储证据，立即禁用 `DecryptFileW`、bundle 归档/重建和外部解压/写入接管，避免把包原生文件变成 409 拒读的明文残留；
+- 一旦存在 AppX 应用受保护存储证据，立即禁止对包私有目录执行 `DecryptFileW`、bundle 归档/重建和外部解压/写入接管；自动修复改为使用非虚拟化独立数据目录；
+- 识别 `CreateVirtualDisk failed: 0x1772`。只有路径位于安全的非 AppX `LocalAppData`、已被 Claude 明确选用、当前用户可读，且存在 0x1772 或工具创建状态时，才把 0x4000 分类为可解密的普通用户 EFS；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
@@ -70,11 +73,13 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 只诊断、不修改系统：双击 `diagnose.cmd`。
 
-### AppX 应用受保护存储的失效保护
+### AppX 应用受保护存储与独立数据目录
 
 `FILE_ATTRIBUTE_ENCRYPTED (0x4000)` 只能说明文件已加密，不能单独区分经典用户 EFS 与 MSIX/AppX 的“应用程序受保护”加密。在 Claude 的包私有 `LocalCache` 中，盲目调用 `DecryptFileW` 或从外部进程写入文件可能触发 `ERROR_APPX_FILE_NOT_ENCRYPTED (409/0x199)`，并使 Cowork 更难恢复。
 
-因此最新版只做诊断：命中 0x4000、`UNKNOWN ... copyfile`、显式 409/0x199 或 `CreateVirtualDisk failed: 0x199` 时，不解密、不移动 bundle、不创建硬链接、不转正 `.tmp/.partial`、不向目录写 `.origin`。报告会保留原始路径和近期日志，供 Anthropic 或设备管理员处理。旧版本已经生成的时间戳备份也不会自动删除或自动硬链接回活动目录。
+因此最新版绝不修改包私有 bundle：命中 0x4000、`UNKNOWN ... copyfile`、显式 409/0x199 或 `CreateVirtualDisk failed: 0x199` 时，不解密、不移动 bundle、不创建硬链接、不转正 `.tmp/.partial`、不向目录写 `.origin`。Auto/Repair 会把可保留的登录与配置迁移到 `%LOCALAPPDATA%\Claude-3p`，跳过 `vm_bundles`、缓存、日志和临时下载，然后设置用户级 `CLAUDE_USER_DATA_DIR`。
+
+独立目录中的加密也不会被盲目处理。只有分类器确认它是当前用户可读的普通 EFS，并命中 `CreateVirtualDisk failed: 0x1772` 或工具创建标记时，才停止 Claude/Cowork、调用 Unicode `DecryptFileW` 并逐项复核。AppX 私有路径、WindowsApps、重解析点和类型不明的加密一律保持原样。
 
 也可以在管理员 PowerShell 中运行：
 
@@ -98,14 +103,15 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 | 默认 AppX 路径不存在/核心文件缺失 | 自动下载官方 MSIX；必要时保留应用数据后重新注册并安装 |
 | 已有多个 Claude | 自动优先选择签名有效、支持 Cowork 的官方 MSIX |
 | 只有官网 EXE/移动版 | 识别并报告其路径，保留原目录，另行安装官方 MSIX 供 Cowork 使用 |
-| Claude MSIX 位于非系统卷 | 移回 Windows 系统 AppX 默认位置 |
+| Claude MSIX 注册路径或最终物理路径位于非系统卷 | 优先移动；失败后先迁移配置并复核官方 MSIX，再卸载重装 |
 | 已安装且健康 | 只补齐依赖并验证 |
 | `Claude.exe` 为 `HashMismatch` | 下载同版本/更新版本官方 MSIX，恢复官方核心文件 |
 | Virtual Machine Platform 未启用 | 自动启用，注册重启后继续 |
-| Claude 在非系统 AppX 卷 | 优先使用 `Move-AppxPackage` 移动；失败则停止并报告，不删除用户数据 |
+| `C:\WindowsApps` 注册路径实际重定向到其他盘 | 使用最终物理路径识别；移动失败时走已验证的卸载重装回退 |
 | TEMP 与 LocalAppData 跨盘 | 恢复用户 TEMP/TMP 到 `%LOCALAPPDATA%\Temp` |
-| `UNKNOWN ... copyfile *.zst.*.partial` 或 `*.tmp` | 先识别 AppX 409/应用受保护证据；命中时停止外部写入修复并报告 |
-| VM 目录或文件带 Encrypted(0x4000) | 保持原样并报告；不自动解密或重建 |
+| `UNKNOWN ... copyfile *.zst.*.partial` 或 `*.tmp` | 包私有目录保持原样，切换至独立数据目录重新下载 VM |
+| 包私有 VM 带 Encrypted(0x4000) | 视为 AppX 受保护候选，绝不解密 |
+| 独立目录出现 `CreateVirtualDisk 0x1772` | 满足全部安全证据后解除普通用户 EFS并复核 |
 | VM 目录是 junction/reparse point | 停止并报告，避免误删大体积 VM 数据 |
 | VDI/虚拟机 | 警告需要嵌套虚拟化 |
 | 企业 AppLocker/策略阻止 | 停止并输出报告，不绕过安全策略 |
@@ -136,7 +142,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 ## 数据与安全
 
-- 默认不删除 `%APPDATA%\Claude` 或 AppX LocalCache；
+- 默认不删除 `%APPDATA%\Claude` 或 AppX LocalCache；只有 AppX 物理卷错位且移动失败时，才会在配置迁移成功、官方 MSIX 签名再次有效的前提下卸载当前用户的错位包；
 - 不自动删除 VM bundle；
 - 原位恢复签名文件前，会把修改版备份到 `%ProgramData%\ClaudeSetup\backups`；
 - 下载地址固定为 Anthropic 官方 endpoint；
@@ -159,6 +165,9 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 - [下载 Claude](https://claude.com/download)
 - [Windows 部署和 Cowork 要求](https://support.claude.com/en/articles/12622703-deploy-claude-desktop-for-windows)
 - [Microsoft Add-AppxPackage](https://learn.microsoft.com/powershell/module/appx/add-appxpackage)
+- [Microsoft GetFinalPathNameByHandle](https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+- [Microsoft Set-AppxDefaultVolume](https://learn.microsoft.com/powershell/module/appx/set-appxdefaultvolume)
+- [Microsoft Move-AppxPackage](https://learn.microsoft.com/powershell/module/appx/move-appxpackage)
 
 ## 免责声明
 
