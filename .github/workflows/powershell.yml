@@ -7,8 +7,12 @@ on:
 jobs:
   validate:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v6
       - name: Parse scripts and run static tests
-        shell: powershell
+        shell: ${{ matrix.shell }}
         run: .\tests\Static.Tests.ps1

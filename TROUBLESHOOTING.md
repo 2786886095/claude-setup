@@ -95,6 +95,20 @@
 
 自动解密范围只包括活动数据根目录、`vm_bundles`、`claudevm.bundle` 和五个 VM 运行文件。会话 `.jsonl`、`local-agent-mode-sessions`、`claude-code-sessions`、outputs、uploads、配置及缓存即使使用 EFS，也只显示为 Info，不会阻断 Cowork 或被自动解密。
 
-若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.1.2 会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和旧备份均已不存在时，只有当前 VM 完整、VM 关键路径无 EFS、完整成功日志成立且 Claude/cowork-svc 双签名有效，才归档为 Abandoned。若只缺一侧、路径异常或任一健康证据不足，Auto 继续失效保护并停止。
+若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.2.0 会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和旧备份均已不存在时，只有当前 VM 完整、VM 关键路径无 EFS、完整成功日志成立且 Claude/cowork-svc 双签名有效，才归档为 Abandoned。Abandoned 落盘前会重新核验全部证据，并把五个 VM 文件的长度/时间、EFS、日志和签名快照写入回执。若只缺一侧、路径异常或任一健康证据不足，工具继续失效保护并停止。
 
 Diagnose 会把已经验证的孤立状态明确显示为“当前独立 VM 健康，Auto 对该状态只执行归档和旧 RunOnce 清理，随后继续常规安装验证”；无法验证的孤立状态会单独提示缺少的健康或签名条件，不再误称重建仍在正常进行。
+
+正式修改前可在普通 PowerShell 中运行：
+
+```powershell
+.\ClaudeSetup.ps1 -Action Plan
+```
+
+它只向标准输出写一个 JSON 对象，不创建 `reports`/`downloads`，不请求 UAC，也不改变 AppX、服务、进程、TEMP/TMP、RunOnce、状态文件或 VM。若只想解除已经验证的旧状态阻断，请在管理员 PowerShell 中运行：
+
+```powershell
+.\ClaudeSetup.ps1 -Action ResolveLegacyState
+```
+
+该动作不会下载或安装 Claude。状态不是可证明的 Superseded/Abandoned 时会保持原文件并报错；若它仍是有效的当前重建状态，则原样保留并正常退出。

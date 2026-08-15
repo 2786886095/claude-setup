@@ -110,6 +110,11 @@ $requiredSafetyChecks = @(
     'Complete-VmBundleRebuild'
     'Assert-VmRebuildState'
     'Resolve-VmRebuildState'
+    'Invoke-ResolveLegacyState'
+    'Get-SetupPlan'
+    "'Plan'"
+    "'ResolveLegacyState'"
+    'Get-AbandonedLegacyVmRebuildEvidence'
     'Archive-SupersededVmRebuildState'
     'Test-AbandonedLegacyVmRebuildState'
     'Archive-AbandonedVmRebuildState'
@@ -135,7 +140,7 @@ if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
 }
 $storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
@@ -175,13 +180,53 @@ if ($abandonedArchiveStart -lt 0 -or $abandonedArchiveEnd -le $abandonedArchiveS
 $abandonedArchiveBlock = $main.Substring($abandonedArchiveStart, $abandonedArchiveEnd - $abandonedArchiveStart)
 if ($abandonedArchiveBlock -notmatch '(?s)Get-VmRebuildStatePathShape.*?Test-Path.+Bundle.*?Test-Path.+Backup' -or
     $abandonedArchiveBlock -notmatch '(?s)Get-VmRebuildState.*?OriginalPath.*?BackupPath.*?Status' -or
+    $abandonedArchiveBlock -notmatch '(?s)Get-AbandonedLegacyVmRebuildEvidence.*?VmFiles.*?VmCriticalEfsCount.*?Lifecycle.*?CoreSignaturesValid' -or
     $abandonedArchiveBlock -notmatch '(?s)Move-Item.+VmRebuildStatePath.+originalArchive' -or
     $abandonedArchiveBlock -match 'Remove-Item.+(BackupPath|PreviousBackupPath)') {
     throw 'Abandoned-state handling may archive only the state record and must never delete or fabricate a legacy backup.'
 }
-if ($main -notmatch '(?s)function Test-AbandonedLegacyVmRebuildState.*?Test-ClaudeCoreSignatures' -or
-    $main -notmatch '(?s)function Test-AbandonedLegacyVmRebuildState.*?CurrentRunHealthy.*?CurrentVirtualDisk1772') {
+if ($main -notmatch '(?s)function Get-AbandonedLegacyVmRebuildEvidence.*?Test-ClaudeCoreSignatures' -or
+    $main -notmatch '(?s)function Get-AbandonedLegacyVmRebuildEvidence.*?CurrentRunHealthy.*?CurrentVirtualDisk1772') {
     throw 'Abandoned-state classification must require valid core signatures and current independent VM health.'
+}
+
+$mainTokens = $null
+$mainErrors = $null
+$mainAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $root 'ClaudeSetup.ps1'),
+    [ref]$mainTokens,
+    [ref]$mainErrors
+)
+$planFunction = $mainAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-SetupPlan'
+}, $true) | Select-Object -First 1
+if (-not $planFunction) { throw 'Get-SetupPlan AST is missing.' }
+$forbiddenPlanCommands = @(
+    'New-Item', 'Set-Item', 'Set-ItemProperty', 'Remove-Item', 'Remove-ItemProperty', 'Move-Item', 'Copy-Item',
+    'Add-Content', 'Set-Content', 'Out-File', 'Invoke-WebRequest', 'Enable-WindowsOptionalFeature',
+    'Set-AppxDefaultVolume', 'Move-AppxPackage', 'Remove-AppxPackage', 'Add-AppxPackage', 'Add-AppxProvisionedPackage',
+    'Start-Service', 'Stop-Service', 'Start-Process', 'Stop-Process', 'Set-Acl'
+)
+$planCommandNames = @($planFunction.Body.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) |
+    ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
+$badPlanCommands = @($planCommandNames | Where-Object { $_ -in $forbiddenPlanCommands } | Select-Object -Unique)
+if ($badPlanCommands.Count -gt 0) {
+    throw "Plan directly invokes mutating commands: $($badPlanCommands -join ', ')"
+}
+$planEntryIndex = $main.IndexOf("if (`$Action -eq 'Plan')")
+$importGuardIndex = $main.LastIndexOf("if (`$env:CLAUDE_SETUP_IMPORT_ONLY -eq '1')")
+$entryWriteIndex = $main.IndexOf('New-Item -ItemType Directory -Path $script:ReportsRoot', $importGuardIndex)
+if ($planEntryIndex -lt 0 -or $entryWriteIndex -lt 0 -or $planEntryIndex -gt $entryWriteIndex) {
+    throw 'Plan must exit before the main entry point creates reports, downloads, logs, or ProgramData directories.'
+}
+$resolveStart = $main.IndexOf('function Invoke-ResolveLegacyState')
+$resolveEnd = $main.IndexOf('function Enable-CoworkPrerequisites', $resolveStart)
+if ($resolveStart -lt 0 -or $resolveEnd -le $resolveStart) { throw 'Unable to isolate ResolveLegacyState.' }
+$resolveBlock = $main.Substring($resolveStart, $resolveEnd - $resolveStart)
+if ($resolveBlock -notmatch 'Resolve-VmRebuildState' -or
+    $resolveBlock -match 'Invoke-AutoSetup|Repair-ClaudePackageAndSignature|Enable-CoworkPrerequisites|Start-CoworkServices') {
+    throw 'ResolveLegacyState must only classify/archive legacy state and must never enter the install/repair pipeline.'
 }
 if ($main -notmatch '(?s)function Repair-MsixVmCommitFailure.*?Get-VmRebuildProtectionEvidence.*?if \(\$protection\.Suspected\).*?return \$false.*?Get-OfficialVmManifest') {
     throw 'MSIX VM commit repair must fail closed before any manifest-based external write when AppX protection is suspected.'
@@ -291,6 +336,48 @@ try {
     }
 } finally {
     Remove-Item -LiteralPath $elevationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$planTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("ClaudeSetupPlan-{0}" -f [guid]::NewGuid().ToString('N'))
+$planImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY
+try {
+    New-Item -ItemType Directory -Path $planTestRoot -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Destination $planTestRoot
+    $planScript = Join-Path $planTestRoot 'ClaudeSetup.ps1'
+    $statePath = Join-Path $env:ProgramData 'ClaudeSetup\vm-rebuild-active.json'
+    $stateHashBefore = if (Test-Path -LiteralPath $statePath -PathType Leaf) { (Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash } else { $null }
+    $runOnceBefore = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name ClaudeSetupResume -ErrorAction SilentlyContinue).ClaudeSetupResume
+    $environmentBefore = @([Environment]::GetEnvironmentVariable('TEMP', 'User'), [Environment]::GetEnvironmentVariable('TMP', 'User')) -join '|'
+    $servicesBefore = @('CoworkVMService', 'vmcompute', 'hns' | ForEach-Object {
+        $service = Get-Service -Name $_ -ErrorAction SilentlyContinue
+        if ($service) { "$_=$($service.Status)" } else { "$_=Missing" }
+    }) -join '|'
+    $rootFilesBefore = @(Get-ChildItem -LiteralPath $planTestRoot -Force | Select-Object -ExpandProperty Name | Sort-Object) -join '|'
+    $env:CLAUDE_SETUP_IMPORT_ONLY = $null
+    $planOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $planScript -Action Plan
+    $planExitCode = $LASTEXITCODE
+    $env:CLAUDE_SETUP_IMPORT_ONLY = $planImportMode
+    $plan = ($planOutput -join "`n") | ConvertFrom-Json
+    $stateHashAfter = if (Test-Path -LiteralPath $statePath -PathType Leaf) { (Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash } else { $null }
+    $runOnceAfter = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name ClaudeSetupResume -ErrorAction SilentlyContinue).ClaudeSetupResume
+    $environmentAfter = @([Environment]::GetEnvironmentVariable('TEMP', 'User'), [Environment]::GetEnvironmentVariable('TMP', 'User')) -join '|'
+    $servicesAfter = @('CoworkVMService', 'vmcompute', 'hns' | ForEach-Object {
+        $service = Get-Service -Name $_ -ErrorAction SilentlyContinue
+        if ($service) { "$_=$($service.Status)" } else { "$_=Missing" }
+    }) -join '|'
+    $rootFilesAfter = @(Get-ChildItem -LiteralPath $planTestRoot -Force | Select-Object -ExpandProperty Name | Sort-Object) -join '|'
+    if ($planExitCode -ne 0 -or $plan.Action -ne 'Plan' -or -not $plan.ReadOnly -or
+        -not $plan.Summary -or @($plan.Steps).Count -lt 8) {
+        throw 'Plan must return a successful machine-readable read-only action graph.'
+    }
+    if ($rootFilesBefore -ne $rootFilesAfter -or $stateHashBefore -ne $stateHashAfter -or
+        $runOnceBefore -ne $runOnceAfter -or $environmentBefore -ne $environmentAfter -or
+        $servicesBefore -ne $servicesAfter) {
+        throw 'Plan changed files, legacy state, RunOnce, user TEMP/TMP, or Cowork-related service state.'
+    }
+} finally {
+    $env:CLAUDE_SETUP_IMPORT_ONLY = $planImportMode
+    Remove-Item -LiteralPath $planTestRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $previousImportMode = $env:CLAUDE_SETUP_IMPORT_ONLY
@@ -539,7 +626,9 @@ try {
         if (Test-AbandonedLegacyVmRebuildState -State $legacyState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures) {
             throw 'A still-present legacy backup must use the Superseded branch, never the Abandoned branch.'
         }
-        if (-not (Test-AbandonedLegacyVmRebuildState -State $abandonedState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures)) {
+        $abandonedFixtureEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $abandonedState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures
+        if (-not $abandonedFixtureEvidence.Eligible) {
+            Write-Host ($abandonedFixtureEvidence | ConvertTo-Json -Depth 6)
             throw 'A missing legacy AppX bundle and backup must be archivable only when the current independent VM is verified healthy.'
         }
         if (Test-AbandonedLegacyVmRebuildState -State $abandonedState -Paths $independentPaths -LifecycleEvidence $healthyLifecycle -CoreSignatures $invalidSignatures) {
@@ -560,7 +649,19 @@ try {
             $script:VmRebuildStatePath = Join-Path $statusRoot 'vm-rebuild-abandoned-active.json'
             $script:VmRebuildStateHistoryRoot = Join-Path $statusRoot 'abandoned-state-history'
             $abandonedState | ConvertTo-Json | Set-Content -LiteralPath $script:VmRebuildStatePath -Encoding UTF8
-            [void](Archive-AbandonedVmRebuildState -State $abandonedState -CurrentActiveUserData $independentData -SkipResumeCleanup)
+            $revalidationStopped = $false
+            try {
+                [void](Archive-AbandonedVmRebuildState -State $abandonedState -Paths $independentPaths `
+                    -LifecycleEvidence $healthyLifecycle -CoreSignatures $invalidSignatures -SkipResumeCleanup)
+            } catch {
+                $revalidationStopped = $true
+            }
+            if (-not $revalidationStopped -or -not (Test-Path -LiteralPath $script:VmRebuildStatePath) -or
+                (Test-Path -LiteralPath $script:VmRebuildStateHistoryRoot)) {
+                throw 'Abandoned-state archival must revalidate current signatures immediately before moving the state file.'
+            }
+            [void](Archive-AbandonedVmRebuildState -State $abandonedState -Paths $independentPaths `
+                -LifecycleEvidence $healthyLifecycle -CoreSignatures $validSignatures -SkipResumeCleanup)
             $abandonedHistory = @(Get-ChildItem -LiteralPath $script:VmRebuildStateHistoryRoot -Filter '*.json' -File)
             $abandonedRecord = @($abandonedHistory | Where-Object Name -match '\.abandoned\.json$')
             if ((Test-Path -LiteralPath $script:VmRebuildStatePath) -or $abandonedHistory.Count -ne 2 -or
@@ -571,7 +672,10 @@ try {
             $abandonedReceipt = Get-Content -LiteralPath $abandonedRecord[0].FullName -Raw | ConvertFrom-Json
             if ($abandonedReceipt.Status -ne 'Abandoned' -or $abandonedReceipt.OriginalPathPresent -or
                 $abandonedReceipt.BackupPathPresent -or -not $abandonedReceipt.CurrentVmHealthy -or
-                $abandonedReceipt.CurrentActiveUserData -ne $independentData) {
+                $abandonedReceipt.CurrentActiveUserData -ne $independentData -or
+                -not $abandonedReceipt.Verification.CoreSignaturesValid -or
+                $abandonedReceipt.Verification.VmCriticalEfsCount -ne 0 -or
+                @($abandonedReceipt.Verification.VmFiles).Count -ne 5) {
                 throw 'Abandoned-state receipt does not accurately describe the verified missing-backup disposition.'
             }
         } finally {

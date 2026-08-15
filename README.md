@@ -2,7 +2,7 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
-> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.1.2 还会区分“备份仍存在的 Superseded 状态”与“旧活动目录和备份均消失的 Abandoned 状态”，只处理 VM 关键 EFS，并避免让已恢复的历史 0x1772 触发解密。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
+> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.2.0 还提供严格只读的机器可读 Plan、独立遗留状态解析，并在 Abandoned 归档落盘前重新核验当前 VM、EFS、日志和双签名。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
 
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
@@ -49,6 +49,8 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 识别 `CreateVirtualDisk failed: 0x1772`。只有路径位于安全的非 AppX `LocalAppData`、已被 Claude 明确选用、当前用户可读，且当前 0x1772 尚未被后续完整成功序列覆盖时，才把 VM 关键路径上的 0x4000 分类为可解密的普通用户 EFS；
 - 将 EFS 自动修复严格限制为数据根目录、`vm_bundles`、`claudevm.bundle` 及 `rootfs.vhdx`、`sessiondata.vhdx`、`smol-bin.vhdx`、`initrd`、`vmlinuz`；会话、输出、上传、配置和缓存只报告，不解密；
 - 识别 v1.0.x 遗留的 `vm-rebuild-active.json`。旧备份存在时，只有旧状态精确属于 Claude AppX 私有目录且当前独立 VM 完整健康，才归档为 Superseded，并永久保留旧备份；旧活动目录与备份均已不存在时，还必须复核当前 VM 关键 EFS、完整成功日志及 Claude/cowork-svc 的 Anthropic 签名，才归档为 Abandoned。两种记录都进入 `%ProgramData%\ClaudeSetup\state-history`；
+- 在任何安装或修复前可运行 `-Action Plan` 输出单个 JSON 操作计划；该动作不请求 UAC，不创建日志/报告，不下载，也不修改文件、AppX、服务、进程、环境变量、RunOnce 或 VM 状态；
+- `-Action ResolveLegacyState` 只处理已经满足安全条件的遗留状态，不进入下载、安装、服务启动或 VM 修复流程；Abandoned 在移动状态 JSON 前会重新读取状态并绑定五个 VM 文件的长度/时间、VM 关键 EFS、当前完整健康日志和双签名证据到回执；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 生成可分享的 JSON 与文本报告。
@@ -89,7 +91,16 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 .\ClaudeSetup.ps1 -Action Auto
 .\ClaudeSetup.ps1 -Action Diagnose
 .\ClaudeSetup.ps1 -Action Repair
+.\ClaudeSetup.ps1 -Action ResolveLegacyState
 ```
+
+先查看机器可读计划（普通用户即可，标准输出只有一个 JSON 对象）：
+
+```powershell
+.\ClaudeSetup.ps1 -Action Plan
+```
+
+`Plan` 的 `Disposition` 会区分 `NoChange`、`WouldChange`、`Conditional`、`Blocked` 和 `Manual`。它反映当前只读快照，不是执行授权；随后运行 `Auto` 或 `ResolveLegacyState` 时仍会重新采集证据，不能复用旧计划绕过安全检查。`ResolveLegacyState` 需要管理员权限，只归档可严格证明为 Superseded/Abandoned 的旧状态；有效的当前重建状态保持不变。
 
 如需自动重启：
 
@@ -165,6 +176,12 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 - `claude-setup-*.log`
 - `claude-diagnostic-*.txt`
 - `claude-diagnostic-*.json`
+
+`-Action Plan` 不创建上述目录或文件，JSON 只写到标准输出。`ResolveLegacyState` 只写本次动作日志和必要的 `state-history` 回执，不生成完整诊断报告。
+
+## 验证边界
+
+仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、只读 Plan 快照、隔离状态夹具、归档前证据失效和发布包一致性。它们不是在每次提交中真实安装 Claude、启动 Hyper-V/Cowork、联网进入 Workspace 的端到端测试。发布 ZIP 当前由 SHA-256 校验，但尚未提供独立 Sigstore/GitHub artifact attestation；因此不能把本工具描述为已在所有 Windows 环境完成生产级 E2E 或供应链证明。
 
 ## 官方资料
 
