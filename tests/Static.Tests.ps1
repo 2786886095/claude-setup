@@ -22,10 +22,12 @@ $main = Get-Content -LiteralPath (Join-Path $root 'ClaudeSetup.ps1') -Raw -Encod
 $batch = Get-Content -LiteralPath (Join-Path $root 'install.bat') -Raw -Encoding UTF8
 $legacyBatch = Get-Content -LiteralPath (Join-Path $root 'setup.cmd') -Raw -Encoding UTF8
 $diagnoseBatch = Get-Content -LiteralPath (Join-Path $root 'diagnose.cmd') -Raw -Encoding UTF8
+$shareDiagnoseBatch = Get-Content -LiteralPath (Join-Path $root 'share-diagnose.cmd') -Raw -Encoding UTF8
 $elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw -Encoding UTF8
 $zstdHelperPath = Join-Path $root 'VmZstdDecompress.js'
 $zstdHelper = Get-Content -LiteralPath $zstdHelperPath -Raw -Encoding UTF8
 $security = Get-Content -LiteralPath (Join-Path $root 'SECURITY.md') -Raw -Encoding UTF8
+$releaseWorkflow = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release.yml') -Raw -Encoding UTF8
 $attributes = Get-Content -LiteralPath (Join-Path $root '.gitattributes') -Raw -Encoding UTF8
 $batchFiles = Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Extension -in @('.bat', '.cmd') }
 if ($attributes -notmatch '(?m)^\*\.bat text eol=crlf\r?$' -or $attributes -notmatch '(?m)^\*\.cmd text eol=crlf\r?$') {
@@ -124,6 +126,12 @@ $requiredSafetyChecks = @(
     'Archive-SupersededVmRebuildState'
     'Test-AbandonedLegacyVmRebuildState'
     'Archive-AbandonedVmRebuildState'
+    'MinimumLifecycleTime'
+    'LifecycleFreshAfterAnchor'
+    'Get-RecentCoworkErrorEvidence'
+    'Invoke-HttpFileDownload'
+    'DOWNLOAD_LENGTH_MISMATCH'
+    'ConvertTo-ShareSafeDiagnosticValue'
     'vm-rebuild-state-abandoned'
     'state-history'
     'vm-rebuild-active.json'
@@ -140,13 +148,16 @@ foreach ($text in $requiredSafetyChecks) {
 if ($main -match 'AllowUnsigned') {
     throw 'The installer must never install an unsigned AppX package.'
 }
+foreach ($required in @('actions/attest@v4', 'id-token: write', 'attestations: write', 'artifact-metadata: write', 'gh release create', 'git ls-files')) {
+    if (-not $releaseWorkflow.Contains($required)) { throw "Release workflow is missing provenance/release control: $required" }
+}
 if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
     throw 'PreserveApplicationData is not valid protection for a normal signed MSIX; profile migration must complete before removal.'
 }
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'v1.2.2', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
 }
 $storageStart = $main.IndexOf('function Repair-VmStorageAttributes')
@@ -209,6 +220,10 @@ $autoResolveIndex = $autoBlock.IndexOf('Resolve-VmRebuildState')
 if ($autoBootstrapIndex -lt 0 -or $autoPackageIndex -lt $autoBootstrapIndex -or
     $autoWaitIndex -lt $autoPackageIndex -or $autoResolveIndex -lt $autoWaitIndex) {
     throw 'Auto must bootstrap and verify the official package, wait for full evidence, and only then resolve an orphaned legacy state.'
+}
+if ($autoBlock -notmatch '(?s)abandonedLifecycleAnchor.*?Wait-AbandonedLegacyVmRebuildEvidence.+MinimumLifecycleTime.*?Resolve-VmRebuildState.+MinimumLifecycleTime' -or
+    $autoBlock -notmatch 'evidenceWaitSeconds = if \(\$SkipLaunch\) \{ 0 \} else \{ 180 \}') {
+    throw 'Auto must bind Abandoned archival to current-execution lifecycle evidence and allow time for the user to enter Cowork.'
 }
 if ($main -notmatch '(?s)function Get-SetupPlanExecutionAdvice.*?RecommendedCommand.*?blockedSteps\.Count -eq 0' -or $main -notmatch 'BlockerResolution =') {
     throw 'Plan must suppress the Auto recommendation and provide machine-readable resolution data when blockers exist.'
@@ -320,6 +335,11 @@ if ($legacyBatch -notmatch '(?i)call\s+"%~dp0install\.bat"') {
 if ($diagnoseBatch -notmatch '%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe' -or
     $diagnoseBatch -notmatch 'PSModulePath=%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\Modules') {
     throw 'diagnose.cmd must use the same isolated system Windows PowerShell chain as install.bat.'
+}
+if ($shareDiagnoseBatch -notmatch '%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe' -or
+    $shareDiagnoseBatch -notmatch '-Action Diagnose -Redact' -or
+    $shareDiagnoseBatch -notmatch 'claude-diagnostic-share-') {
+    throw 'share-diagnose.cmd must use isolated Windows PowerShell and create explicitly redacted reports.'
 }
 if ($batch -notmatch '(?i)Recommended entry:\s*install\.bat') {
     throw 'install.bat must visibly identify itself as the recommended entry point.'
@@ -606,6 +626,106 @@ try {
         if ($timestampedCrossLog.CurrentVirtualDisk1772 -or -not $timestampedCrossLog.FailureResolvedByLaterSuccess) {
             throw 'Timestamped cross-log success evidence must resolve an older 0x1772.'
         }
+        $crossLogSegmentation = Get-RecentCoworkErrorEvidence -LogPaths @($ambiguousFailureLog, $ambiguousSuccessLog)
+        if ($crossLogSegmentation.CurrentErrors.Count -ne 0 -or $crossLogSegmentation.HistoricalErrors.Count -ne 1 -or
+            -not $crossLogSegmentation.GlobalSuccessCutoff) {
+            throw 'A timestamped complete success sequence may resolve older errors across service/node log boundaries.'
+        }
+
+        $emptyLifecycleLog = Join-Path $statusRoot 'no-lifecycle-events.log'
+        [IO.File]::WriteAllText($emptyLifecycleLog, 'ordinary service message without a VM lifecycle event')
+        $emptyLifecycle = Get-ClaudeVmLifecycleEvidence -LogPaths @($emptyLifecycleLog)
+        if ($emptyLifecycle.CurrentRunHealthy -or $emptyLifecycle.CurrentVirtualDisk1772 -or $emptyLifecycle.LatestVmStartedAt) {
+            throw 'A log without lifecycle events must return an empty unhealthy snapshot without throwing under StrictMode.'
+        }
+
+        $segmentedLog = Join-Path $statusRoot 'segmented-errors.log'
+        [IO.File]::WriteAllLines($segmentedLog, @(
+            '2026/08/15 01:00:00 structured error follows',
+            "  [message]: 'RPC pipe closed',",
+            '2026/08/15 01:01:00 VM started successfully',
+            '2026/08/15 01:01:01 sdk-daemon is ready',
+            '2026/08/15 01:01:02 Network status: CONNECTED',
+            '2026/08/15 01:01:03 API reachability: REACHABLE',
+            '2026/08/15 01:02:00 VHDX file not found',
+            '2026/08/15 01:02:01 failed to configure recovery actions: Access is denied'
+        ))
+        $segmented = Get-RecentCoworkErrorEvidence -LogPaths @($segmentedLog)
+        if ($segmented.HistoricalErrors.Count -ne 1 -or $segmented.CurrentErrors.Count -ne 1 -or
+            $segmented.Information.Count -ne 4 -or $segmented.RecoveryWarnings.Count -ne 1) {
+            throw 'Cowork diagnostics must separate unresolved current errors, superseded history, success events, and nonfatal recovery-action warnings.'
+        }
+
+        $downloadDestination = Join-Path $statusRoot 'download.bin'
+        $downloadCounter = [pscustomobject]@{ Value = 0 }
+        $downloadResult = Invoke-HttpFileDownload -Uri 'https://example.invalid/fixture' -Destination $downloadDestination `
+            -MaxAttempts 3 -InitialDelaySeconds 0 -SleepProvider { param($ignoredDelay) } -DownloadProvider {
+                param($ignoredUri, $partialPath, $attempt)
+                $downloadCounter.Value++
+                if ($attempt -lt 3) { throw [TimeoutException]::new('fixture timeout') }
+                [IO.File]::WriteAllBytes($partialPath, [byte[]](1, 2, 3, 4))
+                return [pscustomobject]@{ ContentLength = 4 }
+            }
+        if ($downloadResult.Attempts -ne 3 -or $downloadCounter.Value -ne 3 -or
+            (Get-Item -LiteralPath $downloadDestination).Length -ne 4 -or (Test-Path -LiteralPath "$downloadDestination.partial")) {
+            throw 'Official file download must retry with a same-directory partial file and publish only the complete result.'
+        }
+        $lengthMismatch = $false
+        try {
+            [void](Invoke-HttpFileDownload -Uri 'https://example.invalid/mismatch' -Destination (Join-Path $statusRoot 'mismatch.bin') `
+                -MaxAttempts 1 -InitialDelaySeconds 0 -DownloadProvider {
+                    param($ignoredUri, $partialPath, $attempt)
+                    [IO.File]::WriteAllBytes($partialPath, [byte[]](1, 2, 3))
+                    return [pscustomobject]@{ ContentLength = 4 }
+                })
+        } catch {
+            $lengthMismatch = $_.Exception.Message -match 'DOWNLOAD_LENGTH_MISMATCH'
+        }
+        if (-not $lengthMismatch -or -not $script:LastDownloadFailure -or
+            $script:LastDownloadFailure.Code -ne 'DOWNLOAD_LENGTH_MISMATCH') {
+            throw 'Download length mismatch must fail closed with a machine-readable reason.'
+        }
+        $trustedDestination = Join-Path $statusRoot 'trusted-existing.bin'
+        [IO.File]::WriteAllBytes($trustedDestination, [byte[]](9, 9, 9))
+        $trustedHash = (Get-FileHash -LiteralPath $trustedDestination -Algorithm SHA256).Hash
+        $signatureRejected = $false
+        try {
+            [void](Invoke-HttpFileDownload -Uri 'https://example.invalid/untrusted' -Destination $trustedDestination `
+                -MaxAttempts 1 -InitialDelaySeconds 0 -DownloadProvider {
+                    param($ignoredUri, $partialPath, $attempt)
+                    [IO.File]::WriteAllBytes($partialPath, [byte[]](1, 2, 3))
+                    return [pscustomobject]@{ ContentLength = 3 }
+                } -ValidateDownloadedFile {
+                    param($candidatePath)
+                    throw [IO.InvalidDataException]::new('[DOWNLOAD_SIGNATURE_INVALID] fixture signature rejection')
+                })
+        } catch {
+            $signatureRejected = $_.Exception.Message -match 'DOWNLOAD_SIGNATURE_INVALID'
+        }
+        if (-not $signatureRejected -or (Get-FileHash -LiteralPath $trustedDestination -Algorithm SHA256).Hash -ne $trustedHash -or
+            (Test-Path -LiteralPath "$trustedDestination.partial") -or (Test-Path -LiteralPath "$trustedDestination.previous")) {
+            throw 'Signature/identity validation must occur before publication and preserve an existing trusted download on rejection.'
+        }
+
+        $privateReport = [pscustomobject]@{
+            GeneratedAt = (Get-Date).ToString('o')
+            Computer = $env:COMPUTERNAME
+            User = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            Findings = @([pscustomobject]@{
+                Id = 'fixture'
+                Status = 'Info'
+                Summary = 'fixture'
+                Detail = "$env:USERPROFILE $root S-1-5-21-111-222-333-1001 person@example.com"
+            })
+        }
+        $sharedReport = ConvertTo-ShareSafeDiagnosticValue $privateReport
+        $sharedJson = $sharedReport | ConvertTo-Json -Depth 6
+        $sharedDetail = [string]$sharedReport.Findings.Detail
+        if ($sharedJson -match [regex]::Escape($env:USERPROFILE) -or $sharedJson -match [regex]::Escape($root) -or
+            $sharedJson -match 'S-1-5-21-111' -or $sharedJson -match 'person@example\.com' -or
+            $sharedDetail -notmatch '%USERPROFILE%' -or $sharedDetail -notmatch '<SID>' -or $sharedDetail -notmatch '<EMAIL>') {
+            throw 'Share-report redaction must remove user paths, tool paths, SID, email, computer, and account identifiers.'
+        }
 
         $profileSource = Join-Path $statusRoot 'profile-source'
         $profileTarget = Join-Path $statusRoot 'profile-target'
@@ -688,6 +808,32 @@ try {
         }
         $validSignatures = [pscustomobject]@{ Valid = $true }
         $invalidSignatures = [pscustomobject]@{ Valid = $false }
+        $freshnessAnchor = '2026-08-16T01:00:00+00:00'
+        $staleLifecycle = [pscustomobject]@{
+            CurrentRunHealthy = $true
+            CurrentVirtualDisk1772 = $false
+            LatestVmStartedAt = '2026-08-16T00:59:00+00:00'
+            LatestDaemonReadyAt = '2026-08-16T00:59:01+00:00'
+            LatestNetworkConnectedAt = '2026-08-16T00:59:02+00:00'
+            LatestApiReachableAt = '2026-08-16T00:59:03+00:00'
+        }
+        $freshLifecycle = [pscustomobject]@{
+            CurrentRunHealthy = $true
+            CurrentVirtualDisk1772 = $false
+            LatestVmStartedAt = '2026-08-16T01:00:01+00:00'
+            LatestDaemonReadyAt = '2026-08-16T01:00:02+00:00'
+            LatestNetworkConnectedAt = '2026-08-16T01:00:03+00:00'
+            LatestApiReachableAt = '2026-08-16T01:00:04+00:00'
+        }
+        $staleEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $abandonedState -Paths $independentPaths `
+            -LifecycleEvidence $staleLifecycle -CoreSignatures $validSignatures -MinimumLifecycleTime $freshnessAnchor
+        $freshEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $abandonedState -Paths $independentPaths `
+            -LifecycleEvidence $freshLifecycle -CoreSignatures $validSignatures -MinimumLifecycleTime $freshnessAnchor
+        if ($staleEvidence.Eligible -or $staleEvidence.LifecycleFreshAfterAnchor -or
+            -not ($staleEvidence.Reasons -match '早于本次启动锚点') -or
+            -not $freshEvidence.Eligible -or -not $freshEvidence.LifecycleFreshAfterAnchor) {
+            throw 'Abandoned-state archival must require every lifecycle success event to be newer than the current Auto execution anchor.'
+        }
         $bootstrapEvidence = Get-LegacyStateBootstrapEvidence -State $abandonedState -ExpectedBundlePath $legacyBundle
         if (-not $bootstrapEvidence.Eligible) {
             throw "An orphaned official-package state with both referenced paths absent must permit package bootstrap: $($bootstrapEvidence.Reasons -join '; ')"
@@ -769,6 +915,7 @@ try {
                 $abandonedReceipt.CurrentActiveUserData -ne $independentData -or
                 -not $abandonedReceipt.Verification.CoreSignaturesValid -or
                 $abandonedReceipt.Verification.VmCriticalEfsCount -ne 0 -or
+                $abandonedReceipt.Verification.EvidenceFreshness -ne 'HistoricalSnapshot' -or
                 @($abandonedReceipt.Verification.VmFiles).Count -ne 5) {
                 throw 'Abandoned-state receipt does not accurately describe the verified missing-backup disposition.'
             }

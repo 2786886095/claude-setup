@@ -95,9 +95,9 @@
 
 自动解密范围只包括活动数据根目录、`vm_bundles`、`claudevm.bundle` 和五个 VM 运行文件。会话 `.jsonl`、`local-agent-mode-sessions`、`claude-code-sessions`、outputs、uploads、配置及缓存即使使用 EFS，也只显示为 Info，不会阻断 Cowork 或被自动解密。
 
-若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，v1.2.1 会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和引用备份均已不存在时，Auto 先安装/验证官方包并最多等待 90 秒，再要求当前 VM 完整、VM 关键路径无 EFS、完整成功日志成立且 Claude/cowork-svc 双签名有效，才归档为 Abandoned。Abandoned 落盘前还会重新核验全部证据，并把五个 VM 文件的长度/时间、EFS、日志和签名快照写入回执。若只缺一侧、路径异常或任一健康证据不足，工具保持状态、列出全部拒绝原因并停止。
+若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，最新版会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和引用备份均已不存在时，Auto 先安装/验证官方包，记录本次 UTC 锚点并最多等待 180 秒。请在 Claude 中进入 Cowork；只有 VM、Daemon、Network、API 四项成功时间都不早于锚点，且当前 VM 完整、关键路径无 EFS、双签名有效时才归档 Abandoned。若超时或证据不足，状态保持不动并列出原因。
 
-Diagnose 会把已经验证的孤立状态明确显示为“当前独立 VM 健康，Auto 对该状态只执行归档和旧 RunOnce 清理，随后继续常规安装验证”；无法验证的孤立状态会单独提示缺少的健康或签名条件，不再误称重建仍在正常进行。
+Diagnose 会区分当前未解决错误、已被后续完整成功序列覆盖的历史错误和成功事件；`CoworkVMService` 无法自行设置 recovery actions 的 Access denied 会单列为非致命警告，不会覆盖服务与 VM 的实际健康结论。无法验证的孤立状态会单独提示缺少的健康或签名条件。
 
 正式修改前可在普通 PowerShell 中运行：
 
@@ -117,4 +117,12 @@ Diagnose 会把已经验证的孤立状态明确显示为“当前独立 VM 健�
 
 若旧版出现 `Microsoft.PowerShell.Security could not be loaded`、`ObjectSecurity TypeData` 重复或 `Get-AuthenticodeSignature` 不可用，不代表 Claude 签名已经损坏。常见原因是 PowerShell 7 父进程经 `cmd.exe` 把自己的 `PSModulePath` 传给 Windows PowerShell 5.1。
 
-v1.2.1 的 `install.bat` 使用系统绝对路径启动 Windows PowerShell，并只在该批处理进程内设置系统模块路径；`ClaudeSetup.ps1` 也按 `$PSHOME` 绝对路径导入安全模块。它不会调用 `setx`，不会永久覆盖用户/系统 `PSModulePath`。请使用最新版完整 ZIP 中的 `install.bat`，不要单独复制旧批处理与新脚本混用。
+最新版 `install.bat` 使用系统绝对路径启动 Windows PowerShell，并只在该批处理进程内设置系统模块路径；`ClaudeSetup.ps1` 也按 `$PSHOME` 绝对路径导入安全模块。它不会调用 `setx`，不会永久覆盖用户/系统 `PSModulePath`。请使用最新版完整 ZIP 中的 `install.bat`，不要单独复制旧批处理与新脚本混用。
+
+## 官方下载失败
+
+官方下载最多尝试三次，使用同目录 `.partial` 文件；Content-Length（若服务器提供）、Anthropic 签名、包身份、架构和 SHA-256 全部在转正前验证，拒绝的候选不会覆盖已有可信缓存。最终失败时，诊断 JSON 的 `DownloadFailure.Code` 会区分 `DOWNLOAD_DNS`、`DOWNLOAD_PROXY`、`DOWNLOAD_TLS`、`DOWNLOAD_HTTP`、`DOWNLOAD_TIMEOUT`、`DOWNLOAD_DISK`、`DOWNLOAD_EMPTY`、`DOWNLOAD_LENGTH_MISMATCH`、`DOWNLOAD_SIGNATURE_INVALID`、`DOWNLOAD_IDENTITY_INVALID`、`DOWNLOAD_ARCHITECTURE_INVALID` 与 `DOWNLOAD_UNKNOWN`。Claude 自己下载 VM bundle 的 CDN/代理故障只能由本项目诊断和触发官方重试，工具不会把网络问题伪装成本地文件修复成功。
+
+## 分享诊断报告
+
+普通 `diagnose.cmd` 报告可能包含用户名、设备型号和绝对路径。准备公开上传时请运行 `share-diagnose.cmd` 或 `ClaudeSetup.ps1 -Action Diagnose -Redact`；输出文件名为 `claude-diagnostic-share-*`，会替换用户名、设备名、SID、邮箱、用户目录和工具工作目录。脱敏是降低泄露风险，不保证能识别日志中的所有自由文本秘密，分享前仍应人工浏览一次。

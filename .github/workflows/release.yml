@@ -1,0 +1,60 @@
+name: Release and attest
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate with Windows PowerShell
+        shell: powershell
+        run: .\tests\Static.Tests.ps1
+
+      - name: Validate with PowerShell 7
+        shell: pwsh
+        run: .\tests\Static.Tests.ps1
+
+      - name: Build release archive from tracked files
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'claude-setup-windows'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          foreach ($file in @(git ls-files)) {
+            $target = Join-Path $stage $file
+            New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+            Copy-Item -LiteralPath $file -Destination $target
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = Join-Path $PWD 'claude-setup-windows.zip'
+          [IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive, [IO.Compression.CompressionLevel]::Optimal, $false)
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          "$hash  claude-setup-windows.zip" | Set-Content -LiteralPath 'claude-setup-windows.sha256' -Encoding ascii
+
+      - name: Attest release archive provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: claude-setup-windows.zip
+
+      - name: Create or update GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag claude-setup-windows.zip claude-setup-windows.sha256 --clobber
+          } else {
+            gh release create $tag claude-setup-windows.zip claude-setup-windows.sha256 --title $tag --generate-notes --latest
+          }

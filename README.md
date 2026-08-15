@@ -2,7 +2,7 @@
 
 一个面向 Claude Desktop 与 Cowork 的 Windows 一键安装、修复和诊断工具。
 
-> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.2.1 还修复了“未安装包＋孤立旧状态”的 Auto 顺序和 PowerShell 7 父环境污染 Windows PowerShell 模块路径的问题。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
+> **安全公告（2026-08-14）：请勿运行 v1.0.4–v1.0.13。** 这些版本可能把 AppX“应用程序受保护”加密误判为普通 EFS，并自动移动原本可读的 VM bundle。v1.0.14 起改为失效保护；v1.2.2 进一步把孤立状态归档绑定到本次 Auto 启动后的 VM/Daemon/Network/API 完整成功序列。已经运行旧版的用户请保留所有仍存在的 `claudevm.bundle.backup-*`，不要删除、解密或硬链接，参见 [SECURITY.md](SECURITY.md)。
 
 > **应该运行哪个文件？** 解压后只需双击 **`install.bat`**。
 >
@@ -51,11 +51,13 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 识别 v1.0.x 遗留的 `vm-rebuild-active.json`。旧备份存在时，只有旧状态精确属于 Claude AppX 私有目录且当前独立 VM 完整健康，才归档为 Superseded，并永久保留旧备份；旧活动目录与备份均已不存在时，还必须复核当前 VM 关键 EFS、完整成功日志及 Claude/cowork-svc 的 Anthropic 签名，才归档为 Abandoned。两种记录都进入 `%ProgramData%\ClaudeSetup\state-history`；
 - 在任何安装或修复前可运行 `-Action Plan` 输出单个 JSON 操作计划；该动作不请求 UAC，不创建日志/报告，不下载，也不修改文件、AppX、服务、进程、环境变量、RunOnce 或 VM 状态；
 - `-Action ResolveLegacyState` 只处理已经满足安全条件的遗留状态，不进入下载、安装、服务启动或 VM 修复流程；Abandoned 在移动状态 JSON 前会重新读取状态并绑定五个 VM 文件的长度/时间、VM 关键 EFS、当前完整健康日志和双签名证据到回执；
-- 当旧状态精确指向 Claude 官方包族路径且旧活动 bundle/备份都已消失时，Auto 会先安装并验证官方包、恢复安全用户数据布局、启动 Claude，并在最多 90 秒内反复采集完整 Abandoned 证据；只有全部条件成立才归档，超时保留状态并列出每个拒绝原因；
+- 当旧状态精确指向 Claude 官方包族路径且旧活动 bundle/备份都已消失时，Auto 会先安装并验证官方包、恢复安全用户数据布局、启动 Claude，并在最多 180 秒内等待用户进入 Cowork；四项健康事件都必须晚于本次执行锚点，旧日志不能冒充本次验证；
 - `install.bat` 与 `diagnose.cmd` 固定调用 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`，仅为该子进程构造系统模块路径；不会永久覆盖用户或系统 `PSModulePath`，也不会误载 PowerShell 7/Scoop 版 `Microsoft.PowerShell.Security`；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
-- 生成可分享的 JSON 与文本报告。
+- 将 Cowork 日志分为“当前未解决错误”“已被后续完整成功序列覆盖的历史错误”“成功事件”，并把服务 recovery-actions 权限警告单独标为非致命；
+- 官方 MSIX 下载使用同目录临时文件、最多三次指数退避，并在转正前完成 Content-Length、签名、包身份、架构与 SHA-256 复核；失败代码在诊断 JSON 的 `DownloadFailure` 中机器可读；
+- 生成 JSON 与文本报告；双击 `share-diagnose.cmd` 或使用 `-Redact` 可生成移除用户名、设备名、SID、邮箱及个人路径的分享版。
 - 安装或修复成功后，在当前用户桌面创建或更新 `Claude.lnk`；快捷方式使用稳定的官方 AppX 启动标识，Claude 自动更新后仍然有效。
 - 桌面快捷方式优先使用官方 MSIX `Assets\Square150x150Logo.png` 生成持久化 256×256 ICO；生成时自动裁掉 PNG 外圈透明留白并保留 2 像素安全边距，不再使用偏小的灰色通用 Electron 图标。
 - 启动后必须验证本轮 Claude/Cowork 官方签名握手与 RPC；若用户已请求 Cowork VM，再等待最多 120 秒验证 VM、网络和 API。尚未进入 Cowork 时明确标记为“深度检测延期”，不把未启动的 VM 误判为故障。
@@ -79,7 +81,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 `setup.cmd` 仅为兼容旧下载保留，它会转交给 `install.bat`；两者不要重复运行。
 
-只诊断、不修改系统：双击 `diagnose.cmd`。
+只诊断、不修改系统：双击 `diagnose.cmd`。准备公开分享时双击 `share-diagnose.cmd`，它会生成 `claude-diagnostic-share-*`，原始报告仍可能含个人信息，不应直接公开。
 
 ### AppX 应用受保护存储与独立数据目录
 
@@ -94,6 +96,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 ```powershell
 .\ClaudeSetup.ps1 -Action Auto
 .\ClaudeSetup.ps1 -Action Diagnose
+.\ClaudeSetup.ps1 -Action Diagnose -Redact
 .\ClaudeSetup.ps1 -Action Repair
 .\ClaudeSetup.ps1 -Action ResolveLegacyState
 ```
@@ -180,12 +183,13 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 - `claude-setup-*.log`
 - `claude-diagnostic-*.txt`
 - `claude-diagnostic-*.json`
+- `claude-diagnostic-share-*.txt` / `*.json`（显式脱敏）
 
 `-Action Plan` 不创建上述目录或文件，JSON 只写到标准输出。`ResolveLegacyState` 只写本次动作日志和必要的 `state-history` 回执，不生成完整诊断报告。
 
 ## 验证边界
 
-仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan 快照、孤立状态 bootstrap/证据重试夹具、归档前证据失效和发布包一致性。v1.2.0 曾在一台 Windows 11 build 26200 机器完成真实卸载、官方重装、Cowork VM、网络与 API E2E，但这不代表每次提交或所有机器都有真实 E2E。发布 ZIP 当前由 SHA-256 校验，但尚未提供独立 Sigstore/GitHub artifact attestation；因此不能把本工具描述为已在所有 Windows 环境完成生产级 E2E 或供应链证明。
+仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan、孤立状态 bootstrap、新鲜度锚点、日志分段、下载重试/长度失败、分享报告脱敏和归档前证据失效。v1.2.1 曾在一台 Windows 11 build 26200 机器完成真实卸载、官方重装、Cowork VM、网络与 API E2E；v1.2.2 的改动使用隔离夹具和只读实机检查验证，不冒充新的破坏性 E2E。标签发布由 GitHub Actions 从跟踪文件构建 ZIP、生成 SHA-256 并发布 build provenance attestation，可用 `gh attestation verify claude-setup-windows.zip --repo 2786886095/claude-setup` 验证；这仍不代表所有 Windows、代理、安全软件或 ARM64 环境都已覆盖。
 
 ## 官方资料
 

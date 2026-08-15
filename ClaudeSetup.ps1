@@ -10,7 +10,8 @@ param(
 
     [switch]$RestartIfNeeded,
     [switch]$NonInteractive,
-    [switch]$SkipLaunch
+    [switch]$SkipLaunch,
+    [switch]$Redact
 )
 
 Set-StrictMode -Version 2.0
@@ -18,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.2.1'
+$script:ToolVersion = '1.2.2'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -43,6 +44,7 @@ $script:IndependentUserDataStatePath = Join-Path $script:ProgramDataRoot 'indepe
 $script:DetectedClaudeUserData = $null
 $script:SuppressConsoleLog = $false
 $script:SecurityModuleVerified = $false
+$script:LastDownloadFailure = $null
 $script:WindowsPowerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 function Write-Log {
@@ -113,6 +115,7 @@ function Get-CurrentArgumentList {
     if ($RestartIfNeeded) { $arguments += '-RestartIfNeeded' }
     if ($NonInteractive) { $arguments += '-NonInteractive' }
     if ($SkipLaunch) { $arguments += '-SkipLaunch' }
+    if ($Redact) { $arguments += '-Redact' }
     return $arguments
 }
 
@@ -899,16 +902,18 @@ function Get-ClaudeVmLifecycleEvidence {
     }
 
     $healthyWithoutFailure = $false
+    $eventKinds = @($events | ForEach-Object { $_.Kind })
     if ($failures.Count -eq 0) {
-        foreach ($path in @($events.Path | Select-Object -Unique)) {
+        foreach ($path in @($events | ForEach-Object { $_.Path } | Select-Object -Unique)) {
             $pathEvents = @($events | Where-Object Path -eq $path)
-            if (@($successKinds | Where-Object { $_ -notin $pathEvents.Kind }).Count -eq 0) {
+            $pathEventKinds = @($pathEvents | ForEach-Object { $_.Kind })
+            if (@($successKinds | Where-Object { $_ -notin $pathEventKinds }).Count -eq 0) {
                 $healthyWithoutFailure = $true
                 break
             }
         }
         if (-not $healthyWithoutFailure) {
-            $healthyWithoutFailure = @($successKinds | Where-Object { $_ -notin $events.Kind }).Count -eq 0 -and
+            $healthyWithoutFailure = @($successKinds | Where-Object { $_ -notin $eventKinds }).Count -eq 0 -and
                 @($events | Where-Object { $_.Kind -in $successKinds -and $null -eq $_.Time }).Count -eq 0
         }
     }
@@ -1240,7 +1245,8 @@ function Get-AbandonedLegacyVmRebuildEvidence {
         [Parameter(Mandatory)]$State,
         $Paths,
         $LifecycleEvidence,
-        $CoreSignatures
+        $CoreSignatures,
+        [string]$MinimumLifecycleTime
     )
     $reasons = New-Object System.Collections.Generic.List[string]
     $statePaths = $null
@@ -1291,6 +1297,27 @@ function Get-AbandonedLegacyVmRebuildEvidence {
     if (-not $lifecycle -or -not $lifecycle.CurrentRunHealthy -or $lifecycle.CurrentVirtualDisk1772) {
         $reasons.Add('当前日志没有证明完整健康序列，或仍有未解决的 0x1772。')
     }
+    $lifecycleFreshAfterAnchor = $null
+    if ($MinimumLifecycleTime) {
+        $minimum = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse($MinimumLifecycleTime, [ref]$minimum)) {
+            $reasons.Add('本次执行的健康证据时间锚点无效。')
+            $lifecycleFreshAfterAnchor = $false
+        } else {
+            $lifecycleFreshAfterAnchor = $true
+            foreach ($property in @('LatestVmStartedAt', 'LatestDaemonReadyAt', 'LatestNetworkConnectedAt', 'LatestApiReachableAt')) {
+                $eventTime = [DateTimeOffset]::MinValue
+                $value = if ($lifecycle -and $lifecycle.PSObject.Properties[$property]) { [string]$lifecycle.$property } else { $null }
+                if (-not $value -or -not [DateTimeOffset]::TryParse($value, [ref]$eventTime) -or $eventTime -lt $minimum) {
+                    $lifecycleFreshAfterAnchor = $false
+                    break
+                }
+            }
+            if (-not $lifecycleFreshAfterAnchor) {
+                $reasons.Add("完整 VM/网络/API 健康序列早于本次启动锚点 $($minimum.ToString('o'))；请在已启动的 Claude 中进入 Cowork。")
+            }
+        }
+    }
     $signatures = if ($CoreSignatures) { $CoreSignatures } else { Test-ClaudeCoreSignatures }
     if (-not $signatures -or -not $signatures.Valid) { $reasons.Add('Claude.exe 或 cowork-svc.exe 的 Anthropic 签名无效。') }
     $vmFiles = @()
@@ -1312,6 +1339,8 @@ function Get-AbandonedLegacyVmRebuildEvidence {
         VmFiles = $vmFiles
         VmCriticalEfsCount = $criticalEfsItems.Count
         Lifecycle = $lifecycle
+        MinimumLifecycleTime = if ($MinimumLifecycleTime) { $MinimumLifecycleTime } else { $null }
+        LifecycleFreshAfterAnchor = $lifecycleFreshAfterAnchor
         CoreSignaturesValid = [bool]($signatures -and $signatures.Valid)
         VerifiedAt = (Get-Date).ToUniversalTime().ToString('o')
     }
@@ -1322,6 +1351,7 @@ function Wait-AbandonedLegacyVmRebuildEvidence {
         [Parameter(Mandatory)]$State,
         [int]$Seconds = 90,
         [int]$PollMilliseconds = 5000,
+        [string]$MinimumLifecycleTime,
         [scriptblock]$EvidenceProvider
     )
     $deadline = (Get-Date).AddSeconds([math]::Max(0, $Seconds))
@@ -1332,7 +1362,7 @@ function Wait-AbandonedLegacyVmRebuildEvidence {
         } else {
             $script:DetectedClaudeUserData = $null
             $paths = Get-ClaudePaths
-            Get-AbandonedLegacyVmRebuildEvidence -State $State -Paths $paths
+            Get-AbandonedLegacyVmRebuildEvidence -State $State -Paths $paths -MinimumLifecycleTime $MinimumLifecycleTime
         }
         if ($evidence -and $evidence.Eligible) { return $evidence }
         $reasonText = if ($evidence -and $evidence.Reasons) { $evidence.Reasons -join '；' } else { '无法采集 Abandoned 安全证据。' }
@@ -1351,11 +1381,12 @@ function Test-AbandonedLegacyVmRebuildState {
         [Parameter(Mandatory)]$State,
         $Paths,
         $LifecycleEvidence,
-        $CoreSignatures
+        $CoreSignatures,
+        [string]$MinimumLifecycleTime
     )
     try {
         $evidence = Get-AbandonedLegacyVmRebuildEvidence -State $State -Paths $Paths `
-            -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures
+            -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures -MinimumLifecycleTime $MinimumLifecycleTime
         return [bool]$evidence.Eligible
     } catch { return $false }
 }
@@ -1399,6 +1430,7 @@ function Archive-AbandonedVmRebuildState {
         $Paths,
         $LifecycleEvidence,
         $CoreSignatures,
+        [string]$MinimumLifecycleTime,
         [switch]$SkipResumeCleanup
     )
     $statePaths = Get-VmRebuildStatePathShape $State
@@ -1411,7 +1443,7 @@ function Archive-AbandonedVmRebuildState {
         throw '孤立状态在归档前发生变化；保持最新状态并停止。'
     }
     $freshEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $onDiskState -Paths $Paths `
-        -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures
+        -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures -MinimumLifecycleTime $MinimumLifecycleTime
     if (-not $freshEvidence.Eligible) {
         throw "孤立状态归档前的完整证据复核失败；保持状态并停止：$($freshEvidence.Reasons -join '；')"
     }
@@ -1429,7 +1461,11 @@ function Archive-AbandonedVmRebuildState {
         [pscustomobject]@{
             SchemaVersion = 2
             Status = 'Abandoned'
-            AbandonedReason = 'Legacy AppX bundle and backup no longer exist; current independent VM is verified healthy'
+            AbandonedReason = if ($MinimumLifecycleTime) {
+                'Legacy AppX bundle and backup no longer exist; independent VM health is verified after this execution started'
+            } else {
+                'Legacy AppX bundle and backup no longer exist; independent VM files and historical complete health evidence were verified at archival time'
+            }
             PreviousOriginalPath = [string]$State.OriginalPath
             PreviousBackupPath = [string]$State.BackupPath
             OriginalPathPresent = $false
@@ -1442,6 +1478,9 @@ function Archive-AbandonedVmRebuildState {
                 VmFiles = $freshEvidence.VmFiles
                 VmCriticalEfsCount = $freshEvidence.VmCriticalEfsCount
                 Lifecycle = $freshEvidence.Lifecycle
+                EvidenceFreshness = if ($MinimumLifecycleTime) { 'CurrentExecution' } else { 'HistoricalSnapshot' }
+                MinimumLifecycleTime = $freshEvidence.MinimumLifecycleTime
+                LifecycleFreshAfterAnchor = $freshEvidence.LifecycleFreshAfterAnchor
                 CoreSignaturesValid = $freshEvidence.CoreSignaturesValid
             }
             OriginalStateArchive = $originalArchive
@@ -1465,6 +1504,7 @@ function Resolve-VmRebuildState {
         $Paths,
         $LifecycleEvidence,
         $CoreSignatures,
+        [string]$MinimumLifecycleTime,
         [switch]$SkipResumeCleanup
     )
     $state = if ($PSBoundParameters.ContainsKey('State')) { $State } else { Get-VmRebuildState }
@@ -1481,11 +1521,11 @@ function Resolve-VmRebuildState {
         $abandonedEvidence = $null
         try {
             $abandonedEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $state -Paths $Paths `
-                -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures
+                -LifecycleEvidence $LifecycleEvidence -CoreSignatures $CoreSignatures -MinimumLifecycleTime $MinimumLifecycleTime
         } catch {}
         if ($abandonedEvidence -and $abandonedEvidence.Eligible) {
             [void](Archive-AbandonedVmRebuildState -State $state -Paths $Paths -LifecycleEvidence $LifecycleEvidence `
-                -CoreSignatures $CoreSignatures -SkipResumeCleanup:$SkipResumeCleanup)
+                -CoreSignatures $CoreSignatures -MinimumLifecycleTime $MinimumLifecycleTime -SkipResumeCleanup:$SkipResumeCleanup)
             return $null
         }
         $abandonedReasons = if ($abandonedEvidence -and $abandonedEvidence.Reasons) {
@@ -2208,43 +2248,92 @@ function Test-CompressedPath {
     return [bool]((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::Compressed)
 }
 
-function Get-RecentCoworkErrors {
-    $patterns = @(
-        'RPC pipe closed',
-        'signature verification failed',
-        'HashMismatch',
-        'sessiondata.vhdx',
-        'rootfs.vhdx',
-        'VHDX file not found',
-        'FILE_ENCRYPTED',
-        'EXDEV',
-        'UNKNOWN: unknown error, copyfile',
-        'CreateVirtualDisk failed: 0x199',
-        'CreateVirtualDisk failed: 0x1772',
-        'ERROR_APPX_FILE_NOT_ENCRYPTED',
-        'rootfs.vhdx.tmp',
-        'API reachability',
-        'VM service not running',
-        'Missing HCS'
-    )
-    $configured = Get-ConfiguredClaudeUserData
-    $logs = @(
-        'C:\ProgramData\Claude\Logs\cowork-service.log',
-        (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
-        (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log'),
-        $(if ($configured) { Join-Path $configured.Path 'logs\cowork_vm_node.log' })
-    ) | Where-Object { $_ } | Select-Object -Unique
-    $results = New-Object System.Collections.Generic.List[string]
-    foreach ($log in $logs) {
-        if (-not (Test-Path -LiteralPath $log)) { continue }
-        $tail = Get-Content -LiteralPath $log -Tail 600 -ErrorAction SilentlyContinue
-        foreach ($line in $tail) {
-            if ($patterns | Where-Object { $line -match [regex]::Escape($_) }) {
-                $results.Add("[$log] $line")
+function Get-CoworkLogTimestamp {
+    param([string]$Line)
+    $match = [regex]::Match([string]$Line, '(?<timestamp>\d{4}[-/]\d{2}[-/]\d{2}[T ][0-9:.]+(?:Z|[+-]\d{2}:?\d{2})?)')
+    if (-not $match.Success) { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($match.Groups['timestamp'].Value, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
+function Get-RecentCoworkErrorEvidence {
+    param([string[]]$LogPaths)
+    $errorPattern = '(?i)(RPC pipe closed|signature verification failed|HashMismatch|VHDX file not found|FILE_ENCRYPTED|\bEXDEV\b|UNKNOWN:\s*unknown error,\s*copyfile|CreateVirtualDisk failed: 0x199|CreateVirtualDisk failed: 0x1772|ERROR_APPX_FILE_NOT_ENCRYPTED|VM service not running|Missing HCS|Download stalled|no data received|(?:sessiondata|rootfs)\.vhdx.*(?:not found|missing|failed))'
+    $informationPattern = '(?i)(VM started successfully|HCS VM:\s*Running|sdk-daemon (?:is )?ready|Network(?: status)?\s*[:=]\s*CONNECTED\b|API(?: reachability)?\s*[:=]\s*REACHABLE\b)'
+    $recoveryPattern = '(?i)((?:failed|unable).*(?:configure|set).*recovery action|recovery actions?.*Access is denied)'
+    if (-not $LogPaths) {
+        $configured = Get-ConfiguredClaudeUserData
+        $LogPaths = @(
+            'C:\ProgramData\Claude\Logs\cowork-service.log',
+            (Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\logs\cowork_vm_node.log"),
+            (Join-Path $env:APPDATA 'Claude\logs\cowork_vm_node.log'),
+            $(if ($configured) { Join-Path $configured.Path 'logs\cowork_vm_node.log' })
+        ) | Where-Object { $_ } | Select-Object -Unique
+    }
+    $current = New-Object System.Collections.Generic.List[string]
+    $historical = New-Object System.Collections.Generic.List[string]
+    $information = New-Object System.Collections.Generic.List[string]
+    $recoveryWarnings = New-Object System.Collections.Generic.List[string]
+    $cutoffs = [ordered]@{}
+    $existingLogs = @($LogPaths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -Unique)
+    $globalLifecycle = if ($existingLogs.Count -gt 0) { Get-ClaudeVmLifecycleEvidence -LogPaths $existingLogs } else { $null }
+    $globalSuccessTimes = New-Object System.Collections.Generic.List[DateTimeOffset]
+    if ($globalLifecycle -and $globalLifecycle.CurrentRunHealthy) {
+        foreach ($property in @('LatestVmStartedAt', 'LatestDaemonReadyAt', 'LatestNetworkConnectedAt', 'LatestApiReachableAt')) {
+            $parsed = [DateTimeOffset]::MinValue
+            $value = if ($globalLifecycle.PSObject.Properties[$property]) { [string]$globalLifecycle.$property } else { $null }
+            if ($value -and [DateTimeOffset]::TryParse($value, [ref]$parsed)) { $globalSuccessTimes.Add($parsed) }
+        }
+    }
+    $globalSuccessCutoff = if ($globalSuccessTimes.Count -eq 4) {
+        @($globalSuccessTimes | Sort-Object -Descending | Select-Object -First 1)[0]
+    } else { $null }
+    foreach ($log in $existingLogs) {
+        if (-not (Test-Path -LiteralPath $log -PathType Leaf)) { continue }
+        $lifecycle = Get-ClaudeVmLifecycleEvidence -LogPaths @($log)
+        $successTimes = New-Object System.Collections.Generic.List[DateTimeOffset]
+        foreach ($property in @('LatestVmStartedAt', 'LatestDaemonReadyAt', 'LatestNetworkConnectedAt', 'LatestApiReachableAt')) {
+            $parsed = [DateTimeOffset]::MinValue
+            $value = if ($lifecycle.PSObject.Properties[$property]) { [string]$lifecycle.$property } else { $null }
+            if ($value -and [DateTimeOffset]::TryParse($value, [ref]$parsed)) { $successTimes.Add($parsed) }
+        }
+        $successCutoff = if ($lifecycle.CurrentRunHealthy -and $successTimes.Count -eq 4) {
+            @($successTimes | Sort-Object -Descending | Select-Object -First 1)[0]
+        } else { $null }
+        if ($globalSuccessCutoff -and (-not $successCutoff -or $globalSuccessCutoff -gt $successCutoff)) {
+            $successCutoff = $globalSuccessCutoff
+        }
+        $cutoffs[$log] = if ($successCutoff) { $successCutoff.ToString('o') } else { $null }
+        $lastTimestamp = $null
+        foreach ($line in @(Get-Content -LiteralPath $log -Tail 600 -ErrorAction SilentlyContinue)) {
+            $lineTimestamp = Get-CoworkLogTimestamp -Line $line
+            if ($lineTimestamp) { $lastTimestamp = $lineTimestamp }
+            $formatted = "[$log] $line"
+            if ($line -match $recoveryPattern) { $recoveryWarnings.Add($formatted) }
+            if ($line -match $informationPattern) { $information.Add($formatted) }
+            if ($line -notmatch $errorPattern) { continue }
+            $timestamp = if ($lineTimestamp) { $lineTimestamp } else { $lastTimestamp }
+            if ($successCutoff -and $timestamp -and $timestamp -le $successCutoff) {
+                $historical.Add($formatted)
+            } else {
+                $current.Add($formatted)
             }
         }
     }
-    return @($results | Select-Object -Last 120)
+    return [pscustomobject]@{
+        CurrentErrors = @($current | Select-Object -Last 120)
+        HistoricalErrors = @($historical | Select-Object -Last 120)
+        Information = @($information | Select-Object -Last 40)
+        RecoveryWarnings = @($recoveryWarnings | Select-Object -Last 20)
+        GlobalSuccessCutoff = if ($globalSuccessCutoff) { $globalSuccessCutoff.ToString('o') } else { $null }
+        SuccessCutoffs = [pscustomobject]$cutoffs
+    }
+}
+
+function Get-RecentCoworkErrors {
+    $evidence = Get-RecentCoworkErrorEvidence
+    return @(@($evidence.CurrentErrors) + @($evidence.HistoricalErrors))
 }
 
 function Invoke-Diagnostics {
@@ -2495,9 +2584,23 @@ function Invoke-Diagnostics {
     if (Get-PendingRestart) { Add-Finding 'pending-restart' 'Warning' 'Windows 有待完成的重启操作' }
     else { Add-Finding 'pending-restart' 'Pass' '没有检测到待完成重启' }
 
-    $recentErrors = Get-RecentCoworkErrors
-    if ($recentErrors.Count -gt 0) {
-        Add-Finding 'recent-cowork-errors' 'Info' "找到 $($recentErrors.Count) 条近期 Cowork 关键日志" ($recentErrors -join "`r`n")
+    $recentEvidence = Get-RecentCoworkErrorEvidence
+    if ($recentEvidence.CurrentErrors.Count -gt 0) {
+        Add-Finding 'current-cowork-errors' 'Warning' "找到 $($recentEvidence.CurrentErrors.Count) 条尚未被后续完整成功序列覆盖的 Cowork 错误" ($recentEvidence.CurrentErrors -join "`r`n")
+    } else {
+        Add-Finding 'current-cowork-errors' 'Pass' '没有发现晚于最近完整成功序列的 Cowork 错误'
+    }
+    if ($recentEvidence.HistoricalErrors.Count -gt 0) {
+        Add-Finding 'historical-cowork-errors' 'Info' "找到 $($recentEvidence.HistoricalErrors.Count) 条已被后续完整成功序列覆盖的历史错误" ($recentEvidence.HistoricalErrors -join "`r`n")
+    }
+    if ($recentEvidence.Information.Count -gt 0) {
+        Add-Finding 'recent-cowork-success' 'Info' '最近 Cowork 成功事件（用于会话分段）' ($recentEvidence.Information -join "`r`n")
+    }
+    if ($recentEvidence.RecoveryWarnings.Count -gt 0) {
+        Add-Finding 'service-recovery-actions' 'Warning' 'CoworkVMService 无法自行配置服务恢复动作，但服务运行状态与 VM 健康需独立判断' (($recentEvidence.RecoveryWarnings -join "`r`n") + "`r`n这不是当前 VM 启动失败的充分证据；若服务崩溃后没有自动恢复，请以管理员身份重启服务或重启 Windows。")
+    }
+    if ($script:LastDownloadFailure) {
+        Add-Finding 'official-download-failure' 'Fail' "官方下载失败：$($script:LastDownloadFailure.Code)" (($script:LastDownloadFailure | ConvertTo-Json -Depth 6))
     }
 
     return [pscustomobject]@{
@@ -2505,19 +2608,81 @@ function Invoke-Diagnostics {
         ToolVersion = $script:ToolVersion
         Computer = $env:COMPUTERNAME
         User = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        DownloadFailure = $script:LastDownloadFailure
         Findings = $script:Findings.ToArray()
     }
 }
 
+function Protect-DiagnosticText {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return $null }
+    $result = [string]$Text
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $replacements = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @(
+        @($script:Root, '<TOOL_ROOT>'),
+        @($env:USERPROFILE, '%USERPROFILE%'),
+        @($identity.Name, '<USER>'),
+        @($env:COMPUTERNAME, '<COMPUTER>'),
+        @($env:USERNAME, '<USER>')
+    )) {
+        if ($entry[0]) { $replacements.Add([pscustomobject]@{ Source = [string]$entry[0]; Target = [string]$entry[1] }) }
+    }
+    try {
+        $system = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $modelText = ("$($system.Manufacturer) $($system.Model)").Trim()
+        if ($modelText) { $replacements.Add([pscustomobject]@{ Source = $modelText; Target = '<DEVICE_MODEL>' }) }
+    } catch {}
+    foreach ($replacement in @($replacements | Sort-Object { $_.Source.Length } -Descending)) {
+        $result = [regex]::Replace($result, [regex]::Escape($replacement.Source), $replacement.Target, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+    $result = [regex]::Replace($result, '(?i)\bS-1-5-\d+(?:-\d+)+\b', '<SID>')
+    $result = [regex]::Replace($result, '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '<EMAIL>')
+    $result = [regex]::Replace($result, '(?i)\b[A-Z]:\\Users\\[^\\\r\n"\]]+', '%USERPROFILE%')
+    return $result
+}
+
+function ConvertTo-ShareSafeDiagnosticValue {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return Protect-DiagnosticText -Text $Value }
+    if ($Value -is [ValueType]) { return $Value }
+    if ($Value -is [Collections.IDictionary]) {
+        $dictionary = [ordered]@{}
+        foreach ($key in $Value.Keys) { $dictionary[$key] = ConvertTo-ShareSafeDiagnosticValue $Value[$key] }
+        return [pscustomobject]$dictionary
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        $items = @($Value | ForEach-Object { ConvertTo-ShareSafeDiagnosticValue $_ })
+        return ,$items
+    }
+    $object = [ordered]@{}
+    foreach ($property in $Value.PSObject.Properties) {
+        if ($property.MemberType -in @('NoteProperty', 'Property')) {
+            $object[$property.Name] = ConvertTo-ShareSafeDiagnosticValue $property.Value
+        }
+    }
+    return [pscustomobject]$object
+}
+
 function Save-DiagnosticReport {
-    param([Parameter(Mandatory)]$Report)
+    param(
+        [Parameter(Mandatory)]$Report,
+        [switch]$Redact
+    )
     New-Item -ItemType Directory -Path $script:ReportsRoot -Force | Out-Null
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $jsonPath = Join-Path $script:ReportsRoot "claude-diagnostic-$stamp.json"
-    $textPath = Join-Path $script:ReportsRoot "claude-diagnostic-$stamp.txt"
+    $prefix = if ($Redact) { 'claude-diagnostic-share' } else { 'claude-diagnostic' }
+    $jsonPath = Join-Path $script:ReportsRoot "$prefix-$stamp.json"
+    $textPath = Join-Path $script:ReportsRoot "$prefix-$stamp.txt"
+    if ($Redact) {
+        $Report = ConvertTo-ShareSafeDiagnosticValue $Report
+        $Report | Add-Member -NotePropertyName Redacted -NotePropertyValue $true -Force
+    }
     $Report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
     $lines = @(
         "Claude Setup diagnostic $($Report.GeneratedAt)",
+        "Redacted: $([bool]$Redact)",
         "Computer: $($Report.Computer)",
         "User: $($Report.User)",
         ''
@@ -2663,7 +2828,7 @@ function Get-SetupPlan {
             } else {
                 $bootstrapEvidence = Get-LegacyStateBootstrapEvidence -State $state
                 if ($bootstrapEvidence.Eligible) {
-                    & $addStep 'legacy-state' 'LegacyState' 'Conditional' $script:VmRebuildStatePath 'The old bundle and backup are both absent. Auto first installs/verifies the official package, starts Claude when allowed, waits up to 90 seconds, and then re-evaluates every Abandoned condition.' 'The state is archived only after package identity, independent VM files, VM-critical EFS, lifecycle logs, and both signatures all pass; timeout leaves the state unchanged.' $true $false
+                    & $addStep 'legacy-state' 'LegacyState' 'Conditional' $script:VmRebuildStatePath 'The old bundle and backup are both absent. Auto first installs/verifies the official package, records a UTC execution anchor, starts Claude when allowed, waits up to 180 seconds, and then re-evaluates every Abandoned condition.' 'The state is archived only after package identity, independent VM files, VM-critical EFS, both signatures, and VM/daemon/network/API events newer than the execution anchor all pass; timeout leaves the state unchanged.' $true $false
                 } else {
                     $activeStateValid = $false
                     try { Assert-VmRebuildState $state; $activeStateValid = $true } catch {}
@@ -2833,6 +2998,102 @@ function Get-MsixManifestInfo {
     } finally { $zip.Dispose() }
 }
 
+function Get-DownloadFailureCode {
+    param([Parameter(Mandatory)][Exception]$Exception)
+    if ($Exception.Message -match '^\[(?<code>DOWNLOAD_[A-Z_]+)\]') { return $Matches.code }
+    if ($Exception -is [UnauthorizedAccessException] -or $Exception -is [IO.IOException]) { return 'DOWNLOAD_DISK' }
+    $response = if ($Exception.PSObject.Properties['Response']) { $Exception.Response } else { $null }
+    if ($response -and $response.PSObject.Properties['StatusCode']) { return 'DOWNLOAD_HTTP' }
+    $status = if ($Exception.PSObject.Properties['Status']) { [string]$Exception.Status } else { '' }
+    if ($status -match 'NameResolutionFailure') { return 'DOWNLOAD_DNS' }
+    if ($status -match 'ProxyNameResolutionFailure' -or $Exception.Message -match '(?i)proxy|代理') { return 'DOWNLOAD_PROXY' }
+    if ($status -match 'TrustFailure|SecureChannelFailure' -or $Exception.Message -match '(?i)TLS|SSL|certificate|证书') { return 'DOWNLOAD_TLS' }
+    if ($status -match 'Timeout' -or $Exception.Message -match '(?i)timed?\s*out|timeout|超时') { return 'DOWNLOAD_TIMEOUT' }
+    return 'DOWNLOAD_UNKNOWN'
+}
+
+function Invoke-HttpFileDownload {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Destination,
+        [ValidateRange(1, 10)][int]$MaxAttempts = 3,
+        [ValidateRange(0, 60)][int]$InitialDelaySeconds = 2,
+        [scriptblock]$ValidateDownloadedFile,
+        [scriptblock]$DownloadProvider,
+        [scriptblock]$SleepProvider
+    )
+    $partial = "$Destination.partial"
+    $previous = "$Destination.previous"
+    $attemptHistory = New-Object System.Collections.Generic.List[object]
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+        try {
+            $response = if ($DownloadProvider) {
+                & $DownloadProvider $Uri $partial $attempt
+            } else {
+                Invoke-WebRequest -Uri $Uri -OutFile $partial -UseBasicParsing -PassThru
+            }
+            if (-not (Test-Path -LiteralPath $partial -PathType Leaf)) {
+                throw [IO.InvalidDataException]::new('[DOWNLOAD_EMPTY] 下载请求结束但没有生成临时文件。')
+            }
+            $actualLength = (Get-Item -LiteralPath $partial -Force).Length
+            if ($actualLength -le 0) { throw [IO.InvalidDataException]::new('[DOWNLOAD_EMPTY] 下载文件为空。') }
+            $expectedLength = $null
+            if ($response -and $response.PSObject.Properties['ContentLength']) {
+                $candidate = 0L
+                if ([long]::TryParse([string]$response.ContentLength, [ref]$candidate) -and $candidate -gt 0) { $expectedLength = $candidate }
+            }
+            if (-not $expectedLength -and $response -and $response.PSObject.Properties['Headers'] -and $response.Headers) {
+                $candidate = 0L
+                $header = $response.Headers['Content-Length']
+                if ($header -and [long]::TryParse([string]$header, [ref]$candidate) -and $candidate -gt 0) { $expectedLength = $candidate }
+            }
+            if ($expectedLength -and $actualLength -ne $expectedLength) {
+                throw [IO.InvalidDataException]::new("[DOWNLOAD_LENGTH_MISMATCH] Content-Length=$expectedLength，实际写入=$actualLength。")
+            }
+            $validation = if ($ValidateDownloadedFile) { & $ValidateDownloadedFile $partial } else { $null }
+            if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+                Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+                [IO.File]::Replace($partial, $Destination, $previous, $true)
+                Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+            } else {
+                [IO.File]::Move($partial, $Destination)
+            }
+            return [pscustomobject]@{
+                Path = $Destination
+                Attempts = $attempt
+                Length = $actualLength
+                ExpectedLength = $expectedLength
+                Validation = $validation
+            }
+        } catch {
+            $code = Get-DownloadFailureCode -Exception $_.Exception
+            $attemptHistory.Add([pscustomobject]@{
+                Attempt = $attempt
+                Code = $code
+                Message = $_.Exception.Message
+                At = (Get-Date).ToUniversalTime().ToString('o')
+            })
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+            if ($attempt -lt $MaxAttempts) {
+                $delay = [math]::Min(30, $InitialDelaySeconds * [math]::Pow(2, $attempt - 1))
+                Write-Log "下载第 $attempt/$MaxAttempts 次失败（$code），$delay 秒后重试：$($_.Exception.Message)" WARN
+                if ($SleepProvider) { & $SleepProvider ([int]$delay) } elseif ($delay -gt 0) { Start-Sleep -Seconds ([int]$delay) }
+                continue
+            }
+            $script:LastDownloadFailure = [pscustomobject]@{
+                Code = $code
+                Uri = $Uri
+                Destination = $Destination
+                Attempts = $MaxAttempts
+                AttemptHistory = $attemptHistory.ToArray()
+                OccurredAt = (Get-Date).ToUniversalTime().ToString('o')
+            }
+            throw "[$code] 下载在 $MaxAttempts 次尝试后失败。诊断 JSON 的 DownloadFailure 字段包含机器可读详情。最后错误：$($_.Exception.Message)"
+        }
+    }
+}
+
 function Download-OfficialClaude {
     $arch = Get-NativeArchitecture
     if (-not $arch) { throw '当前 CPU 架构不受支持。' }
@@ -2840,23 +3101,31 @@ function Download-OfficialClaude {
     $destination = Join-Path $script:DownloadsRoot "Claude-latest-$arch.msix"
     $url = Get-OfficialPackageUrl -Architecture $arch
     Write-Log "从 Anthropic 官方地址下载 Claude ($arch)。" INFO
-    Invoke-WebRequest -Uri $url -OutFile $destination -UseBasicParsing
+    $script:LastDownloadFailure = $null
+    $downloadResult = Invoke-HttpFileDownload -Uri $url -Destination $destination -ValidateDownloadedFile {
+        param($candidatePath)
+        $candidateSignature = Test-AnthropicSignature $candidatePath
+        if (-not $candidateSignature.Valid) {
+            throw [IO.InvalidDataException]::new("[DOWNLOAD_SIGNATURE_INVALID] 官方安装包签名验证失败：$($candidateSignature.Status)。")
+        }
+        $candidateManifest = Get-MsixManifestInfo $candidatePath
+        if ($candidateManifest.Name -ne 'Claude' -or $candidateManifest.Publisher -notmatch 'Anthropic') {
+            throw [IO.InvalidDataException]::new('[DOWNLOAD_IDENTITY_INVALID] 下载文件的包身份不是 Anthropic Claude。')
+        }
+        if ($candidateManifest.Architecture -ne $arch) {
+            throw [IO.InvalidDataException]::new("[DOWNLOAD_ARCHITECTURE_INVALID] 下载架构不匹配：需要 $arch，得到 $($candidateManifest.Architecture)。")
+        }
+        return [pscustomobject]@{
+            Manifest = $candidateManifest
+            Sha256 = (Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256).Hash
+        }
+    }
+    if ($downloadResult.Attempts -gt 1) {
+        Write-Log "官方 Claude 下载在第 $($downloadResult.Attempts) 次尝试成功；大小=$($downloadResult.Length) 字节。" OK
+    }
 
-    $signature = Test-AnthropicSignature $destination
-    if (-not $signature.Valid) {
-        Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
-        throw "官方安装包签名验证失败：$($signature.Status)。拒绝安装。"
-    }
-    $manifest = Get-MsixManifestInfo $destination
-    if ($manifest.Name -ne 'Claude' -or $manifest.Publisher -notmatch 'Anthropic') {
-        Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
-        throw '下载文件的包身份不是 Anthropic Claude。'
-    }
-    if ($manifest.Architecture -ne $arch) {
-        Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
-        throw "下载架构不匹配：需要 $arch，得到 $($manifest.Architecture)。"
-    }
-    Write-Log "官方 MSIX 验证通过：Claude $($manifest.Version)，SHA-256 $((Get-FileHash $destination -Algorithm SHA256).Hash)" OK
+    $manifest = $downloadResult.Validation.Manifest
+    Write-Log "官方 MSIX 验证通过：Claude $($manifest.Version)，SHA-256 $($downloadResult.Validation.Sha256)" OK
     $script:OfficialMsixPath = $destination
     $script:VmManifestCache = $null
     return [pscustomobject]@{ Path = $destination; Manifest = $manifest }
@@ -3419,19 +3688,23 @@ function Invoke-AutoSetup {
 
     $rebuildState = Get-VmRebuildState
     $packagePrepared = $false
+    $abandonedLifecycleAnchor = $null
     if ($rebuildState) {
         $bootstrapEvidence = Get-LegacyStateBootstrapEvidence -State $rebuildState
-        $currentAbandonedEvidence = $null
-        try { $currentAbandonedEvidence = Get-AbandonedLegacyVmRebuildEvidence -State $rebuildState } catch {}
-        if ($bootstrapEvidence.Eligible -and (-not $currentAbandonedEvidence -or -not $currentAbandonedEvidence.Eligible)) {
-            Write-Log '检测到旧活动 bundle 与备份均已不存在；先安装并验证官方 Claude，再重新采集 Abandoned 安全证据。旧状态保持不动。' WARN
+        if ($bootstrapEvidence.Eligible) {
+            Write-Log '检测到旧活动 bundle 与备份均已不存在；先安装并验证官方 Claude，再要求本次执行后的完整 Cowork 健康序列。旧状态保持不动。' WARN
             [void](Repair-ClaudePackageAndSignature)
             $packagePrepared = $true
             [void](Repair-ClaudeUserDataLayout)
+            $abandonedLifecycleAnchor = (Get-Date).ToUniversalTime().ToString('o')
             Start-CoworkServices
             if (-not $SkipLaunch) { Start-ClaudeAppx }
-            $evidenceWaitSeconds = if ($SkipLaunch) { 0 } else { 90 }
-            $readyEvidence = Wait-AbandonedLegacyVmRebuildEvidence -State $rebuildState -Seconds $evidenceWaitSeconds
+            $evidenceWaitSeconds = if ($SkipLaunch) { 0 } else { 180 }
+            if (-not $SkipLaunch) {
+                Write-Log '请在已启动的 Claude 中进入 Cowork；只有本次启动后的 VM、网络、daemon 与 API 全部成功，才会归档孤立状态。' WARN
+            }
+            $readyEvidence = Wait-AbandonedLegacyVmRebuildEvidence -State $rebuildState -Seconds $evidenceWaitSeconds `
+                -MinimumLifecycleTime $abandonedLifecycleAnchor
             if (-not $readyEvidence -or -not $readyEvidence.Eligible) {
                 $waitReasons = if ($readyEvidence -and $readyEvidence.Reasons) {
                     $readyEvidence.Reasons -join '；'
@@ -3440,7 +3713,7 @@ function Invoke-AutoSetup {
             }
         }
     }
-    $rebuildState = Resolve-VmRebuildState -State $rebuildState
+    $rebuildState = Resolve-VmRebuildState -State $rebuildState -MinimumLifecycleTime $abandonedLifecycleAnchor
     if ($rebuildState -and $rebuildState.Status -eq 'Completed') {
         $completedStatus = Get-VmBundleStatus -BundlePath $rebuildState.OriginalPath
         if (-not $completedStatus.Ready) { throw 'VM 重建状态标记为 Completed，但活动 bundle 未通过复核。' }
@@ -3577,7 +3850,7 @@ try {
 
     if (-not $skipFinalReport) {
         $finalReport = if ($actionReport) { $actionReport } else { Invoke-Diagnostics }
-        [void](Save-DiagnosticReport $finalReport)
+        [void](Save-DiagnosticReport $finalReport -Redact:$Redact)
         if ($finalReport.Findings | Where-Object { $_.Status -eq 'Fail' }) {
             Write-Log '仍有失败项，请查看诊断报告。' WARN
             if ($exitCode -eq 0) { $exitCode = 2 }
@@ -3592,7 +3865,7 @@ try {
     if (-not $skipFinalReport) {
         try {
             $failureReport = Invoke-Diagnostics
-            [void](Save-DiagnosticReport $failureReport)
+            [void](Save-DiagnosticReport $failureReport -Redact:$Redact)
         } catch {}
     }
     $exitCode = 1
