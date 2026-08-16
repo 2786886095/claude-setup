@@ -22,6 +22,8 @@
 
 `v1.2.4` 增加只读备份 `Inventory`/`CleanupPlan` 及独立的显式 `CleanupBackup`。Auto、Install、Repair、Diagnose、Plan、Inventory 和 CleanupPlan 均不会删除备份。CleanupBackup 必须同时满足：路径位于工具认可的 Claude `vm_bundles` 根目录、名称属于已知备份/隔离件、不是重解析点、未被活动重建状态引用、候选结构完整可读且无 EFS、当前活动 VM 完整且无 EFS、删除后仍至少保留一份结构验证通过的健康备份，并提交绑定路径/大小/最后写入时间的当前确认令牌。外部显式路径只列为 `ExternalExplicit`，不允许工具删除。该版本还把实时 VM 与历史生命周期、服务运行与崩溃恢复、建议重启与必需重启分别报告；普通 Diagnose 不启动 VM，只有显式 ActiveProbe 才可启动 Claude/Cowork。
 
+`v1.2.5` 将 CoworkVMService 崩溃恢复配置保持为独立的显式动作：Auto、Install、Repair、Diagnose 和 ActiveProbe 均不会调用它。`ConfigureServiceRecovery` 只有在管理员明确提交 `-ConfirmServiceRecovery`、Claude.exe/cowork-svc.exe 双签名有效、注册服务二进制精确等于当前官方 cowork-svc.exe 时才执行固定参数；随后必须从 `qfailure`/`qfailureflag` 复核 86400 秒重置期、三次 5000 ms 重启和 non-crash failure flag。任何原始退出码或复核失败都不会报告成功。该版还为 Cowork 等待增加明确用户指引/倒计时字段，并为安全清理计划生成路径和当前令牌绑定的推荐命令；两者都不降低既有证据或删除门槛。
+
 ## 已运行旧版本怎么办
 
 1. 停止反复运行旧版安装器；不要删除任何 `claudevm.bundle.backup-*`、`foreignjunk` 或 `%ProgramData%\ClaudeSetup` 状态文件。

@@ -132,6 +132,10 @@ $requiredSafetyChecks = @(
     'Get-RecentCoworkErrorEvidence'
     'Get-CurrentLiveVmEvidence'
     'Get-ServiceRecoveryPolicyEvidence'
+    'ConvertFrom-ServiceRecoveryPolicyOutput'
+    'Invoke-ServiceRecoveryConfiguration'
+    'ConfigureServiceRecovery'
+    'ConfirmServiceRecovery'
     'Get-PendingRestartEvidence'
     'CurrentLiveVm'
     'RecentVerifiedLifecycle'
@@ -140,11 +144,14 @@ $requiredSafetyChecks = @(
     'RemainingSeconds'
     'ExpectedUserAction'
     'MissingEvidence'
+    'ProgressPercent'
+    'UserInstruction'
     'Get-VmBackupInventory'
     'Remove-VerifiedVmBackup'
     'CleanupPlan'
     'CleanupBackup'
     'ConfirmationToken'
+    'RecommendedCleanupCommand'
     'ActiveProbe'
     'Get-DownloadStagingPaths'
     'Invoke-HttpFileDownload'
@@ -175,10 +182,10 @@ if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'v1.2.2', 'v1.2.3', 'v1.2.4', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'v1.2.2', 'v1.2.3', 'v1.2.4', 'v1.2.5', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
 }
-foreach ($required in @('Windows 11 build 26200 x64', 'ARM64 Windows', '企业代理', '第三方杀毒/EDR', '多用户并发', '全新 Windows 用户档案', '不能冒充 v1.2.4 新 E2E')) {
+foreach ($required in @('Windows 11 build 26200 x64', 'v1.2.4 完整破坏性 E2E', 'ARM64 Windows', '企业代理', '第三方杀毒/EDR', '多用户并发', '全新 Windows 用户档案', '不能冒充 v1.2.5 新 E2E')) {
     if (-not $testMatrix.Contains($required)) { throw "TEST_MATRIX.md is missing a required coverage boundary: $required" }
 }
 if ($main -match '\$partial\s*=\s*"\$Destination\.partial"') {
@@ -249,6 +256,9 @@ if ($autoBlock -notmatch '(?s)abandonedLifecycleAnchor.*?Wait-AbandonedLegacyVmR
     $autoBlock -notmatch 'evidenceWaitSeconds = if \(\$SkipLaunch\) \{ 0 \} else \{ \$LegacyEvidenceWaitSeconds \}') {
     throw 'Auto must bind Abandoned archival to current-execution lifecycle evidence and allow time for the user to enter Cowork.'
 }
+if ($autoBlock.Contains('Invoke-ServiceRecoveryConfiguration')) {
+    throw 'Auto must never change CoworkVMService failure actions; service recovery is a separate explicit action.'
+}
 if ($main -notmatch '(?s)function Get-SetupPlanExecutionAdvice.*?RecommendedCommand.*?blockedSteps\.Count -eq 0' -or $main -notmatch 'BlockerResolution =') {
     throw 'Plan must suppress the Auto recommendation and provide machine-readable resolution data when blockers exist.'
 }
@@ -290,6 +300,16 @@ if ($diagnosticsStart -lt 0 -or $diagnosticsEnd -le $diagnosticsStart) { throw '
 $diagnosticsBlock = $main.Substring($diagnosticsStart, $diagnosticsEnd - $diagnosticsStart)
 if ($diagnosticsBlock -match 'Start-CoworkServices|Start-ClaudeAppx|Start-Service|Start-Process') {
     throw 'Ordinary Diagnose must remain passive; only the explicit ActiveProbe path may start Claude/Cowork.'
+}
+if ($diagnosticsBlock.Contains('Invoke-ServiceRecoveryConfiguration')) {
+    throw 'Diagnose must report service recovery policy without changing it.'
+}
+$serviceRecoveryStart = $main.IndexOf('function Get-ServiceRecoveryConfigurationSafetyEvidence')
+$serviceRecoveryEnd = $main.IndexOf('function Get-AppxSystemVolume', $serviceRecoveryStart)
+if ($serviceRecoveryStart -lt 0 -or $serviceRecoveryEnd -le $serviceRecoveryStart) { throw 'Unable to isolate explicit service recovery configuration.' }
+$serviceRecoveryBlock = $main.Substring($serviceRecoveryStart, $serviceRecoveryEnd - $serviceRecoveryStart)
+foreach ($required in @('Get-ServiceRecoveryConfigurationSafetyEvidence', 'CoreSignaturesValid', 'BinaryMatchesOfficialClaude', 'Confirmed', 'failureflag', 'RecoveryConfigured')) {
+    if (-not $serviceRecoveryBlock.Contains($required)) { throw "ConfigureServiceRecovery is missing a safety/verification guard: $required" }
 }
 $cleanupStart = $main.IndexOf('function Remove-VerifiedVmBackup')
 $cleanupEnd = $main.IndexOf('function Get-OfficialVmManifest', $cleanupStart)
@@ -715,6 +735,67 @@ try {
             @($recoveryEvidence.AdministratorRepairCommands).Count -ne 2 -or $null -eq $recoveryEvidence.ServiceRunning) {
             throw 'Service recovery diagnostics must separate current running state, policy state, raw/inferred error source, and copyable administrator repair commands.'
         }
+        $unconfiguredPolicy = ConvertFrom-ServiceRecoveryPolicyOutput -FailureOutput @(
+            '[SC] QueryServiceConfig2 SUCCESS',
+            'RESET_PERIOD (in seconds) : 0'
+        ) -FailureExitCode 0 -FailureFlagOutput @(
+            '[SC] QueryServiceConfig2 SUCCESS',
+            'FAILURE_ACTIONS_ON_NONCRASH_FAILURES: FALSE'
+        ) -FailureFlagExitCode 0
+        $configuredPolicy = ConvertFrom-ServiceRecoveryPolicyOutput -FailureOutput @(
+            '[SC] QueryServiceConfig2 SUCCESS',
+            'RESET_PERIOD (in seconds) : 86400',
+            'FAILURE_ACTIONS : RESTART -- Delay = 5000 milliseconds.',
+            'RESTART -- Delay = 5000 milliseconds.',
+            'RESTART -- Delay = 5000 milliseconds.'
+        ) -FailureExitCode 0 -FailureFlagOutput @(
+            '[SC] QueryServiceConfig2 SUCCESS',
+            'FAILURE_ACTIONS_ON_NONCRASH_FAILURES: TRUE'
+        ) -FailureFlagExitCode 0
+        if ($unconfiguredPolicy.RecoveryConfigured -or -not $configuredPolicy.RecoveryConfigured -or
+            $configuredPolicy.ResetPeriodSeconds -ne 86400 -or $configuredPolicy.RestartActionCount -ne 3 -or
+            @($configuredPolicy.RestartDelaysMilliseconds | Where-Object { $_ -ne 5000 }).Count -gt 0 -or
+            -not $configuredPolicy.FailureActionsOnNonCrashFailures) {
+            throw 'Service recovery output parsing must require the exact recommended reset/restart/failureflag policy.'
+        }
+        $fakeSafety = [pscustomobject]@{ Safe = $true; CoreSignaturesValid = $true; BinaryMatchesOfficialClaude = $true }
+        $unconfirmedRecoveryRejected = $false
+        try {
+            [void](Invoke-ServiceRecoveryConfiguration -SafetyProvider { $fakeSafety } -EvidenceProvider { $unconfiguredPolicy })
+        } catch { $unconfirmedRecoveryRejected = $true }
+        if (-not $unconfirmedRecoveryRejected) { throw 'Service recovery changes must require explicit confirmation.' }
+        $recoveryQueries = [pscustomobject]@{ Value = 0 }
+        $recoveryCommands = New-Object System.Collections.Generic.List[string]
+        $recoveryReceipt = Invoke-ServiceRecoveryConfiguration -Confirmed -SafetyProvider { $fakeSafety } -EvidenceProvider {
+            $recoveryQueries.Value++
+            if ($recoveryQueries.Value -eq 1) { return $unconfiguredPolicy }
+            return $configuredPolicy
+        } -CommandRunner {
+            param([string[]]$Arguments)
+            $recoveryCommands.Add(($Arguments -join ' '))
+            return [pscustomobject]@{ ExitCode = 0; Output = @('[SC] ChangeServiceConfig2 SUCCESS') }
+        }
+        if (-not $recoveryReceipt.Changed -or $recoveryReceipt.Status -ne 'ConfiguredAndVerified' -or
+            $recoveryQueries.Value -ne 2 -or $recoveryCommands.Count -ne 2 -or
+            $recoveryCommands[0] -notmatch '^failure CoworkVMService ' -or $recoveryCommands[1] -ne 'failureflag CoworkVMService 1') {
+            throw 'Explicit service recovery configuration must run the two fixed commands and verify the resulting policy.'
+        }
+        $alreadyConfiguredReceipt = Invoke-ServiceRecoveryConfiguration -SafetyProvider { $fakeSafety } -EvidenceProvider { $configuredPolicy } -CommandRunner {
+            throw 'Already-configured recovery policy must not invoke sc.exe mutations.'
+        }
+        if ($alreadyConfiguredReceipt.Changed -or $alreadyConfiguredReceipt.Status -ne 'AlreadyConfigured') {
+            throw 'ConfigureServiceRecovery must be idempotent when the recommended policy is already active.'
+        }
+        $recoveryFailureText = $null
+        try {
+            [void](Invoke-ServiceRecoveryConfiguration -Confirmed -SafetyProvider { $fakeSafety } -EvidenceProvider { $unconfiguredPolicy } -CommandRunner {
+                param([string[]]$Arguments)
+                return [pscustomobject]@{ ExitCode = 5; Output = @('[SC] OpenService FAILED 5: Access is denied.') }
+            })
+        } catch { $recoveryFailureText = $_.Exception.Message }
+        if ($recoveryFailureText -notmatch '原始退出码=5' -or $recoveryFailureText -notmatch 'Access is denied') {
+            throw 'Service recovery mutation failures must preserve the raw sc.exe code and output.'
+        }
         $recommendedRestart = Get-PendingRestartEvidence
         $requiredRestart = Get-PendingRestartEvidence -RebuildState ([pscustomobject]@{ Status = 'AwaitingRestart' })
         if ($requiredRestart.Classification -ne 'Required' -or -not $requiredRestart.Pending -or
@@ -760,10 +841,16 @@ try {
             try { [void](Get-VmBackupInventory -ExplicitPath '.\relative-backup' -Mode CleanupPlan) } catch { $relativePathRejected = $true }
             if (-not $inventory.ReadOnly -or $inventory.CandidateCount -ne 2 -or $inventory.StructurallyVerifiedBackupCount -ne 2 -or
                 -not $inventory.ActiveVmHealthy -or @($inventory.Items | Where-Object ConfirmationToken).Count -ne 0 -or
-                @($cleanup.Items | Where-Object { $_.Deletable -and $_.ConfirmationToken }).Count -ne 2 -or -not $relativePathRejected) {
+                @($cleanup.Items | Where-Object { $_.Deletable -and $_.ConfirmationToken -and $_.RecommendedCleanupCommand }).Count -ne 2 -or
+                @($cleanup.ExpectedSequence) -join ',' -ne 'Inventory,CleanupPlan,CleanupBackup' -or -not $relativePathRejected) {
                 throw 'Backup Inventory/CleanupPlan must report size, structural verification, recoverability, and tokens only in cleanup planning mode.'
             }
             $targetPlan = @($cleanup.Items | Where-Object Path -eq $backupOne)[0]
+            if (-not $targetPlan.RecommendedCleanupCommand.Contains((Join-Path $root 'ClaudeSetup.ps1')) -or
+                -not $targetPlan.RecommendedCleanupCommand.Contains($targetPlan.Path) -or
+                -not $targetPlan.RecommendedCleanupCommand.Contains($targetPlan.ConfirmationToken)) {
+                throw 'CleanupPlan recommended commands must bind the actual setup script, exact path, and current confirmation token.'
+            }
             $wrongTokenRejected = $false
             try { [void](Remove-VerifiedVmBackup -Path $backupOne -Token 'WRONG-TOKEN') } catch { $wrongTokenRejected = $true }
             if (-not $wrongTokenRejected -or -not (Test-Path -LiteralPath $backupOne)) {
@@ -1021,7 +1108,8 @@ try {
             return $readyEvidence
         }
         if (-not $waitResult.Eligible -or $evidenceCounter.Value -lt 3 -or
-            -not $waitResult.PSObject.Properties['RemainingSeconds'] -or $waitResult.ExpectedUserAction -ne 'OpenClaudeCowork' -or $waitResult.TimedOut) {
+            -not $waitResult.PSObject.Properties['RemainingSeconds'] -or -not $waitResult.PSObject.Properties['ProgressPercent'] -or
+            -not $waitResult.UserInstruction -or $waitResult.ExpectedUserAction -ne 'OpenClaudeCowork' -or $waitResult.TimedOut) {
             throw 'Fresh-install evidence waiting must retry without weakening the final predicate.'
         }
         $detailedFailure = $null

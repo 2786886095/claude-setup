@@ -6,11 +6,12 @@
 |---|---|---|---|
 | Windows PowerShell 5.1 静态与隔离夹具 | Windows GitHub-hosted runner、本地 Windows 11 x64 | 已验证 | 每次主分支和标签 CI 执行 |
 | PowerShell 7 静态与隔离夹具 | Windows GitHub-hosted runner、本地 Windows 11 x64 | 已验证 | 每次主分支和标签 CI 执行 |
-| 官方 MSIX 下载、Anthropic 签名、manifest 与原子转正 | Windows 11 x64 | 已验证 | v1.2.3、v1.2.4 非破坏性真实下载 |
-| 真实卸载、官方重装、孤立状态归档 | Windows 11 build 26200 x64 | 已验证 | v1.2.3 完整 E2E；不能冒充 v1.2.4 新 E2E |
-| 从零 VM 三项资产下载、官方压缩哈希、Network/API | Windows 11 build 26200 x64 | 已验证 | v1.2.3 完整 E2E |
-| 实时/历史语义、重启分类、服务恢复证据 | Windows 11 x64 与隔离日志夹具 | 已验证 | v1.2.4 非破坏性诊断与双 PowerShell 测试 |
-| Inventory/CleanupPlan 零写入与双确认清理保护 | 隔离临时 VM bundle 夹具 | 已验证 | v1.2.4；验证令牌错误拒绝及最后健康备份保护 |
+| 官方 MSIX 下载、Anthropic 签名、manifest 与原子转正 | Windows 11 x64 | 已验证 | v1.2.4 完整破坏性 E2E；v1.2.5 非破坏性真实下载 |
+| 真实卸载、官方重装、孤立状态归档 | Windows 11 build 26200 x64 | 已验证 | v1.2.4 完整破坏性 E2E；不能冒充 v1.2.5 新 E2E |
+| 从零 VM 三项资产下载、官方压缩哈希、Network/API、ActiveProbe | Windows 11 build 26200 x64 | 已验证 | v1.2.4 完整破坏性 E2E |
+| 实时/历史语义、重启分类、服务恢复证据 | Windows 11 x64 与隔离日志夹具 | 已验证 | v1.2.4 实机；v1.2.5 非破坏性诊断与双 PowerShell 测试 |
+| 显式服务恢复配置、严格复核及 Access Denied 失败报告 | 隔离命令/输出夹具 | 部分覆盖 | v1.2.5 不在开发机修改真实 CoworkVMService；真实打包服务写入仍待独立授权实测 |
+| Inventory/CleanupPlan 零写入、推荐命令与双确认清理保护 | 隔离临时 VM bundle 夹具 | 已验证 | v1.2.4/v1.2.5；验证令牌错误拒绝及最后健康受管备份保护 |
 | ARM64 Windows | 未覆盖 | 未验证 | 仅有代码路径与 URL 测试 |
 | 企业代理、TLS 检查、透明代理 | 未覆盖 | 未验证 | 失败分类存在，不等于兼容性实测 |
 | 第三方杀毒/EDR 拦截 | 未覆盖 | 未验证 | 不承诺所有产品策略兼容 |

@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('Auto', 'Diagnose', 'Install', 'Repair', 'Launch', 'Plan', 'ResolveLegacyState', 'Inventory', 'CleanupPlan', 'CleanupBackup')]
+    [ValidateSet('Auto', 'Diagnose', 'Install', 'Repair', 'Launch', 'Plan', 'ResolveLegacyState', 'Inventory', 'CleanupPlan', 'CleanupBackup', 'ConfigureServiceRecovery')]
     [string]$Action = 'Auto',
 
     [ValidateSet('None', 'Compatible')]
@@ -15,6 +15,7 @@ param(
     [ValidateRange(30, 1800)][int]$LegacyEvidenceWaitSeconds = 180,
     [string]$BackupPath,
     [string]$ConfirmationToken,
+    [switch]$ConfirmServiceRecovery,
     [switch]$ActiveProbe
 )
 
@@ -23,7 +24,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.2.4'
+$script:ToolVersion = '1.2.5'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -119,6 +120,7 @@ function Get-CurrentArgumentList {
     if ($CompatibleChineseProjectPath) { $arguments += @('-CompatibleChineseProjectPath', ('"{0}"' -f $CompatibleChineseProjectPath)) }
     if ($BackupPath) { $arguments += @('-BackupPath', ('"{0}"' -f $BackupPath)) }
     if ($ConfirmationToken) { $arguments += @('-ConfirmationToken', ('"{0}"' -f $ConfirmationToken)) }
+    if ($ConfirmServiceRecovery) { $arguments += '-ConfirmServiceRecovery' }
     if ($RestartIfNeeded) { $arguments += '-RestartIfNeeded' }
     if ($NonInteractive) { $arguments += '-NonInteractive' }
     if ($SkipLaunch) { $arguments += '-SkipLaunch' }
@@ -217,18 +219,65 @@ function Get-CurrentLiveVmEvidence {
     }
 }
 
+function ConvertFrom-ServiceRecoveryPolicyOutput {
+    param(
+        [AllowEmptyCollection()][string[]]$FailureOutput,
+        [int]$FailureExitCode,
+        [AllowEmptyCollection()][string[]]$FailureFlagOutput,
+        [int]$FailureFlagExitCode
+    )
+    $failureText = @($FailureOutput) -join "`n"
+    $flagText = @($FailureFlagOutput) -join "`n"
+    $resetMatch = [regex]::Match($failureText, '(?im)^\s*RESET_PERIOD[^\r\n:]*:\s*(?<value>\d+)\s*$')
+    $resetSeconds = if ($resetMatch.Success) { [int64]$resetMatch.Groups['value'].Value } else { $null }
+    $restartDelays = New-Object System.Collections.Generic.List[int]
+    foreach ($line in @($FailureOutput | Where-Object { $_ -match '(?i)(?:^\s*RESTART\b|^\s*FAILURE_ACTIONS[^:]*:\s*RESTART\b)' })) {
+        $delayMatch = [regex]::Match([string]$line, '(?i)Delay\s*=\s*(?<value>\d+)')
+        $restartDelays.Add($(if ($delayMatch.Success) { [int]$delayMatch.Groups['value'].Value } else { -1 }))
+    }
+    $flagMatch = [regex]::Match($flagText, '(?im)^\s*FAILURE_ACTIONS_ON_NONCRASH_FAILURES\s*:\s*(?<value>TRUE|FALSE|1|0)\s*$')
+    $failureFlagEnabled = if ($flagMatch.Success) { $flagMatch.Groups['value'].Value -match '^(?i:TRUE|1)$' } else { $null }
+    $matchesRecommended = [bool](
+        $FailureExitCode -eq 0 -and $FailureFlagExitCode -eq 0 -and
+        $resetSeconds -eq 86400 -and $restartDelays.Count -eq 3 -and
+        @($restartDelays | Where-Object { $_ -ne 5000 }).Count -eq 0 -and
+        $failureFlagEnabled -eq $true
+    )
+    return [pscustomobject]@{
+        QuerySucceeded = $FailureExitCode -eq 0 -and $FailureFlagExitCode -eq 0
+        FailureQueryExitCode = $FailureExitCode
+        FailureFlagQueryExitCode = $FailureFlagExitCode
+        ResetPeriodSeconds = $resetSeconds
+        RestartActionCount = $restartDelays.Count
+        RestartDelaysMilliseconds = $restartDelays.ToArray()
+        FailureActionsOnNonCrashFailures = $failureFlagEnabled
+        RecoveryConfigured = $matchesRecommended
+        FailureQueryOutput = @($FailureOutput)
+        FailureFlagQueryOutput = @($FailureFlagOutput)
+    }
+}
+
 function Get-ServiceRecoveryPolicyEvidence {
     param([string[]]$RecoveryWarnings)
     $service = Get-Service -Name CoworkVMService -ErrorAction SilentlyContinue
-    $output = @()
-    $exitCode = $null
+    $failureOutput = @()
+    $failureExitCode = -1
+    $failureFlagOutput = @()
+    $failureFlagExitCode = -1
     try {
-        $output = @(& sc.exe qfailure CoworkVMService 2>&1 | ForEach-Object { [string]$_ })
-        $exitCode = $LASTEXITCODE
+        $failureOutput = @(& sc.exe qfailure CoworkVMService 2>&1 | ForEach-Object { [string]$_ })
+        $failureExitCode = $LASTEXITCODE
     } catch {
-        $output = @($_.Exception.Message)
-        $exitCode = -1
+        $failureOutput = @($_.Exception.Message)
     }
+    try {
+        $failureFlagOutput = @(& sc.exe qfailureflag CoworkVMService 2>&1 | ForEach-Object { [string]$_ })
+        $failureFlagExitCode = $LASTEXITCODE
+    } catch {
+        $failureFlagOutput = @($_.Exception.Message)
+    }
+    $policy = ConvertFrom-ServiceRecoveryPolicyOutput -FailureOutput $failureOutput -FailureExitCode $failureExitCode `
+        -FailureFlagOutput $failureFlagOutput -FailureFlagExitCode $failureFlagExitCode
     $rawCodes = New-Object System.Collections.Generic.List[int]
     foreach ($line in @($RecoveryWarnings)) {
         foreach ($match in [regex]::Matches([string]$line, '(?i)\b(?:win32(?:\s+error)?|error\s+code|code)\b[\s:=#(]*(?<code>\d+)\b')) {
@@ -236,21 +285,115 @@ function Get-ServiceRecoveryPolicyEvidence {
         }
     }
     $hasAccessDeniedWithoutCode = [bool](@($RecoveryWarnings | Where-Object { $_ -match '(?i)Access is denied|拒绝访问' }).Count -gt 0 -and $rawCodes.Count -eq 0)
-    $configured = [bool]($exitCode -eq 0 -and ($output -join "`n") -match '(?i)\bRESTART\b')
     return [pscustomobject]@{
-        QuerySucceeded = $exitCode -eq 0
-        QueryExitCode = $exitCode
-        RecoveryConfigured = $configured
+        QuerySucceeded = $policy.QuerySucceeded
+        QueryExitCode = $policy.FailureQueryExitCode
+        FailureFlagQueryExitCode = $policy.FailureFlagQueryExitCode
+        RecoveryConfigured = $policy.RecoveryConfigured
+        ResetPeriodSeconds = $policy.ResetPeriodSeconds
+        RestartActionCount = $policy.RestartActionCount
+        RestartDelaysMilliseconds = $policy.RestartDelaysMilliseconds
+        FailureActionsOnNonCrashFailures = $policy.FailureActionsOnNonCrashFailures
         ServiceRunning = [bool]($service -and $service.Status -eq 'Running')
         RawWin32ErrorCodes = @($rawCodes | Select-Object -Unique)
         InferredWin32ErrorCode = if ($hasAccessDeniedWithoutCode) { 5 } else { $null }
         ErrorCodeSource = if ($rawCodes.Count -gt 0) { 'ServiceLog' } elseif ($hasAccessDeniedWithoutCode) { 'InferredFromAccessDeniedText' } else { 'NotReported' }
-        QueryOutput = $output
+        QueryOutput = $policy.FailureQueryOutput
+        FailureFlagQueryOutput = $policy.FailureFlagQueryOutput
         LogWarnings = @($RecoveryWarnings)
         AdministratorRepairCommands = @(
             'sc.exe failure CoworkVMService reset= 86400 actions= restart/5000/restart/5000/restart/5000',
             'sc.exe failureflag CoworkVMService 1'
         )
+    }
+}
+
+function Get-ServiceRecoveryConfigurationSafetyEvidence {
+    $service = Get-Service -Name CoworkVMService -ErrorAction SilentlyContinue
+    $paths = Get-ClaudePaths
+    $signatures = Test-ClaudeCoreSignatures
+    $record = Get-CimInstance Win32_Service -Filter "Name='CoworkVMService'" -ErrorAction SilentlyContinue
+    $expectedBinary = if ($paths) { [IO.Path]::GetFullPath((Join-Path $paths.Resources 'cowork-svc.exe')) } else { $null }
+    $registeredBinary = $null
+    if ($record -and $record.PathName) {
+        try { $registeredBinary = [IO.Path]::GetFullPath(([Environment]::ExpandEnvironmentVariables([string]$record.PathName)).Trim().Trim('"')) } catch {}
+    }
+    $binaryMatches = [bool]($expectedBinary -and $registeredBinary -and $expectedBinary.Equals($registeredBinary, [StringComparison]::OrdinalIgnoreCase))
+    return [pscustomobject]@{
+        Safe = [bool]($service -and $signatures.Valid -and $binaryMatches)
+        ServiceExists = [bool]$service
+        CoreSignaturesValid = [bool]$signatures.Valid
+        ExpectedBinary = $expectedBinary
+        RegisteredBinary = $registeredBinary
+        BinaryMatchesOfficialClaude = $binaryMatches
+    }
+}
+
+function Invoke-ServiceRecoveryConfiguration {
+    param(
+        [switch]$Confirmed,
+        [scriptblock]$SafetyProvider,
+        [scriptblock]$EvidenceProvider,
+        [scriptblock]$CommandRunner
+    )
+    if (-not $SafetyProvider) { $SafetyProvider = { Get-ServiceRecoveryConfigurationSafetyEvidence } }
+    if (-not $EvidenceProvider) { $EvidenceProvider = { Get-ServiceRecoveryPolicyEvidence } }
+    if (-not $CommandRunner) {
+        $CommandRunner = {
+            param([string[]]$Arguments)
+            $commandOutput = @(& sc.exe @Arguments 2>&1 | ForEach-Object { [string]$_ })
+            [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $commandOutput }
+        }
+    }
+    $safety = & $SafetyProvider
+    if (-not $safety -or -not $safety.Safe) {
+        throw "拒绝修改服务恢复策略：无法证明 CoworkVMService 精确指向当前 Anthropic 签名有效的 cowork-svc.exe。$($safety | ConvertTo-Json -Compress)"
+    }
+    $before = & $EvidenceProvider
+    if ($before -and $before.RecoveryConfigured) {
+        return [pscustomobject]@{
+            SchemaVersion = 1
+            ToolVersion = $script:ToolVersion
+            Action = 'ConfigureServiceRecovery'
+            Changed = $false
+            Status = 'AlreadyConfigured'
+            Safety = $safety
+            Before = $before
+            After = $before
+        }
+    }
+    if (-not $Confirmed) {
+        throw 'ConfigureServiceRecovery 会修改 Windows 服务崩溃恢复策略；请确认当前 Plan/Diagnose 后显式添加 -ConfirmServiceRecovery。'
+    }
+    $commands = @(
+        @('failure', 'CoworkVMService', 'reset=', '86400', 'actions=', 'restart/5000/restart/5000/restart/5000'),
+        @('failureflag', 'CoworkVMService', '1')
+    )
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($arguments in $commands) {
+        $result = & $CommandRunner ([string[]]$arguments)
+        $results.Add([pscustomobject]@{ Arguments = $arguments; ExitCode = $result.ExitCode; Output = @($result.Output) })
+        if ($result.ExitCode -ne 0) {
+            $postFailureEvidence = $null
+            try { $postFailureEvidence = & $EvidenceProvider } catch {}
+            throw "sc.exe $($arguments[0]) 失败，原始退出码=$($result.ExitCode)：$(@($result.Output) -join ' ')；失败后策略=$($postFailureEvidence | ConvertTo-Json -Depth 5 -Compress)"
+        }
+    }
+    $after = & $EvidenceProvider
+    if (-not $after -or -not $after.RecoveryConfigured) {
+        throw "sc.exe 返回成功，但复核未得到推荐策略；不会把部分配置报告为成功：$($after | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    return [pscustomobject]@{
+        SchemaVersion = 1
+        ToolVersion = $script:ToolVersion
+        Action = 'ConfigureServiceRecovery'
+        Changed = $true
+        Status = 'ConfiguredAndVerified'
+        Safety = $safety
+        Before = $before
+        After = $after
+        Commands = $results.ToArray()
+        CompletedAt = (Get-Date).ToUniversalTime().ToString('o')
     }
 }
 
@@ -1485,7 +1628,8 @@ function Wait-AbandonedLegacyVmRebuildEvidence {
         [string]$MinimumLifecycleTime,
         [scriptblock]$EvidenceProvider
     )
-    $deadline = (Get-Date).AddSeconds([math]::Max(0, $Seconds))
+    $waitStarted = Get-Date
+    $deadline = $waitStarted.AddSeconds([math]::Max(0, $Seconds))
     $lastReasonText = $null
     $nextProgress = Get-Date
     do {
@@ -1497,16 +1641,21 @@ function Wait-AbandonedLegacyVmRebuildEvidence {
             Get-AbandonedLegacyVmRebuildEvidence -State $State -Paths $paths -MinimumLifecycleTime $MinimumLifecycleTime
         }
         $remainingSeconds = [math]::Max(0, [math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+        $elapsedSeconds = [math]::Max(0, [math]::Floor(((Get-Date) - $waitStarted).TotalSeconds))
+        $progressPercent = if ($Seconds -gt 0) { [math]::Min(100, [math]::Floor(($elapsedSeconds / $Seconds) * 100)) } else { 100 }
         if ($evidence) {
             $evidence | Add-Member -NotePropertyName RemainingSeconds -NotePropertyValue $remainingSeconds -Force
+            $evidence | Add-Member -NotePropertyName ElapsedSeconds -NotePropertyValue $elapsedSeconds -Force
+            $evidence | Add-Member -NotePropertyName ProgressPercent -NotePropertyValue $progressPercent -Force
             $evidence | Add-Member -NotePropertyName ExpectedUserAction -NotePropertyValue 'OpenClaudeCowork' -Force
+            $evidence | Add-Member -NotePropertyName UserInstruction -NotePropertyValue '请切换到 Claude，进入 Cowork 并保持该窗口开启；不要关闭安装器。' -Force
             $evidence | Add-Member -NotePropertyName TimedOut -NotePropertyValue $false -Force
         }
         if ($evidence -and $evidence.Eligible) { return $evidence }
         $reasonText = if ($evidence -and $evidence.Reasons) { $evidence.Reasons -join '；' } else { '无法采集 Abandoned 安全证据。' }
         if ($reasonText -ne $lastReasonText -or (Get-Date) -ge $nextProgress) {
             $missingText = if ($evidence -and $evidence.PSObject.Properties['MissingEvidence']) { @($evidence.MissingEvidence) -join ',' } else { 'Unknown' }
-            Write-Log "等待孤立状态安全证据就绪：RemainingSeconds=$remainingSeconds；ExpectedUserAction=OpenClaudeCowork；MissingEvidence=$missingText；$reasonText" INFO
+            Write-Log "等待 Cowork 证据：ProgressPercent=$progressPercent；RemainingSeconds=$remainingSeconds；ExpectedUserAction=OpenClaudeCowork；MissingEvidence=$missingText。请在 Claude 中进入 Cowork 并保持窗口开启。详情：$reasonText" INFO
             $lastReasonText = $reasonText
             $nextProgress = (Get-Date).AddSeconds(15)
         }
@@ -1515,7 +1664,10 @@ function Wait-AbandonedLegacyVmRebuildEvidence {
     } while ($true)
     if ($evidence) {
         $evidence | Add-Member -NotePropertyName RemainingSeconds -NotePropertyValue 0 -Force
+        $evidence | Add-Member -NotePropertyName ElapsedSeconds -NotePropertyValue ([math]::Max(0, [math]::Floor(((Get-Date) - $waitStarted).TotalSeconds))) -Force
+        $evidence | Add-Member -NotePropertyName ProgressPercent -NotePropertyValue 100 -Force
         $evidence | Add-Member -NotePropertyName ExpectedUserAction -NotePropertyValue 'OpenClaudeCowork' -Force
+        $evidence | Add-Member -NotePropertyName UserInstruction -NotePropertyValue '等待已超时；进入 Claude Cowork 后重新运行 install.bat，安全门槛不会降低。' -Force
         $evidence | Add-Member -NotePropertyName TimedOut -NotePropertyValue $true -Force
     }
     return $evidence
@@ -1838,6 +1990,7 @@ function Get-VmBackupInventory {
             Deletable = $false
             DeletionBlockers = @()
             ConfirmationToken = $null
+            RecommendedCleanupCommand = $null
         })
     }
     $verifiedCount = @($items | Where-Object VerificationStatus -eq 'StructurallyVerified').Count
@@ -1854,6 +2007,8 @@ function Get-VmBackupInventory {
         $item.Deletable = $blockers.Count -eq 0
         if ($Mode -eq 'CleanupPlan' -and $item.Deletable) {
             $item.ConfirmationToken = Get-VmBackupDeletionToken -Path $item.Path -Bytes $item.SizeBytes -LastWriteTimeUtc $item.LastWriteTimeUtc
+            $setupScriptPath = Join-Path $script:Root 'ClaudeSetup.ps1'
+            $item.RecommendedCleanupCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action CleanupBackup -BackupPath "{1}" -ConfirmationToken "{2}"' -f $setupScriptPath, $item.Path, $item.ConfirmationToken
         }
     }
     $totalBytes = [int64]0
@@ -1877,6 +2032,7 @@ function Get-VmBackupInventory {
             'Cleanup requires a separate CleanupBackup invocation with the exact path and the current confirmation token.',
             'CleanupBackup refuses unmanaged paths, reparse points, active-state references, unhealthy current VM state, and deletion of the last structurally verified backup.'
         )
+        ExpectedSequence = @('Inventory', 'CleanupPlan', 'CleanupBackup')
         Items = $items.ToArray()
     }
 }
@@ -3277,6 +3433,13 @@ function Get-SetupPlan {
             & $addStep 'vm-efs' 'UserData' 'Conditional' 'Claude VM-critical paths' 'EFS classification requires an installed official Claude package and an active user-data path.' 'No decrypt during Plan.' $true $false
         }
 
+    $serviceRecovery = $null
+    try { $serviceRecovery = Get-ServiceRecoveryPolicyEvidence } catch {}
+    if ($serviceRecovery -and $serviceRecovery.RecoveryConfigured) {
+        & $addStep 'service-recovery-policy' 'Runtime' 'NoChange' 'CoworkVMService failure actions' 'The recommended three restart actions, 86400-second reset period, and non-crash failure flag are already configured.' 'No service configuration change.' $true $false
+    } else {
+        & $addStep 'service-recovery-policy' 'Runtime' 'Manual' 'CoworkVMService failure actions' 'Auto intentionally leaves service failure actions unchanged. After reviewing Diagnose, the user may run ConfigureServiceRecovery with explicit confirmation; the action verifies the official signed service binary before and after the change.' 'Separate opt-in service configuration; never part of Auto/Install/Repair.' $true $false
+    }
     & $addStep 'services-shortcut-launch' 'Runtime' 'WouldChange' 'Cowork services, desktop Claude.lnk, Claude AppX activation' 'After package and storage checks, Auto starts available Cowork services, creates or updates the official AppX shortcut, and launches Claude unless SkipLaunch is set.' 'Does not disable Claude official automatic updates.' $true $false
 
     $stepArray = @($steps.ToArray() | Sort-Object Order)
@@ -4183,7 +4346,7 @@ function Invoke-AutoSetup {
             if (-not $SkipLaunch) { Start-ClaudeAppx }
             $evidenceWaitSeconds = if ($SkipLaunch) { 0 } else { $LegacyEvidenceWaitSeconds }
             if (-not $SkipLaunch) {
-                Write-Log '请在已启动的 Claude 中进入 Cowork；只有本次启动后的 VM、网络、daemon 与 API 全部成功，才会归档孤立状态。' WARN
+                Write-Log "需要用户操作：请切换到已启动的 Claude，进入 Cowork 并保持窗口开启。安装器将在 $LegacyEvidenceWaitSeconds 秒内显示倒计时；只有本次启动后的 VM、网络、daemon 与 API 全部成功，才会归档孤立状态。" WARN
             }
             $readyEvidence = Wait-AbandonedLegacyVmRebuildEvidence -State $rebuildState -Seconds $evidenceWaitSeconds `
                 -MinimumLifecycleTime $abandonedLifecycleAnchor
@@ -4284,7 +4447,7 @@ if ($Action -in @('Plan', 'Inventory', 'CleanupPlan')) {
 }
 
 New-Item -ItemType Directory -Path $script:ReportsRoot -Force | Out-Null
-if ($Action -notin @('Diagnose', 'ResolveLegacyState', 'CleanupBackup')) {
+if ($Action -notin @('Diagnose', 'ResolveLegacyState', 'CleanupBackup', 'ConfigureServiceRecovery')) {
     New-Item -ItemType Directory -Path $script:DownloadsRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $script:ProgramDataRoot, $script:BackupRoot -Force | Out-Null
 }
@@ -4294,7 +4457,7 @@ Ensure-Administrator
 
 $exitCode = 0
 $actionReport = $null
-$skipFinalReport = $Action -in @('ResolveLegacyState', 'CleanupBackup')
+$skipFinalReport = $Action -in @('ResolveLegacyState', 'CleanupBackup', 'ConfigureServiceRecovery')
 try {
     switch ($Action) {
         'Diagnose' {
@@ -4337,6 +4500,12 @@ try {
             $actionReport = Remove-VerifiedVmBackup -Path $BackupPath -Token $ConfirmationToken
             [Console]::Out.WriteLine(($actionReport | ConvertTo-Json -Depth 8 -Compress))
             Write-Log "已按精确路径删除经过二次确认的 Claude VM 备份：$($actionReport.RemovedPath)；该删除不可由本工具恢复。" WARN
+        }
+        'ConfigureServiceRecovery' {
+            $actionReport = Invoke-ServiceRecoveryConfiguration -Confirmed:$ConfirmServiceRecovery
+            [Console]::Out.WriteLine(($actionReport | ConvertTo-Json -Depth 10 -Compress))
+            $message = if ($actionReport.Changed) { '已配置并复核 CoworkVMService 崩溃恢复策略。' } else { 'CoworkVMService 已符合推荐崩溃恢复策略；没有修改。' }
+            Write-Log $message OK
         }
         'Auto' { $exitCode = Invoke-AutoSetup }
     }

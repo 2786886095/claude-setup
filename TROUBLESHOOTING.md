@@ -131,19 +131,27 @@ Diagnose 分开输出 `CurrentLiveVm`、`RecentVerifiedLifecycle` 和 `LastSucce
 
 ## 服务恢复动作与待重启
 
-`service-CoworkVMService` 表示服务当前是否运行；`service-recovery-policy` 表示服务异常退出后 SCM 是否配置重启动作。两者互不替代。报告保存 `sc.exe qfailure` 输出、服务日志中的原始 Win32 代码及来源；日志只写 Access Denied 而没有数字时，Win32 5 会明确标为推断。报告给出的管理员命令不会被 Diagnose 自动执行。
+`service-CoworkVMService` 表示服务当前是否运行；`service-recovery-policy` 表示服务异常退出后 SCM 是否配置推荐策略。两者互不替代。报告同时查询 `sc.exe qfailure` 与 `qfailureflag`，严格要求 86400 秒重置期、三次 5000 ms 重启以及 non-crash failure flag；服务日志只写 Access Denied 而没有数字时，Win32 5 会明确标为推断。
+
+Auto、Install、Repair 和 Diagnose 都不会修改恢复策略。确认 Claude.exe/cowork-svc.exe 签名和服务二进制路径正常后，可在管理员 PowerShell 中显式运行：
+
+```powershell
+.\ClaudeSetup.ps1 -Action ConfigureServiceRecovery -ConfirmServiceRecovery
+```
+
+该动作执行固定的两条 `sc.exe` 配置并立即重新查询；任何原始退出码非零或复核不一致都会失败，不会把部分配置报告为成功。Windows 对打包服务仍可能返回 Access Denied，这属于可观察的系统限制，不影响当前 VM 健康语义。
 
 `pending-restart` 的 `Classification=Recommended` 表示 Windows 存在系统级待处理标记，但当前检查没有证明它阻断 Claude；`Required` 只用于 ClaudeSetup 本轮修改虚拟化先决条件、VM 重建正处于 AwaitingRestart 或 VirtualMachinePlatform 明确处于 Pending 状态。
 
 ## Cowork 需要用户进入与等待时间
 
-孤立状态恢复不是所有场景完全无人值守。安装器能启动 Claude，但必须由用户进入 Cowork 才能产生本轮 VM、daemon、Network 和 API 新鲜证据。等待日志持续输出 `RemainingSeconds`、`ExpectedUserAction` 与 `MissingEvidence`。可用 `-LegacyEvidenceWaitSeconds 600` 把默认 180 秒延长到 10 分钟，允许范围 30–1800 秒；超时只保留状态，不降低归档门槛。
+孤立状态恢复不是所有场景完全无人值守。安装器能启动 Claude，但必须由用户进入 Cowork 才能产生本轮 VM、daemon、Network 和 API 新鲜证据。等待日志持续输出 `ProgressPercent`、`RemainingSeconds`、`ExpectedUserAction`、中文 `UserInstruction` 与 `MissingEvidence`，并明确提醒保持 Claude 和安装器窗口开启。可用 `-LegacyEvidenceWaitSeconds 600` 把默认 180 秒延长到 10 分钟，允许范围 30–1800 秒；超时只保留状态，不降低归档门槛。
 
 ## 备份库存与安全清理
 
 `-Action Inventory` 和 `-Action CleanupPlan` 都是零写入 JSON 操作。它们只自动管理已知 Claude `vm_bundles` 根目录下的 `claudevm.bundle.backup-*` 和 `claudevm.bundle.*isolated*`；外部完整 E2E 备份可用 `-BackupPath` 列出，但标为 `ExternalExplicit`，工具拒绝删除。
 
-删除必须另行执行 `CleanupBackup`，复制 CleanupPlan 当前生成的令牌，并再次提交完全相同的绝对路径。令牌会在大小或最后写入时间变化后失效。工具拒绝重解析点、活动状态引用、结构不完整/不可读/带 EFS 的候选、当前活动 VM 不健康，以及会删除最后一份健康备份的请求。该动作不可恢复，不要把它放进无人值守 Auto 流程。
+删除必须另行执行 `CleanupBackup`。CleanupPlan 为可删除项生成 `RecommendedCleanupCommand`，其中绑定当前绝对路径与令牌；也可手动复制相同字段。令牌会在大小或最后写入时间变化后失效。工具拒绝重解析点、活动状态引用、结构不完整/不可读/带 EFS 的候选、当前活动 VM 不健康，以及会删除最后一份健康受管备份的请求。该动作不可恢复，不要把它放进无人值守 Auto 流程。
 
 ## 分享诊断报告
 

@@ -60,9 +60,9 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 将 Cowork 日志分为“当前未解决错误”“已被后续完整成功序列覆盖的历史错误”“成功事件”，并把服务 recovery-actions 权限警告单独标为非致命；
 - 将 `CurrentLiveVm`、`RecentVerifiedLifecycle` 与 `LastSuccessAgeSeconds` 分开报告；普通 Diagnose 只观察，不启动 Claude/Cowork，只有显式 `-ActiveProbe` 才会启动服务和客户端进行探测；
 - 将 Windows 待重启分类为 `Required`、`Recommended` 或 `None`，系统级待处理标记不再自动等同 Claude 当前故障；
-- 单独查询 CoworkVMService 当前运行状态与崩溃恢复策略，保留服务日志给出的原始 Win32 错误码；只有日志未给出代码但明确出现 Access Denied 时，才把 Win32 5 标为“推断”，并给出可复制的管理员命令；
-- 孤立状态等待时持续输出 `RemainingSeconds`、`ExpectedUserAction=OpenClaudeCowork` 和 `MissingEvidence`；可用 `-LegacyEvidenceWaitSeconds 30..1800` 调整等待窗口，但不能降低新鲜证据门槛；
-- 提供零写入 `Inventory` 与 `CleanupPlan`：列出工具管理范围内 VM 备份/隔离件的来源、时间、大小、结构验证、加密状态和可恢复性。真正删除必须另行运行 `CleanupBackup`，同时提交精确路径和当前确认令牌；活动状态引用、重解析点、当前 VM 不健康、未验证候选及最后一份健康备份一律拒绝删除；
+- 单独查询 CoworkVMService 当前运行状态与崩溃恢复策略，严格核对 86400 秒重置期、三次 5000 ms 重启和 non-crash failure flag；只有日志未给出代码但明确出现 Access Denied 时，才把 Win32 5 标为“推断”。Auto/Install/Repair/Diagnose 永不修改该策略，只有显式 `ConfigureServiceRecovery -ConfirmServiceRecovery` 才会在双签名和服务二进制路径通过后执行并复核；
+- 孤立状态等待时持续输出 `ProgressPercent`、`RemainingSeconds`、`ExpectedUserAction=OpenClaudeCowork`、`UserInstruction` 和 `MissingEvidence`；可用 `-LegacyEvidenceWaitSeconds 30..1800` 调整等待窗口，但不能降低新鲜证据门槛；
+- 提供零写入 `Inventory` 与 `CleanupPlan`：列出工具管理范围内 VM 备份/隔离件的来源、时间、大小、结构验证、加密状态和可恢复性。CleanupPlan 为每个可删除项生成路径/令牌绑定的 `RecommendedCleanupCommand`；真正删除仍必须另行确认，活动状态引用、重解析点、当前 VM 不健康、未验证候选及最后一份健康受管备份一律拒绝删除；
 - 官方 MSIX 下载使用同目录临时文件、最多三次指数退避，并在转正前完成 Content-Length、签名、包身份、架构与 SHA-256 复核；失败代码在诊断 JSON 的 `DownloadFailure` 中机器可读；
 - 生成 JSON 与文本报告；双击 `share-diagnose.cmd` 或使用 `-Redact` 可生成移除用户名、设备名、SID、邮箱及个人路径的分享版。
 - 安装或修复成功后，在当前用户桌面创建或更新 `Claude.lnk`；快捷方式使用稳定的官方 AppX 启动标识，Claude 自动更新后仍然有效。
@@ -110,6 +110,14 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 .\ClaudeSetup.ps1 -Action CleanupPlan
 ```
 
+服务当前正常但 Diagnose 报告 `RecoveryConfigured=false` 时，可先运行 Plan/Diagnose，再显式配置并复核推荐的崩溃恢复策略。该动作不属于 Auto，必须管理员权限和独立确认：
+
+```powershell
+.\ClaudeSetup.ps1 -Action ConfigureServiceRecovery -ConfirmServiceRecovery
+```
+
+若 Windows 拒绝修改打包服务，命令会保留 `sc.exe` 原始退出码并失败，不会把部分配置报告为成功。
+
 孤立状态需要更长等待时间时：
 
 ```powershell
@@ -122,7 +130,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 .\ClaudeSetup.ps1 -Action Diagnose -ActiveProbe
 ```
 
-备份清理采用两步确认。先复制 `CleanupPlan` 为目标给出的 `ConfirmationToken`，再用完全相同的绝对路径执行；令牌绑定路径、大小和最后写入时间，目录变化后必须重新规划：
+备份清理采用两步确认。优先直接复制 `CleanupPlan` 为目标给出的 `RecommendedCleanupCommand`；它包含完全相同的绝对路径和当前 `ConfirmationToken`。令牌绑定路径、大小和最后写入时间，目录变化后必须重新规划：
 
 ```powershell
 .\ClaudeSetup.ps1 -Action CleanupPlan -BackupPath "C:\...\vm_bundles\claudevm.bundle.backup-YYYYMMDD-HHMMSS"
@@ -219,7 +227,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 ## 验证边界
 
-仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan/Inventory/CleanupPlan、孤立状态 bootstrap、新鲜度锚点与结构化等待、实时/历史运行语义、服务恢复策略、重启分类、备份双确认删除保护、日志分段、下载重试/长度失败、真实 Windows Authenticode 扩展名行为、分享报告脱敏和归档前证据失效。v1.2.3 已在一台 Windows 11 build 26200 x64 实机完成真实卸载重装、孤立状态恢复、从零 VM 资产下载以及 Cowork 网络/API E2E，确认修复 v1.2.2 的 P0；v1.2.4 的增强使用隔离夹具、真实官方下载和非破坏性实机检查验证，不把 v1.2.3 的破坏性结果冒充为 v1.2.4 新 E2E。完整覆盖范围见 [TEST_MATRIX.md](TEST_MATRIX.md)。标签发布由 GitHub Actions 从跟踪文件构建 ZIP、生成 SHA-256 并发布 build provenance attestation，可用 `gh attestation verify claude-setup-windows.zip --repo 2786886095/claude-setup` 验证；这仍不代表所有 Windows、代理、安全软件或 ARM64 环境都已覆盖。
+仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan/Inventory/CleanupPlan、孤立状态 bootstrap、新鲜度锚点与结构化等待、实时/历史运行语义、服务恢复策略解析与显式动作夹具、重启分类、备份双确认删除保护、日志分段、下载重试/长度失败、真实 Windows Authenticode 扩展名行为、分享报告脱敏和归档前证据失效。v1.2.4 已在一台 Windows 11 build 26200 x64 实机完成真实卸载重装、孤立状态恢复、从零 VM 资产下载、官方 manifest 哈希、Cowork 网络/API 与 ActiveProbe E2E；v1.2.5 不在当前开发机重跑破坏性卸载，新增动作仅通过隔离夹具和非破坏性检查验证，不能冒充 v1.2.5 新 E2E。完整覆盖范围见 [TEST_MATRIX.md](TEST_MATRIX.md)。标签发布由 GitHub Actions 从跟踪文件构建 ZIP、生成 SHA-256 并发布 build provenance attestation，可用 `gh attestation verify claude-setup-windows.zip --repo 2786886095/claude-setup` 验证；这仍不代表所有 Windows、代理、安全软件或 ARM64 环境都已覆盖。
 
 ## 官方资料
 
