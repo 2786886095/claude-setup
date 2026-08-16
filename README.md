@@ -53,11 +53,16 @@ Claude 始终使用官方 MSIX 默认安装位置：Windows 系统 AppX 卷（�
 - 识别 v1.0.x 遗留的 `vm-rebuild-active.json`。旧备份存在时，只有旧状态精确属于 Claude AppX 私有目录且当前独立 VM 完整健康，才归档为 Superseded，并永久保留旧备份；旧活动目录与备份均已不存在时，还必须复核当前 VM 关键 EFS、完整成功日志及 Claude/cowork-svc 的 Anthropic 签名，才归档为 Abandoned。两种记录都进入 `%ProgramData%\ClaudeSetup\state-history`；
 - 在任何安装或修复前可运行 `-Action Plan` 输出单个 JSON 操作计划；该动作不请求 UAC，不创建日志/报告，不下载，也不修改文件、AppX、服务、进程、环境变量、RunOnce 或 VM 状态；
 - `-Action ResolveLegacyState` 只处理已经满足安全条件的遗留状态，不进入下载、安装、服务启动或 VM 修复流程；Abandoned 在移动状态 JSON 前会重新读取状态并绑定五个 VM 文件的长度/时间、VM 关键 EFS、当前完整健康日志和双签名证据到回执；
-- 当旧状态精确指向 Claude 官方包族路径且旧活动 bundle/备份都已消失时，Auto 会先安装并验证官方包、恢复安全用户数据布局、启动 Claude，并在最多 180 秒内等待用户进入 Cowork；四项健康事件都必须晚于本次执行锚点，旧日志不能冒充本次验证；
+- 当旧状态精确指向 Claude 官方包族路径且旧活动 bundle/备份都已消失时，Auto 会先安装并验证官方包、恢复安全用户数据布局、启动 Claude，并默认等待 180 秒（可配置 30–1800 秒）让用户进入 Cowork；四项健康事件都必须晚于本次执行锚点，旧日志不能冒充本次验证；
 - `install.bat` 与 `diagnose.cmd` 固定调用 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`，仅为该子进程构造系统模块路径；不会永久覆盖用户或系统 `PSModulePath`，也不会误载 PowerShell 7/Scoop 版 `Microsoft.PowerShell.Security`；
 - 修复汉化或其他修改造成的 `Claude.exe` 签名损坏；
 - 诊断 `RPC pipe closed`、VHDX 缺失和 Cowork 服务故障；
 - 将 Cowork 日志分为“当前未解决错误”“已被后续完整成功序列覆盖的历史错误”“成功事件”，并把服务 recovery-actions 权限警告单独标为非致命；
+- 将 `CurrentLiveVm`、`RecentVerifiedLifecycle` 与 `LastSuccessAgeSeconds` 分开报告；普通 Diagnose 只观察，不启动 Claude/Cowork，只有显式 `-ActiveProbe` 才会启动服务和客户端进行探测；
+- 将 Windows 待重启分类为 `Required`、`Recommended` 或 `None`，系统级待处理标记不再自动等同 Claude 当前故障；
+- 单独查询 CoworkVMService 当前运行状态与崩溃恢复策略，保留服务日志给出的原始 Win32 错误码；只有日志未给出代码但明确出现 Access Denied 时，才把 Win32 5 标为“推断”，并给出可复制的管理员命令；
+- 孤立状态等待时持续输出 `RemainingSeconds`、`ExpectedUserAction=OpenClaudeCowork` 和 `MissingEvidence`；可用 `-LegacyEvidenceWaitSeconds 30..1800` 调整等待窗口，但不能降低新鲜证据门槛；
+- 提供零写入 `Inventory` 与 `CleanupPlan`：列出工具管理范围内 VM 备份/隔离件的来源、时间、大小、结构验证、加密状态和可恢复性。真正删除必须另行运行 `CleanupBackup`，同时提交精确路径和当前确认令牌；活动状态引用、重解析点、当前 VM 不健康、未验证候选及最后一份健康备份一律拒绝删除；
 - 官方 MSIX 下载使用同目录临时文件、最多三次指数退避，并在转正前完成 Content-Length、签名、包身份、架构与 SHA-256 复核；失败代码在诊断 JSON 的 `DownloadFailure` 中机器可读；
 - 生成 JSON 与文本报告；双击 `share-diagnose.cmd` 或使用 `-Redact` 可生成移除用户名、设备名、SID、邮箱及个人路径的分享版。
 - 安装或修复成功后，在当前用户桌面创建或更新 `Claude.lnk`；快捷方式使用稳定的官方 AppX 启动标识，Claude 自动更新后仍然有效。
@@ -101,7 +106,30 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 .\ClaudeSetup.ps1 -Action Diagnose -Redact
 .\ClaudeSetup.ps1 -Action Repair
 .\ClaudeSetup.ps1 -Action ResolveLegacyState
+.\ClaudeSetup.ps1 -Action Inventory
+.\ClaudeSetup.ps1 -Action CleanupPlan
 ```
+
+孤立状态需要更长等待时间时：
+
+```powershell
+.\ClaudeSetup.ps1 -Action Auto -LegacyEvidenceWaitSeconds 600
+```
+
+普通 Diagnose 不会启动 VM。只有明确希望启动 Claude/Cowork 做当前探测时才运行：
+
+```powershell
+.\ClaudeSetup.ps1 -Action Diagnose -ActiveProbe
+```
+
+备份清理采用两步确认。先复制 `CleanupPlan` 为目标给出的 `ConfirmationToken`，再用完全相同的绝对路径执行；令牌绑定路径、大小和最后写入时间，目录变化后必须重新规划：
+
+```powershell
+.\ClaudeSetup.ps1 -Action CleanupPlan -BackupPath "C:\...\vm_bundles\claudevm.bundle.backup-YYYYMMDD-HHMMSS"
+.\ClaudeSetup.ps1 -Action CleanupBackup -BackupPath "C:\...\vm_bundles\claudevm.bundle.backup-YYYYMMDD-HHMMSS" -ConfirmationToken "DELETE-CLAUDE-BACKUP-..."
+```
+
+`CleanupBackup` 是不可恢复的显式删除动作，不属于 Auto/Repair；请先保留独立备份。外部测试备份目录只会以 `ExternalExplicit` 列出，不由本工具删除。
 
 先查看机器可读计划（普通用户即可，标准输出只有一个 JSON 对象）：
 
@@ -191,7 +219,7 @@ UAC 自提权由 `ElevateInstall.ps1` 通过系统 `cmd.exe` 启动并等待结�
 
 ## 验证边界
 
-仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan、孤立状态 bootstrap、新鲜度锚点、日志分段、下载重试/长度失败、真实 Windows Authenticode 扩展名行为、分享报告脱敏和归档前证据失效。v1.2.1 曾在一台 Windows 11 build 26200 机器完成真实卸载、官方重装、Cowork VM、网络与 API E2E；v1.2.2 的真实重装测试已确认失败，不能沿用 v1.2.1 的结论。v1.2.3 已用同一官方 MSIX 的等字节扩展名对照、隔离夹具和只读实机检查验证，但在发布前未再次卸载当前健康的 Claude，因此不冒充新的破坏性 E2E。标签发布由 GitHub Actions 从跟踪文件构建 ZIP、生成 SHA-256 并发布 build provenance attestation，可用 `gh attestation verify claude-setup-windows.zip --repo 2786886095/claude-setup` 验证；这仍不代表所有 Windows、代理、安全软件或 ARM64 环境都已覆盖。
+仓库测试覆盖 Windows PowerShell 与 PowerShell 7 的语法、PowerShell 7→cmd→Windows PowerShell 模块污染链、只读 Plan/Inventory/CleanupPlan、孤立状态 bootstrap、新鲜度锚点与结构化等待、实时/历史运行语义、服务恢复策略、重启分类、备份双确认删除保护、日志分段、下载重试/长度失败、真实 Windows Authenticode 扩展名行为、分享报告脱敏和归档前证据失效。v1.2.3 已在一台 Windows 11 build 26200 x64 实机完成真实卸载重装、孤立状态恢复、从零 VM 资产下载以及 Cowork 网络/API E2E，确认修复 v1.2.2 的 P0；v1.2.4 的增强使用隔离夹具、真实官方下载和非破坏性实机检查验证，不把 v1.2.3 的破坏性结果冒充为 v1.2.4 新 E2E。完整覆盖范围见 [TEST_MATRIX.md](TEST_MATRIX.md)。标签发布由 GitHub Actions 从跟踪文件构建 ZIP、生成 SHA-256 并发布 build provenance attestation，可用 `gh attestation verify claude-setup-windows.zip --repo 2786886095/claude-setup` 验证；这仍不代表所有 Windows、代理、安全软件或 ARM64 环境都已覆盖。
 
 ## 官方资料
 

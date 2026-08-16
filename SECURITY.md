@@ -20,6 +20,8 @@
 
 `v1.2.2` 存在独立的全新安装/重装阻断回归：下载目标为 `.msix` 时，临时文件被命名为 `*.msix.partial`。Windows Authenticode 根据最后扩展名选择格式，因而会把字节完整、官方签名有效的 MSIX 返回为 `UnknownError`。请勿使用 v1.2.2 做全新安装或重装。`v1.2.3` 将同目录暂存/回滚文件改为 `*.partial.msix` / `*.previous.msix`，签名和 manifest 验证仍发生在覆盖可信缓存之前；失败历史增加候选长度与 SHA-256，便于区分重复内容和网络变化。该修复由同一官方 MSIX 的等字节扩展名对照和真实 Windows Authenticode 夹具验证，但未以卸载当前健康 Claude 的方式冒充新的破坏性 E2E。
 
+`v1.2.4` 增加只读备份 `Inventory`/`CleanupPlan` 及独立的显式 `CleanupBackup`。Auto、Install、Repair、Diagnose、Plan、Inventory 和 CleanupPlan 均不会删除备份。CleanupBackup 必须同时满足：路径位于工具认可的 Claude `vm_bundles` 根目录、名称属于已知备份/隔离件、不是重解析点、未被活动重建状态引用、候选结构完整可读且无 EFS、当前活动 VM 完整且无 EFS、删除后仍至少保留一份结构验证通过的健康备份，并提交绑定路径/大小/最后写入时间的当前确认令牌。外部显式路径只列为 `ExternalExplicit`，不允许工具删除。该版本还把实时 VM 与历史生命周期、服务运行与崩溃恢复、建议重启与必需重启分别报告；普通 Diagnose 不启动 VM，只有显式 ActiveProbe 才可启动 Claude/Cowork。
+
 ## 已运行旧版本怎么办
 
 1. 停止反复运行旧版安装器；不要删除任何 `claudevm.bundle.backup-*`、`foreignjunk` 或 `%ProgramData%\ClaudeSetup` 状态文件。

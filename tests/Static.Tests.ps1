@@ -27,6 +27,7 @@ $elevator = Get-Content -LiteralPath (Join-Path $root 'ElevateInstall.ps1') -Raw
 $zstdHelperPath = Join-Path $root 'VmZstdDecompress.js'
 $zstdHelper = Get-Content -LiteralPath $zstdHelperPath -Raw -Encoding UTF8
 $security = Get-Content -LiteralPath (Join-Path $root 'SECURITY.md') -Raw -Encoding UTF8
+$testMatrix = Get-Content -LiteralPath (Join-Path $root 'TEST_MATRIX.md') -Raw -Encoding UTF8
 $releaseWorkflow = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release.yml') -Raw -Encoding UTF8
 $attributes = Get-Content -LiteralPath (Join-Path $root '.gitattributes') -Raw -Encoding UTF8
 $batchFiles = Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Extension -in @('.bat', '.cmd') }
@@ -129,6 +130,22 @@ $requiredSafetyChecks = @(
     'MinimumLifecycleTime'
     'LifecycleFreshAfterAnchor'
     'Get-RecentCoworkErrorEvidence'
+    'Get-CurrentLiveVmEvidence'
+    'Get-ServiceRecoveryPolicyEvidence'
+    'Get-PendingRestartEvidence'
+    'CurrentLiveVm'
+    'RecentVerifiedLifecycle'
+    'LastSuccessAgeSeconds'
+    'LegacyEvidenceWaitSeconds'
+    'RemainingSeconds'
+    'ExpectedUserAction'
+    'MissingEvidence'
+    'Get-VmBackupInventory'
+    'Remove-VerifiedVmBackup'
+    'CleanupPlan'
+    'CleanupBackup'
+    'ConfirmationToken'
+    'ActiveProbe'
     'Get-DownloadStagingPaths'
     'Invoke-HttpFileDownload'
     'DOWNLOAD_LENGTH_MISMATCH'
@@ -158,8 +175,11 @@ if ($main -match '(?s)Remove-AppxPackage[^\r\n]*PreserveApplicationData') {
 if ($main -match 'disableAutoUpdates|Register-ScheduledTask|New-ScheduledTask') {
     throw 'The one-shot installer must not take over Claude updates or create scheduled tasks.'
 }
-foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'v1.2.2', 'v1.2.3', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
+foreach ($required in @('v1.0.4', 'v1.0.13', 'v1.1.0', 'v1.1.1', 'v1.1.2', 'v1.2.0', 'v1.2.1', 'v1.2.2', 'v1.2.3', 'v1.2.4', 'ERROR_APPX_FILE_NOT_ENCRYPTED', '0x1772', 'Claude-3p', '不要把活动 VHDX 硬链接到唯一备份')) {
     if (-not $security.Contains($required)) { throw "SECURITY.md is missing required incident guidance: $required" }
+}
+foreach ($required in @('Windows 11 build 26200 x64', 'ARM64 Windows', '企业代理', '第三方杀毒/EDR', '多用户并发', '全新 Windows 用户档案', '不能冒充 v1.2.4 新 E2E')) {
+    if (-not $testMatrix.Contains($required)) { throw "TEST_MATRIX.md is missing a required coverage boundary: $required" }
 }
 if ($main -match '\$partial\s*=\s*"\$Destination\.partial"') {
     throw 'Download staging must preserve the final package extension for Windows Authenticode detection.'
@@ -226,7 +246,7 @@ if ($autoBootstrapIndex -lt 0 -or $autoPackageIndex -lt $autoBootstrapIndex -or
     throw 'Auto must bootstrap and verify the official package, wait for full evidence, and only then resolve an orphaned legacy state.'
 }
 if ($autoBlock -notmatch '(?s)abandonedLifecycleAnchor.*?Wait-AbandonedLegacyVmRebuildEvidence.+MinimumLifecycleTime.*?Resolve-VmRebuildState.+MinimumLifecycleTime' -or
-    $autoBlock -notmatch 'evidenceWaitSeconds = if \(\$SkipLaunch\) \{ 0 \} else \{ 180 \}') {
+    $autoBlock -notmatch 'evidenceWaitSeconds = if \(\$SkipLaunch\) \{ 0 \} else \{ \$LegacyEvidenceWaitSeconds \}') {
     throw 'Auto must bind Abandoned archival to current-execution lifecycle evidence and allow time for the user to enter Cowork.'
 }
 if ($main -notmatch '(?s)function Get-SetupPlanExecutionAdvice.*?RecommendedCommand.*?blockedSteps\.Count -eq 0' -or $main -notmatch 'BlockerResolution =') {
@@ -258,10 +278,29 @@ if ($badPlanCommands.Count -gt 0) {
     throw "Plan directly invokes mutating commands: $($badPlanCommands -join ', ')"
 }
 $planEntryIndex = $main.IndexOf("if (`$Action -eq 'Plan')")
+$readOnlyEntryIndex = $main.IndexOf("if (`$Action -in @('Plan', 'Inventory', 'CleanupPlan'))")
 $importGuardIndex = $main.LastIndexOf("if (`$env:CLAUDE_SETUP_IMPORT_ONLY -eq '1')")
 $entryWriteIndex = $main.IndexOf('New-Item -ItemType Directory -Path $script:ReportsRoot', $importGuardIndex)
-if ($planEntryIndex -lt 0 -or $entryWriteIndex -lt 0 -or $planEntryIndex -gt $entryWriteIndex) {
+if ($readOnlyEntryIndex -lt 0 -or $entryWriteIndex -lt 0 -or $readOnlyEntryIndex -gt $entryWriteIndex) {
     throw 'Plan must exit before the main entry point creates reports, downloads, logs, or ProgramData directories.'
+}
+$diagnosticsStart = $main.IndexOf('function Invoke-Diagnostics')
+$diagnosticsEnd = $main.IndexOf('function Protect-DiagnosticText', $diagnosticsStart)
+if ($diagnosticsStart -lt 0 -or $diagnosticsEnd -le $diagnosticsStart) { throw 'Unable to isolate Invoke-Diagnostics.' }
+$diagnosticsBlock = $main.Substring($diagnosticsStart, $diagnosticsEnd - $diagnosticsStart)
+if ($diagnosticsBlock -match 'Start-CoworkServices|Start-ClaudeAppx|Start-Service|Start-Process') {
+    throw 'Ordinary Diagnose must remain passive; only the explicit ActiveProbe path may start Claude/Cowork.'
+}
+$cleanupStart = $main.IndexOf('function Remove-VerifiedVmBackup')
+$cleanupEnd = $main.IndexOf('function Get-OfficialVmManifest', $cleanupStart)
+if ($cleanupStart -lt 0 -or $cleanupEnd -le $cleanupStart) { throw 'Unable to isolate verified backup cleanup.' }
+$cleanupBlock = $main.Substring($cleanupStart, $cleanupEnd - $cleanupStart)
+foreach ($required in @('ConfirmationToken', 'DeletionBlockers', 'Test-ReparsePoint', 'vm_bundles', 'Remove-Item -LiteralPath $fullPath')) {
+    if (-not $cleanupBlock.Contains($required)) { throw "CleanupBackup is missing a destructive-action guard: $required" }
+}
+if ($main -notmatch '(?s)function Get-VmBackupInventory.*?Deletion would remove the last structurally verified healthy managed backup' -or
+    -not $main.Contains('StructurallyVerifiedManagedBackupCount') -or -not $main.Contains('ReparseItemCount')) {
+    throw 'CleanupPlan must refuse deletion of the last structurally verified healthy backup.'
 }
 $resolveStart = $main.IndexOf('function Invoke-ResolveLegacyState')
 $resolveEnd = $main.IndexOf('function Enable-CoworkPrerequisites', $resolveStart)
@@ -432,8 +471,14 @@ try {
     $env:CLAUDE_SETUP_IMPORT_ONLY = $null
     $planOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $planScript -Action Plan
     $planExitCode = $LASTEXITCODE
+    $inventoryOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $planScript -Action Inventory
+    $inventoryExitCode = $LASTEXITCODE
+    $cleanupPlanOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $planScript -Action CleanupPlan
+    $cleanupPlanExitCode = $LASTEXITCODE
     $env:CLAUDE_SETUP_IMPORT_ONLY = $planImportMode
     $plan = ($planOutput -join "`n") | ConvertFrom-Json
+    $inventoryPlan = ($inventoryOutput -join "`n") | ConvertFrom-Json
+    $cleanupPlan = ($cleanupPlanOutput -join "`n") | ConvertFrom-Json
     $stateHashAfter = if (Test-Path -LiteralPath $statePath -PathType Leaf) { (Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash } else { $null }
     $runOnceAfter = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name ClaudeSetupResume -ErrorAction SilentlyContinue).ClaudeSetupResume
     $environmentAfter = @([Environment]::GetEnvironmentVariable('TEMP', 'User'), [Environment]::GetEnvironmentVariable('TMP', 'User')) -join '|'
@@ -445,6 +490,11 @@ try {
     if ($planExitCode -ne 0 -or $plan.Action -ne 'Plan' -or -not $plan.ReadOnly -or
         -not $plan.Summary -or @($plan.Steps).Count -lt 8) {
         throw 'Plan must return a successful machine-readable read-only action graph.'
+    }
+    if ($inventoryExitCode -ne 0 -or $cleanupPlanExitCode -ne 0 -or
+        $inventoryPlan.Action -ne 'Inventory' -or $cleanupPlan.Action -ne 'CleanupPlan' -or
+        -not $inventoryPlan.ReadOnly -or -not $cleanupPlan.ReadOnly) {
+        throw 'Inventory and CleanupPlan must return successful machine-readable read-only reports.'
     }
     if ($rootFilesBefore -ne $rootFilesAfter -or $stateHashBefore -ne $stateHashAfter -or
         $runOnceBefore -ne $runOnceAfter -or $environmentBefore -ne $environmentAfter -or
@@ -606,7 +656,8 @@ try {
             '2026/08/15 01:01:03 API reachability: REACHABLE'
         ))
         $resolved1772 = Get-ClaudeVmLifecycleEvidence -LogPaths @($resolved1772Log)
-        if ($resolved1772.CurrentVirtualDisk1772 -or -not $resolved1772.FailureResolvedByLaterSuccess -or -not $resolved1772.CurrentRunHealthy) {
+        if ($resolved1772.CurrentVirtualDisk1772 -or -not $resolved1772.FailureResolvedByLaterSuccess -or -not $resolved1772.CurrentRunHealthy -or
+            -not $resolved1772.LatestCompleteSuccessAt -or $null -eq $resolved1772.LastSuccessAgeSeconds) {
             throw 'A complete success sequence after 0x1772 must classify the failure as resolved history.'
         }
 
@@ -658,6 +709,79 @@ try {
         if ($segmented.HistoricalErrors.Count -ne 1 -or $segmented.CurrentErrors.Count -ne 1 -or
             $segmented.Information.Count -ne 4 -or $segmented.RecoveryWarnings.Count -ne 1) {
             throw 'Cowork diagnostics must separate unresolved current errors, superseded history, success events, and nonfatal recovery-action warnings.'
+        }
+        $recoveryEvidence = Get-ServiceRecoveryPolicyEvidence -RecoveryWarnings $segmented.RecoveryWarnings
+        if ($recoveryEvidence.ErrorCodeSource -ne 'InferredFromAccessDeniedText' -or $recoveryEvidence.InferredWin32ErrorCode -ne 5 -or
+            @($recoveryEvidence.AdministratorRepairCommands).Count -ne 2 -or $null -eq $recoveryEvidence.ServiceRunning) {
+            throw 'Service recovery diagnostics must separate current running state, policy state, raw/inferred error source, and copyable administrator repair commands.'
+        }
+        $recommendedRestart = Get-PendingRestartEvidence
+        $requiredRestart = Get-PendingRestartEvidence -RebuildState ([pscustomobject]@{ Status = 'AwaitingRestart' })
+        if ($requiredRestart.Classification -ne 'Required' -or -not $requiredRestart.Pending -or
+            $recommendedRestart.Classification -notin @('None', 'Recommended')) {
+            throw 'Pending restart diagnostics must distinguish required Claude workflow restarts from generic Windows recommendations.'
+        }
+        $liveVmEvidence = Get-CurrentLiveVmEvidence
+        if (-not $liveVmEvidence.PSObject.Properties['CurrentLiveVm'] -or -not $liveVmEvidence.PSObject.Properties['Status'] -or
+            $liveVmEvidence.Status -notin @('Running', 'NotDetected', 'Unknown')) {
+            throw 'Current live VM evidence must be explicit and independent from historical lifecycle success.'
+        }
+
+        $savedLocalAppData = $env:LOCALAPPDATA
+        $savedAppData = $env:APPDATA
+        $savedDetectedUserData = $script:DetectedClaudeUserData
+        $savedCandidateCache = $script:InstallationCandidateCache
+        $savedVmStatePath = $script:VmRebuildStatePath
+        try {
+            $inventoryFixture = Join-Path $statusRoot 'inventory-fixture'
+            $env:LOCALAPPDATA = Join-Path $inventoryFixture 'LocalAppData'
+            $env:APPDATA = Join-Path $inventoryFixture 'Roaming'
+            $activeUserData = Join-Path $env:LOCALAPPDATA 'Claude-3p'
+            $vmBundles = Join-Path $activeUserData 'vm_bundles'
+            $activeFixtureBundle = Join-Path $vmBundles 'claudevm.bundle'
+            $backupOne = Join-Path $vmBundles 'claudevm.bundle.backup-20260816-010101'
+            $backupTwo = Join-Path $vmBundles 'claudevm.bundle.v123-coldtest-isolated-20260816-020202'
+            foreach ($directory in @($activeFixtureBundle, $backupOne, $backupTwo)) {
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+                foreach ($name in @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz')) {
+                    [IO.File]::WriteAllBytes((Join-Path $directory $name), [byte[]](1, 2, 3, 4))
+                }
+            }
+            $fakeInstall = Join-Path $inventoryFixture 'WindowsApps\Claude_fixture'
+            $script:InstallationCandidateCache = @([pscustomobject]@{
+                Type = 'MSIX'; CurrentUserRegistered = $true; Package = [pscustomobject]@{ InstallLocation = $fakeInstall; Version = [version]'1.0.0.0' }
+                Path = (Join-Path $fakeInstall 'app\Claude.exe'); Score = 2000; Version = [version]'1.0.0.0'; SignatureStatus = 'Valid'; CoworkCapable = $true
+            })
+            $script:DetectedClaudeUserData = [pscustomobject]@{ Path = $activeUserData; Source = 'Fixture' }
+            $script:VmRebuildStatePath = Join-Path $inventoryFixture 'no-active-state.json'
+            $inventory = Get-VmBackupInventory -Mode Inventory
+            $cleanup = Get-VmBackupInventory -Mode CleanupPlan
+            $relativePathRejected = $false
+            try { [void](Get-VmBackupInventory -ExplicitPath '.\relative-backup' -Mode CleanupPlan) } catch { $relativePathRejected = $true }
+            if (-not $inventory.ReadOnly -or $inventory.CandidateCount -ne 2 -or $inventory.StructurallyVerifiedBackupCount -ne 2 -or
+                -not $inventory.ActiveVmHealthy -or @($inventory.Items | Where-Object ConfirmationToken).Count -ne 0 -or
+                @($cleanup.Items | Where-Object { $_.Deletable -and $_.ConfirmationToken }).Count -ne 2 -or -not $relativePathRejected) {
+                throw 'Backup Inventory/CleanupPlan must report size, structural verification, recoverability, and tokens only in cleanup planning mode.'
+            }
+            $targetPlan = @($cleanup.Items | Where-Object Path -eq $backupOne)[0]
+            $wrongTokenRejected = $false
+            try { [void](Remove-VerifiedVmBackup -Path $backupOne -Token 'WRONG-TOKEN') } catch { $wrongTokenRejected = $true }
+            if (-not $wrongTokenRejected -or -not (Test-Path -LiteralPath $backupOne)) {
+                throw 'CleanupBackup must require the exact current second-confirmation token.'
+            }
+            $receipt = Remove-VerifiedVmBackup -Path $backupOne -Token $targetPlan.ConfirmationToken
+            $remainingPlan = Get-VmBackupInventory -Mode CleanupPlan
+            $remaining = @($remainingPlan.Items | Where-Object Path -eq $backupTwo)[0]
+            if ((Test-Path -LiteralPath $backupOne) -or $receipt.RemovedPath -ne $backupOne -or $remaining.Deletable -or
+                -not ($remaining.DeletionBlockers -match 'last structurally verified healthy managed backup')) {
+                throw 'CleanupBackup must delete only the exact planned target and then protect the final healthy backup.'
+            }
+        } finally {
+            $env:LOCALAPPDATA = $savedLocalAppData
+            $env:APPDATA = $savedAppData
+            $script:DetectedClaudeUserData = $savedDetectedUserData
+            $script:InstallationCandidateCache = $savedCandidateCache
+            $script:VmRebuildStatePath = $savedVmStatePath
         }
 
         $downloadDestination = Join-Path $statusRoot 'download.msix'
@@ -896,7 +1020,8 @@ try {
             if ($evidenceCounter.Value -lt 3) { return $waitingEvidence }
             return $readyEvidence
         }
-        if (-not $waitResult.Eligible -or $evidenceCounter.Value -lt 3) {
+        if (-not $waitResult.Eligible -or $evidenceCounter.Value -lt 3 -or
+            -not $waitResult.PSObject.Properties['RemainingSeconds'] -or $waitResult.ExpectedUserAction -ne 'OpenClaudeCowork' -or $waitResult.TimedOut) {
             throw 'Fresh-install evidence waiting must retry without weakening the final predicate.'
         }
         $detailedFailure = $null

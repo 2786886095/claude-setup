@@ -95,7 +95,7 @@
 
 自动解密范围只包括活动数据根目录、`vm_bundles`、`claudevm.bundle` 和五个 VM 运行文件。会话 `.jsonl`、`local-agent-mode-sessions`、`claude-code-sessions`、outputs、uploads、配置及缓存即使使用 EFS，也只显示为 Info，不会阻断 Cowork 或被自动解密。
 
-若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，最新版会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和引用备份均已不存在时，Auto 先安装/验证官方包，记录本次 UTC 锚点并最多等待 180 秒。请在 Claude 中进入 Cowork；只有 VM、Daemon、Network、API 四项成功时间都不早于锚点，且当前 VM 完整、关键路径无 EFS、双签名有效时才归档 Abandoned。若超时或证据不足，状态保持不动并列出原因。
+若 v1.0.x 留下的 `vm-rebuild-active.json` 仍指向 AppX 私有目录，而 Claude 已切换到健康的 `%LOCALAPPDATA%\Claude-3p`，最新版会先区分两种情况：旧备份仍存在时归档为 Superseded 并保持备份不动；旧活动目录和引用备份均已不存在时，Auto 先安装/验证官方包，记录本次 UTC 锚点并默认等待 180 秒（可配置 30–1800 秒）。请在 Claude 中进入 Cowork；只有 VM、Daemon、Network、API 四项成功时间都不早于锚点，且当前 VM 完整、关键路径无 EFS、双签名有效时才归档 Abandoned。若超时或证据不足，状态保持不动并列出原因。
 
 Diagnose 会区分当前未解决错误、已被后续完整成功序列覆盖的历史错误和成功事件；`CoworkVMService` 无法自行设置 recovery actions 的 Access denied 会单列为非致命警告，不会覆盖服务与 VM 的实际健康结论。无法验证的孤立状态会单独提示缺少的健康或签名条件。
 
@@ -122,6 +122,28 @@ Diagnose 会区分当前未解决错误、已被后续完整成功序列覆盖�
 ## 官方下载失败
 
 官方下载最多尝试三次，并使用同目录、保持最终格式扩展名的暂存文件，例如目标 `Claude-latest-x64.msix` 对应 `Claude-latest-x64.partial.msix`。Content-Length（若服务器提供）、Anthropic 签名、包身份、架构和 SHA-256 全部在转正前验证，拒绝的候选不会覆盖已有可信缓存。请勿使用 v1.2.2 做全新安装或重装：该版的 `*.msix.partial` 命名会让 Windows Authenticode 对有效 MSIX 返回 `UnknownError`；v1.2.3 已修复。最终失败时，诊断 JSON 的 `DownloadFailure.Code` 会区分 `DOWNLOAD_DNS`、`DOWNLOAD_PROXY`、`DOWNLOAD_TLS`、`DOWNLOAD_HTTP`、`DOWNLOAD_TIMEOUT`、`DOWNLOAD_DISK`、`DOWNLOAD_EMPTY`、`DOWNLOAD_LENGTH_MISMATCH`、`DOWNLOAD_SIGNATURE_INVALID`、`DOWNLOAD_IDENTITY_INVALID`、`DOWNLOAD_ARCHITECTURE_INVALID` 与 `DOWNLOAD_UNKNOWN`，每次失败还记录候选长度和 SHA-256（若文件可读）。Claude 自己下载 VM bundle 的 CDN/代理故障只能由本项目诊断和触发官方重试，工具不会把网络问题伪装成本地文件修复成功。
+
+## 实时 VM、历史成功与主动探测
+
+Diagnose 分开输出 `CurrentLiveVm`、`RecentVerifiedLifecycle` 和 `LastSuccessAgeSeconds`。`CurrentLiveVm=false` 只表示当前 HCS/服务/进程组合未检测到正在运行的 Cowork VM；若最近完整生命周期仍有效，它不是新的启动失败。普通 Diagnose 不会启动服务、Claude 或 VM。
+
+只有用户明确运行 `-Action Diagnose -ActiveProbe` 时，工具才会在 Anthropic 双签名通过后尝试启动 CoworkVMService 和 Claude，并等待当前握手/VM 证据。若尚未进入 Cowork，报告会给出 `ExpectedUserAction=OpenClaudeCowork`，不会把历史成功伪装成当前运行。
+
+## 服务恢复动作与待重启
+
+`service-CoworkVMService` 表示服务当前是否运行；`service-recovery-policy` 表示服务异常退出后 SCM 是否配置重启动作。两者互不替代。报告保存 `sc.exe qfailure` 输出、服务日志中的原始 Win32 代码及来源；日志只写 Access Denied 而没有数字时，Win32 5 会明确标为推断。报告给出的管理员命令不会被 Diagnose 自动执行。
+
+`pending-restart` 的 `Classification=Recommended` 表示 Windows 存在系统级待处理标记，但当前检查没有证明它阻断 Claude；`Required` 只用于 ClaudeSetup 本轮修改虚拟化先决条件、VM 重建正处于 AwaitingRestart 或 VirtualMachinePlatform 明确处于 Pending 状态。
+
+## Cowork 需要用户进入与等待时间
+
+孤立状态恢复不是所有场景完全无人值守。安装器能启动 Claude，但必须由用户进入 Cowork 才能产生本轮 VM、daemon、Network 和 API 新鲜证据。等待日志持续输出 `RemainingSeconds`、`ExpectedUserAction` 与 `MissingEvidence`。可用 `-LegacyEvidenceWaitSeconds 600` 把默认 180 秒延长到 10 分钟，允许范围 30–1800 秒；超时只保留状态，不降低归档门槛。
+
+## 备份库存与安全清理
+
+`-Action Inventory` 和 `-Action CleanupPlan` 都是零写入 JSON 操作。它们只自动管理已知 Claude `vm_bundles` 根目录下的 `claudevm.bundle.backup-*` 和 `claudevm.bundle.*isolated*`；外部完整 E2E 备份可用 `-BackupPath` 列出，但标为 `ExternalExplicit`，工具拒绝删除。
+
+删除必须另行执行 `CleanupBackup`，复制 CleanupPlan 当前生成的令牌，并再次提交完全相同的绝对路径。令牌会在大小或最后写入时间变化后失效。工具拒绝重解析点、活动状态引用、结构不完整/不可读/带 EFS 的候选、当前活动 VM 不健康，以及会删除最后一份健康备份的请求。该动作不可恢复，不要把它放进无人值守 Auto 流程。
 
 ## 分享诊断报告
 

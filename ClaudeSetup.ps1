@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('Auto', 'Diagnose', 'Install', 'Repair', 'Launch', 'Plan', 'ResolveLegacyState')]
+    [ValidateSet('Auto', 'Diagnose', 'Install', 'Repair', 'Launch', 'Plan', 'ResolveLegacyState', 'Inventory', 'CleanupPlan', 'CleanupBackup')]
     [string]$Action = 'Auto',
 
     [ValidateSet('None', 'Compatible')]
@@ -11,7 +11,11 @@ param(
     [switch]$RestartIfNeeded,
     [switch]$NonInteractive,
     [switch]$SkipLaunch,
-    [switch]$Redact
+    [switch]$Redact,
+    [ValidateRange(30, 1800)][int]$LegacyEvidenceWaitSeconds = 180,
+    [string]$BackupPath,
+    [string]$ConfirmationToken,
+    [switch]$ActiveProbe
 )
 
 Set-StrictMode -Version 2.0
@@ -19,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$script:ToolVersion = '1.2.3'
+$script:ToolVersion = '1.2.4'
 $script:PackageName = 'Claude'
 $script:PackageFamily = 'Claude_pzs8sxrjxfjjc'
 $script:Aumid = 'Claude_pzs8sxrjxfjjc!Claude'
@@ -45,6 +49,7 @@ $script:DetectedClaudeUserData = $null
 $script:SuppressConsoleLog = $false
 $script:SecurityModuleVerified = $false
 $script:LastDownloadFailure = $null
+$script:ActiveProbeResult = $null
 $script:WindowsPowerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 function Write-Log {
@@ -110,18 +115,21 @@ function Test-IsAdministrator {
 }
 
 function Get-CurrentArgumentList {
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), '-Action', $Action, '-ChineseMode', $ChineseMode)
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), '-Action', $Action, '-ChineseMode', $ChineseMode, '-LegacyEvidenceWaitSeconds', $LegacyEvidenceWaitSeconds)
     if ($CompatibleChineseProjectPath) { $arguments += @('-CompatibleChineseProjectPath', ('"{0}"' -f $CompatibleChineseProjectPath)) }
+    if ($BackupPath) { $arguments += @('-BackupPath', ('"{0}"' -f $BackupPath)) }
+    if ($ConfirmationToken) { $arguments += @('-ConfirmationToken', ('"{0}"' -f $ConfirmationToken)) }
     if ($RestartIfNeeded) { $arguments += '-RestartIfNeeded' }
     if ($NonInteractive) { $arguments += '-NonInteractive' }
     if ($SkipLaunch) { $arguments += '-SkipLaunch' }
     if ($Redact) { $arguments += '-Redact' }
+    if ($ActiveProbe) { $arguments += '-ActiveProbe' }
     return $arguments
 }
 
 function Ensure-Administrator {
     if (Test-IsAdministrator) { return }
-    if ($Action -eq 'Diagnose') {
+    if ($Action -in @('Diagnose', 'Inventory', 'CleanupPlan')) {
         Write-Log '诊断以普通用户权限运行；部分系统级检查将标记为未知。' WARN
         return
     }
@@ -143,18 +151,107 @@ function Get-NativeArchitecture {
 }
 
 function Get-PendingRestart {
+    return (Get-PendingRestartEvidence).Pending
+}
+
+function Get-PendingRestartEvidence {
+    param($RebuildState, $VirtualMachinePlatformState)
+    $signals = New-Object System.Collections.Generic.List[string]
     $checks = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
     )
     foreach ($path in $checks) {
-        if (Test-Path -LiteralPath $path) { return $true }
+        if (Test-Path -LiteralPath $path) { $signals.Add($path) }
     }
     try {
         $sessionManager = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
-        if ($sessionManager.PendingFileRenameOperations) { return $true }
+        if ($sessionManager.PendingFileRenameOperations) { $signals.Add('PendingFileRenameOperations') }
     } catch {}
-    return $false
+    $requiredReasons = New-Object System.Collections.Generic.List[string]
+    if ($script:NeedsRestart) { $requiredReasons.Add('ClaudeSetup changed a virtualization prerequisite in this execution.') }
+    if ($RebuildState -and $RebuildState.PSObject.Properties['Status'] -and [string]$RebuildState.Status -eq 'AwaitingRestart') {
+        $requiredReasons.Add('The active Claude VM rebuild state is AwaitingRestart.')
+    }
+    if ($VirtualMachinePlatformState -and [string]$VirtualMachinePlatformState -match 'Pending') {
+        $requiredReasons.Add("VirtualMachinePlatform state is $VirtualMachinePlatformState.")
+    }
+    $classification = if ($requiredReasons.Count -gt 0) { 'Required' } elseif ($signals.Count -gt 0) { 'Recommended' } else { 'None' }
+    return [pscustomobject]@{
+        Pending = [bool]($signals.Count -gt 0 -or $requiredReasons.Count -gt 0)
+        Classification = $classification
+        Signals = $signals.ToArray()
+        RequiredReasons = $requiredReasons.ToArray()
+    }
+}
+
+function Get-CurrentLiveVmEvidence {
+    $service = Get-Service -Name CoworkVMService -ErrorAction SilentlyContinue
+    $processes = @(Get-Process -Name 'cowork-svc' -ErrorAction SilentlyContinue)
+    $hcsdiagPath = Join-Path $env:SystemRoot 'System32\hcsdiag.exe'
+    $output = @()
+    $exitCode = $null
+    if (Test-Path -LiteralPath $hcsdiagPath -PathType Leaf) {
+        try {
+            $output = @(& $hcsdiagPath list 2>&1 | ForEach-Object { [string]$_ })
+            $exitCode = $LASTEXITCODE
+        } catch {
+            $output = @($_.Exception.Message)
+            $exitCode = -1
+        }
+    }
+    $runningComputeSystems = @($output | Where-Object { $_ -match '(?i)\bRunning\b' })
+    $currentLive = [bool]($service -and $service.Status -eq 'Running' -and $processes.Count -gt 0 -and $runningComputeSystems.Count -gt 0)
+    $status = if (-not (Test-Path -LiteralPath $hcsdiagPath -PathType Leaf) -or ($null -ne $exitCode -and $exitCode -ne 0)) {
+        'Unknown'
+    } elseif ($currentLive) { 'Running' } else { 'NotDetected' }
+    return [pscustomobject]@{
+        CurrentLiveVm = $currentLive
+        Status = $status
+        CoworkServiceStatus = if ($service) { [string]$service.Status } else { 'Missing' }
+        CoworkProcessCount = $processes.Count
+        RunningComputeSystemCount = $runningComputeSystems.Count
+        HcsdiagExitCode = $exitCode
+        HcsdiagOutput = @($output | Select-Object -Last 30)
+        ProbedAt = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
+function Get-ServiceRecoveryPolicyEvidence {
+    param([string[]]$RecoveryWarnings)
+    $service = Get-Service -Name CoworkVMService -ErrorAction SilentlyContinue
+    $output = @()
+    $exitCode = $null
+    try {
+        $output = @(& sc.exe qfailure CoworkVMService 2>&1 | ForEach-Object { [string]$_ })
+        $exitCode = $LASTEXITCODE
+    } catch {
+        $output = @($_.Exception.Message)
+        $exitCode = -1
+    }
+    $rawCodes = New-Object System.Collections.Generic.List[int]
+    foreach ($line in @($RecoveryWarnings)) {
+        foreach ($match in [regex]::Matches([string]$line, '(?i)\b(?:win32(?:\s+error)?|error\s+code|code)\b[\s:=#(]*(?<code>\d+)\b')) {
+            $rawCodes.Add([int]$match.Groups['code'].Value)
+        }
+    }
+    $hasAccessDeniedWithoutCode = [bool](@($RecoveryWarnings | Where-Object { $_ -match '(?i)Access is denied|拒绝访问' }).Count -gt 0 -and $rawCodes.Count -eq 0)
+    $configured = [bool]($exitCode -eq 0 -and ($output -join "`n") -match '(?i)\bRESTART\b')
+    return [pscustomobject]@{
+        QuerySucceeded = $exitCode -eq 0
+        QueryExitCode = $exitCode
+        RecoveryConfigured = $configured
+        ServiceRunning = [bool]($service -and $service.Status -eq 'Running')
+        RawWin32ErrorCodes = @($rawCodes | Select-Object -Unique)
+        InferredWin32ErrorCode = if ($hasAccessDeniedWithoutCode) { 5 } else { $null }
+        ErrorCodeSource = if ($rawCodes.Count -gt 0) { 'ServiceLog' } elseif ($hasAccessDeniedWithoutCode) { 'InferredFromAccessDeniedText' } else { 'NotReported' }
+        QueryOutput = $output
+        LogWarnings = @($RecoveryWarnings)
+        AdministratorRepairCommands = @(
+            'sc.exe failure CoworkVMService reset= 86400 actions= restart/5000/restart/5000/restart/5000',
+            'sc.exe failureflag CoworkVMService 1'
+        )
+    }
 }
 
 function Get-AppxSystemVolume {
@@ -855,7 +952,7 @@ function Get-ClaudeUserDataProtectionKind {
 }
 
 function Get-ClaudeVmLifecycleEvidence {
-    param([Parameter(Mandatory)][string[]]$LogPaths)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$LogPaths)
     $events = New-Object System.Collections.Generic.List[object]
     $kindPatterns = [ordered]@{
         VirtualDisk1772 = '(?i)CreateVirtualDisk failed:\s*0x0*1772\b'
@@ -923,15 +1020,30 @@ function Get-ClaudeVmLifecycleEvidence {
         $latest = @($events | Where-Object { $_.Kind -eq $kind -and $null -ne $_.Time } | Sort-Object Time -Descending | Select-Object -First 1)
         $latestTimes[$kind] = if ($latest.Count -gt 0) { $latest[0].Time.ToString('o') } else { $null }
     }
+    $currentRunHealthy = [bool]($healthyWithoutFailure -or ($failures.Count -gt 0 -and $unresolvedFailures.Count -eq 0))
+    $completeSuccessTimes = New-Object System.Collections.Generic.List[DateTimeOffset]
+    if ($currentRunHealthy) {
+        foreach ($kind in $successKinds) {
+            $parsed = [DateTimeOffset]::MinValue
+            if ($latestTimes[$kind] -and [DateTimeOffset]::TryParse([string]$latestTimes[$kind], [ref]$parsed)) {
+                $completeSuccessTimes.Add($parsed)
+            }
+        }
+    }
+    $latestCompleteSuccess = if ($completeSuccessTimes.Count -eq 4) {
+        @($completeSuccessTimes | Sort-Object -Descending | Select-Object -First 1)[0]
+    } else { $null }
     return [pscustomobject]@{
         CurrentVirtualDisk1772 = $unresolvedFailures.Count -gt 0
         HistoricalVirtualDisk1772 = $failures.Count -gt 0
         FailureResolvedByLaterSuccess = $resolvedFailures.Count -gt 0
-        CurrentRunHealthy = [bool]($healthyWithoutFailure -or ($failures.Count -gt 0 -and $unresolvedFailures.Count -eq 0))
+        CurrentRunHealthy = $currentRunHealthy
         LatestVmStartedAt = $latestTimes.VmStarted
         LatestDaemonReadyAt = $latestTimes.DaemonReady
         LatestNetworkConnectedAt = $latestTimes.NetworkConnected
         LatestApiReachableAt = $latestTimes.ApiReachable
+        LatestCompleteSuccessAt = if ($latestCompleteSuccess) { $latestCompleteSuccess.ToString('o') } else { $null }
+        LastSuccessAgeSeconds = if ($latestCompleteSuccess) { [math]::Max(0, [math]::Floor(([DateTimeOffset]::Now - $latestCompleteSuccess).TotalSeconds)) } else { $null }
     }
 }
 
@@ -1249,40 +1361,45 @@ function Get-AbandonedLegacyVmRebuildEvidence {
         [string]$MinimumLifecycleTime
     )
     $reasons = New-Object System.Collections.Generic.List[string]
+    $missingEvidence = New-Object System.Collections.Generic.List[string]
     $statePaths = $null
     try { $statePaths = Get-VmRebuildStatePathShape $State } catch { $reasons.Add($_.Exception.Message) }
     if (-not $statePaths) {
-        return [pscustomobject]@{ Eligible = $false; Reasons = $reasons.ToArray(); StatePaths = $null }
+        $missingEvidence.Add('StatePathShape')
+        return [pscustomobject]@{ Eligible = $false; Reasons = $reasons.ToArray(); MissingEvidence = $missingEvidence.ToArray(); StatePaths = $null }
     }
     if (-not $State.PSObject.Properties['Status'] -or [string]$State.Status -notin @('AwaitingRestart', 'Rebuilding')) {
         $reasons.Add('状态不是 AwaitingRestart/Rebuilding。')
+        $missingEvidence.Add('EligibleStateStatus')
     }
     $originalPresent = Test-Path -LiteralPath $statePaths.Bundle
     $backupPresent = Test-Path -LiteralPath $statePaths.Backup
-    if ($originalPresent -or $backupPresent) { $reasons.Add('旧活动 bundle 或备份仍然存在。') }
+    if ($originalPresent -or $backupPresent) { $reasons.Add('旧活动 bundle 或备份仍然存在。'); $missingEvidence.Add('OldPathsAbsent') }
     $paths = if ($Paths) { $Paths } else { Get-ClaudePaths }
     if (-not $paths -or -not $paths.PSObject.Properties['PackageLocalUserData'] -or
         -not (Test-IsAppxPrivatePath $statePaths.Bundle)) {
         $reasons.Add('无法证明旧状态精确属于当前 Claude AppX 包私有目录。')
+        $missingEvidence.Add('OfficialPackageIdentity')
     }
     $expectedLegacyBundle = if ($paths -and $paths.PSObject.Properties['PackageLocalUserData']) {
         [IO.Path]::GetFullPath((Join-Path $paths.PackageLocalUserData 'vm_bundles\claudevm.bundle'))
     } else { $null }
     if ($expectedLegacyBundle -and -not $statePaths.Bundle.Equals($expectedLegacyBundle, [StringComparison]::OrdinalIgnoreCase)) {
         $reasons.Add('旧状态路径与当前 Claude 包身份不匹配。')
+        $missingEvidence.Add('OfficialPackageIdentity')
     }
     $safeActiveData = [bool]($paths -and (Test-SafeIndependentClaudeUserDataPath $paths.ActiveUserData) -and
         -not (Test-IsAppxPrivatePath $paths.ActiveUserData) -and $paths.ActiveUserDataSource -ne 'PackageLocalCache:default')
-    if (-not $safeActiveData) { $reasons.Add('当前活动数据目录不是已配置的安全独立 LocalAppData 路径。') }
+    if (-not $safeActiveData) { $reasons.Add('当前活动数据目录不是已配置的安全独立 LocalAppData 路径。'); $missingEvidence.Add('SafeIndependentUserData') }
     $currentBundle = if ($paths -and $paths.PSObject.Properties['ActiveUserData']) {
         [IO.Path]::GetFullPath((Join-Path $paths.ActiveUserData 'vm_bundles\claudevm.bundle'))
     } else { $null }
     $status = if ($currentBundle) { Get-VmBundleStatus -BundlePath $currentBundle } else { $null }
-    if (-not $status -or -not $status.Ready) { $reasons.Add('当前独立 VM bundle 的五个运行文件不完整或路径不安全。') }
+    if (-not $status -or -not $status.Ready) { $reasons.Add('当前独立 VM bundle 的五个运行文件不完整或路径不安全。'); $missingEvidence.Add('CompleteVmFiles') }
     $criticalEfsItems = @(if ($paths -and $paths.PSObject.Properties['ActiveUserData']) {
         Get-ClaudeVmCriticalEfsItems $paths.ActiveUserData
     })
-    if ($criticalEfsItems.Count -gt 0) { $reasons.Add("当前 VM 关键路径仍有 $($criticalEfsItems.Count) 个 EFS 项。") }
+    if ($criticalEfsItems.Count -gt 0) { $reasons.Add("当前 VM 关键路径仍有 $($criticalEfsItems.Count) 个 EFS 项。"); $missingEvidence.Add('VmCriticalEfsClear') }
     $lifecycle = if ($LifecycleEvidence) { $LifecycleEvidence } elseif ($paths -and $paths.PSObject.Properties['ActiveUserData']) {
         $protection = Get-ClaudeUserDataProtectionEvidence -UserDataPath $paths.ActiveUserData
         [pscustomobject]@{
@@ -1296,12 +1413,24 @@ function Get-AbandonedLegacyVmRebuildEvidence {
     } else { $null }
     if (-not $lifecycle -or -not $lifecycle.CurrentRunHealthy -or $lifecycle.CurrentVirtualDisk1772) {
         $reasons.Add('当前日志没有证明完整健康序列，或仍有未解决的 0x1772。')
+        foreach ($pair in @(
+            @('LatestVmStartedAt', 'VmStarted'),
+            @('LatestDaemonReadyAt', 'DaemonReady'),
+            @('LatestNetworkConnectedAt', 'NetworkConnected'),
+            @('LatestApiReachableAt', 'ApiReachable')
+        )) {
+            if (-not $lifecycle -or -not $lifecycle.PSObject.Properties[$pair[0]] -or -not [string]$lifecycle.($pair[0])) {
+                $missingEvidence.Add($pair[1])
+            }
+        }
+        if ($lifecycle -and $lifecycle.CurrentVirtualDisk1772) { $missingEvidence.Add('NoCurrentVirtualDisk1772') }
     }
     $lifecycleFreshAfterAnchor = $null
     if ($MinimumLifecycleTime) {
         $minimum = [DateTimeOffset]::MinValue
         if (-not [DateTimeOffset]::TryParse($MinimumLifecycleTime, [ref]$minimum)) {
             $reasons.Add('本次执行的健康证据时间锚点无效。')
+            $missingEvidence.Add('ValidLifecycleAnchor')
             $lifecycleFreshAfterAnchor = $false
         } else {
             $lifecycleFreshAfterAnchor = $true
@@ -1315,11 +1444,12 @@ function Get-AbandonedLegacyVmRebuildEvidence {
             }
             if (-not $lifecycleFreshAfterAnchor) {
                 $reasons.Add("完整 VM/网络/API 健康序列早于本次启动锚点 $($minimum.ToString('o'))；请在已启动的 Claude 中进入 Cowork。")
+                $missingEvidence.Add('LifecycleFreshAfterAnchor')
             }
         }
     }
     $signatures = if ($CoreSignatures) { $CoreSignatures } else { Test-ClaudeCoreSignatures }
-    if (-not $signatures -or -not $signatures.Valid) { $reasons.Add('Claude.exe 或 cowork-svc.exe 的 Anthropic 签名无效。') }
+    if (-not $signatures -or -not $signatures.Valid) { $reasons.Add('Claude.exe 或 cowork-svc.exe 的 Anthropic 签名无效。'); $missingEvidence.Add('CoreSignaturesValid') }
     $vmFiles = @()
     if ($status -and $status.Ready) {
         $vmFiles = @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz' | ForEach-Object {
@@ -1330,6 +1460,7 @@ function Get-AbandonedLegacyVmRebuildEvidence {
     return [pscustomobject]@{
         Eligible = $reasons.Count -eq 0
         Reasons = $reasons.ToArray()
+        MissingEvidence = @($missingEvidence | Select-Object -Unique)
         StatePaths = $statePaths
         OriginalPathPresent = $originalPresent
         BackupPathPresent = $backupPresent
@@ -1356,6 +1487,7 @@ function Wait-AbandonedLegacyVmRebuildEvidence {
     )
     $deadline = (Get-Date).AddSeconds([math]::Max(0, $Seconds))
     $lastReasonText = $null
+    $nextProgress = Get-Date
     do {
         $evidence = if ($EvidenceProvider) {
             & $EvidenceProvider $State
@@ -1364,15 +1496,28 @@ function Wait-AbandonedLegacyVmRebuildEvidence {
             $paths = Get-ClaudePaths
             Get-AbandonedLegacyVmRebuildEvidence -State $State -Paths $paths -MinimumLifecycleTime $MinimumLifecycleTime
         }
+        $remainingSeconds = [math]::Max(0, [math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+        if ($evidence) {
+            $evidence | Add-Member -NotePropertyName RemainingSeconds -NotePropertyValue $remainingSeconds -Force
+            $evidence | Add-Member -NotePropertyName ExpectedUserAction -NotePropertyValue 'OpenClaudeCowork' -Force
+            $evidence | Add-Member -NotePropertyName TimedOut -NotePropertyValue $false -Force
+        }
         if ($evidence -and $evidence.Eligible) { return $evidence }
         $reasonText = if ($evidence -and $evidence.Reasons) { $evidence.Reasons -join '；' } else { '无法采集 Abandoned 安全证据。' }
-        if ($reasonText -ne $lastReasonText) {
-            Write-Log "等待孤立状态安全证据就绪：$reasonText" INFO
+        if ($reasonText -ne $lastReasonText -or (Get-Date) -ge $nextProgress) {
+            $missingText = if ($evidence -and $evidence.PSObject.Properties['MissingEvidence']) { @($evidence.MissingEvidence) -join ',' } else { 'Unknown' }
+            Write-Log "等待孤立状态安全证据就绪：RemainingSeconds=$remainingSeconds；ExpectedUserAction=OpenClaudeCowork；MissingEvidence=$missingText；$reasonText" INFO
             $lastReasonText = $reasonText
+            $nextProgress = (Get-Date).AddSeconds(15)
         }
         if ((Get-Date) -ge $deadline) { break }
         Start-Sleep -Milliseconds ([math]::Max(10, $PollMilliseconds))
     } while ($true)
+    if ($evidence) {
+        $evidence | Add-Member -NotePropertyName RemainingSeconds -NotePropertyValue 0 -Force
+        $evidence | Add-Member -NotePropertyName ExpectedUserAction -NotePropertyValue 'OpenClaudeCowork' -Force
+        $evidence | Add-Member -NotePropertyName TimedOut -NotePropertyValue $true -Force
+    }
     return $evidence
 }
 
@@ -1550,6 +1695,229 @@ function Get-VmBundleStatus {
         Missing = $missing
         Encrypted = $encrypted
         ReparsePoint = Test-ReparsePoint $BundlePath
+    }
+}
+
+function Get-ManagedVmBackupRoots {
+    $roots = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @(
+        @((Join-Path $env:LOCALAPPDATA 'Claude-3p\vm_bundles'), 'IndependentUserData'),
+        @((Join-Path $env:LOCALAPPDATA "Packages\$script:PackageFamily\LocalCache\Roaming\Claude\vm_bundles"), 'PackageLocalCache'),
+        @((Join-Path $env:APPDATA 'Claude\vm_bundles'), 'RoamingUserData')
+    )) {
+        $full = [IO.Path]::GetFullPath([string]$entry[0])
+        if (-not @($roots | Where-Object { $_.Path.Equals($full, [StringComparison]::OrdinalIgnoreCase) }).Count) {
+            $roots.Add([pscustomobject]@{ Path = $full; Source = [string]$entry[1] })
+        }
+    }
+    $state = $null
+    try { $state = Get-VmRebuildState } catch {}
+    if ($state) {
+        try {
+            $shape = Get-VmRebuildStatePathShape $state
+            if (-not @($roots | Where-Object { $_.Path.Equals($shape.VmBundles, [StringComparison]::OrdinalIgnoreCase) }).Count) {
+                $roots.Add([pscustomobject]@{ Path = $shape.VmBundles; Source = 'ActiveRebuildState' })
+            }
+        } catch {}
+    }
+    return $roots.ToArray()
+}
+
+function Test-VmBackupLeafName {
+    param([Parameter(Mandatory)][string]$Name)
+    return $Name -like 'claudevm.bundle.backup-*' -or $Name -like 'claudevm.bundle.*isolated*'
+}
+
+function Get-DirectorySizeBytes {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $measurement = Get-ChildItem -LiteralPath $Path -File -Recurse -Force -ErrorAction Stop | Measure-Object -Property Length -Sum
+        return [int64]$(if ($null -ne $measurement.Sum) { $measurement.Sum } else { 0 })
+    } catch { return $null }
+}
+
+function Test-VmBackupRequiredFilesReadable {
+    param([Parameter(Mandatory)][string]$Path)
+    foreach ($name in @('rootfs.vhdx', 'sessiondata.vhdx', 'smol-bin.vhdx', 'initrd', 'vmlinuz')) {
+        $file = Join-Path $Path $name
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $false }
+        $stream = $null
+        try {
+            $stream = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            if ($stream.Length -le 0) { return $false }
+            [void]$stream.ReadByte()
+        } catch { return $false }
+        finally { if ($stream) { $stream.Dispose() } }
+    }
+    return $true
+}
+
+function Get-VmBackupDeletionToken {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int64]$Bytes,
+        [Parameter(Mandatory)][string]$LastWriteTimeUtc
+    )
+    $payload = "{0}`n{1}`n{2}" -f ([IO.Path]::GetFullPath($Path)), $Bytes, $LastWriteTimeUtc
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload))).Replace('-', '')
+    } finally { $sha.Dispose() }
+    return "DELETE-CLAUDE-BACKUP-$($digest.Substring(0, 20))"
+}
+
+function Get-VmBackupInventory {
+    param(
+        [string]$ExplicitPath,
+        [ValidateSet('Inventory', 'CleanupPlan')][string]$Mode = 'Inventory'
+    )
+    $roots = @(Get-ManagedVmBackupRoots)
+    $candidatePaths = New-Object System.Collections.Generic.List[string]
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root.Path -PathType Container)) { continue }
+        foreach ($directory in @(Get-ChildItem -LiteralPath $root.Path -Directory -Force -ErrorAction SilentlyContinue | Where-Object { Test-VmBackupLeafName $_.Name })) {
+            $candidatePaths.Add([IO.Path]::GetFullPath($directory.FullName))
+        }
+    }
+    if ($ExplicitPath) {
+        if (-not [IO.Path]::IsPathRooted($ExplicitPath) -or $ExplicitPath -match '^[A-Za-z]:[^\\/]') {
+            throw "备份路径必须是完整绝对路径：$ExplicitPath"
+        }
+        try { $candidatePaths.Add([IO.Path]::GetFullPath($ExplicitPath)) } catch { throw "无法解析备份绝对路径：$ExplicitPath" }
+    }
+    $candidatePaths = @($candidatePaths | Select-Object -Unique)
+    $state = $null
+    $stateBackup = $null
+    try {
+        $state = Get-VmRebuildState
+        if ($state) { $stateBackup = [IO.Path]::GetFullPath([string]$state.BackupPath) }
+    } catch {}
+    $paths = Get-ClaudePaths
+    $activeBundle = if ($paths) { [IO.Path]::GetFullPath((Join-Path $paths.ActiveUserData 'vm_bundles\claudevm.bundle')) } else { $null }
+    $activeStatus = if ($activeBundle) { Get-VmBundleStatus -BundlePath $activeBundle } else { $null }
+    $activeVmHealthy = [bool]($activeStatus -and $activeStatus.Ready -and @(Get-ClaudeVmCriticalEfsItems $paths.ActiveUserData).Count -eq 0)
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($candidatePath in $candidatePaths) {
+        $exists = Test-Path -LiteralPath $candidatePath -PathType Container
+        $leaf = Split-Path -Leaf $candidatePath
+        $rootMatch = @($roots | Where-Object { ([IO.Path]::GetDirectoryName($candidatePath)).Equals($_.Path, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
+        $managed = [bool]($rootMatch.Count -gt 0 -and -not (Test-ReparsePoint $rootMatch[0].Path) -and (Test-VmBackupLeafName $leaf))
+        $source = if ($rootMatch.Count -gt 0) { $rootMatch[0].Source } else { 'ExternalExplicit' }
+        $item = if ($exists) { Get-Item -LiteralPath $candidatePath -Force } else { $null }
+        $reparse = [bool]($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint))
+        $descendantReparseCount = if ($exists -and -not $reparse) {
+            try { @(Get-ChildItem -LiteralPath $candidatePath -Force -Recurse -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count } catch { $null }
+        } else { $null }
+        $status = if ($exists -and -not $reparse) { Get-VmBundleStatus -BundlePath $candidatePath } else { $null }
+        $bytes = if ($exists -and -not $reparse) { Get-DirectorySizeBytes -Path $candidatePath } else { $null }
+        $readable = [bool]($exists -and -not $reparse -and $status -and $status.Ready -and (Test-VmBackupRequiredFilesReadable -Path $candidatePath))
+        $encryptedCount = if ($exists -and -not $reparse) {
+            try { @(Get-ChildItem -LiteralPath $candidatePath -Force -Recurse -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::Encrypted }).Count } catch { $null }
+        } else { $null }
+        $verificationStatus = if (-not $exists) { 'Missing' } elseif ($reparse -or ($null -ne $descendantReparseCount -and $descendantReparseCount -gt 0)) { 'ReparsePointRejected' } elseif (-not $status.Ready) { 'Incomplete' } elseif (-not $readable -or $null -eq $bytes -or $null -eq $encryptedCount -or $null -eq $descendantReparseCount) { 'Unreadable' } elseif ($encryptedCount -gt 0) { 'EncryptedOrProtected' } else { 'StructurallyVerified' }
+        $recoverability = switch ($verificationStatus) {
+            'StructurallyVerified' { 'RecoveryCandidate' }
+            'EncryptedOrProtected' { 'RequiresOriginalProtectionContext' }
+            default { 'Unverified' }
+        }
+        $items.Add([pscustomobject]@{
+            Path = $candidatePath
+            Source = $source
+            ManagedByCleanup = $managed
+            Exists = $exists
+            CreatedAt = if ($item) { $item.CreationTimeUtc.ToString('o') } else { $null }
+            LastWriteTimeUtc = if ($item) { $item.LastWriteTimeUtc.ToString('o') } else { $null }
+            SizeBytes = $bytes
+            SizeGiB = if ($null -ne $bytes) { [math]::Round($bytes / 1GB, 2) } else { $null }
+            VerificationStatus = $verificationStatus
+            Recoverability = $recoverability
+            MissingFiles = if ($status) { @($status.Missing) } else { @() }
+            EncryptedItemCount = $encryptedCount
+            ReparseItemCount = $descendantReparseCount
+            ReferencedByActiveState = [bool]($stateBackup -and $candidatePath.Equals($stateBackup, [StringComparison]::OrdinalIgnoreCase))
+            Deletable = $false
+            DeletionBlockers = @()
+            ConfirmationToken = $null
+        })
+    }
+    $verifiedCount = @($items | Where-Object VerificationStatus -eq 'StructurallyVerified').Count
+    $verifiedManagedCount = @($items | Where-Object { $_.ManagedByCleanup -and $_.VerificationStatus -eq 'StructurallyVerified' }).Count
+    foreach ($item in $items) {
+        $blockers = New-Object System.Collections.Generic.List[string]
+        if (-not $item.ManagedByCleanup) { $blockers.Add('Path is outside a managed Claude vm_bundles root or its name is not a recognized backup/isolation artifact.') }
+        if (-not $item.Exists) { $blockers.Add('Path does not exist.') }
+        if ($item.ReferencedByActiveState) { $blockers.Add('Backup is referenced by the active VM rebuild state.') }
+        if ($item.VerificationStatus -ne 'StructurallyVerified') { $blockers.Add("Backup verification status is $($item.VerificationStatus).") }
+        if (-not $activeVmHealthy) { $blockers.Add('The active Claude VM bundle is not structurally healthy and EFS-clear.') }
+        if ($item.ManagedByCleanup -and $verifiedManagedCount -le 1) { $blockers.Add('Deletion would remove the last structurally verified healthy managed backup.') }
+        $item.DeletionBlockers = $blockers.ToArray()
+        $item.Deletable = $blockers.Count -eq 0
+        if ($Mode -eq 'CleanupPlan' -and $item.Deletable) {
+            $item.ConfirmationToken = Get-VmBackupDeletionToken -Path $item.Path -Bytes $item.SizeBytes -LastWriteTimeUtc $item.LastWriteTimeUtc
+        }
+    }
+    $totalBytes = [int64]0
+    foreach ($inventoryItem in $items) {
+        if ($null -ne $inventoryItem.SizeBytes) { $totalBytes += [int64]$inventoryItem.SizeBytes }
+    }
+    return [pscustomobject]@{
+        SchemaVersion = 1
+        ToolVersion = $script:ToolVersion
+        Action = $Mode
+        GeneratedAt = (Get-Date).ToUniversalTime().ToString('o')
+        ReadOnly = $true
+        ActiveBundle = $activeBundle
+        ActiveVmHealthy = $activeVmHealthy
+        CandidateCount = $items.Count
+        StructurallyVerifiedBackupCount = $verifiedCount
+        StructurallyVerifiedManagedBackupCount = $verifiedManagedCount
+        TotalBytes = $totalBytes
+        Guarantees = @(
+            "$Mode does not create reports or logs and does not modify files, services, AppX packages, processes, or VM state.",
+            'Cleanup requires a separate CleanupBackup invocation with the exact path and the current confirmation token.',
+            'CleanupBackup refuses unmanaged paths, reparse points, active-state references, unhealthy current VM state, and deletion of the last structurally verified backup.'
+        )
+        Items = $items.ToArray()
+    }
+}
+
+function Remove-VerifiedVmBackup {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Token
+    )
+    if (-not [IO.Path]::IsPathRooted($Path) -or $Path -match '^[A-Za-z]:[^\\/]') {
+        throw "CleanupBackup 只接受完整绝对路径：$Path"
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $plan = Get-VmBackupInventory -ExplicitPath $fullPath -Mode CleanupPlan
+    $candidate = @($plan.Items | Where-Object { $_.Path.Equals($fullPath, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
+    if ($candidate.Count -ne 1) { throw "清理目标未进入安全清单：$fullPath" }
+    $candidate = $candidate[0]
+    if (-not $candidate.Deletable) { throw "拒绝删除备份：$($candidate.DeletionBlockers -join '；')" }
+    if (-not $Token.Equals([string]$candidate.ConfirmationToken, [StringComparison]::Ordinal)) {
+        throw '二次确认令牌不匹配；请重新运行 CleanupPlan 并复制当前令牌。'
+    }
+    $parentPath = [IO.Path]::GetDirectoryName($fullPath)
+    if ((Split-Path -Leaf $parentPath) -ne 'vm_bundles' -or -not (Test-VmBackupLeafName (Split-Path -Leaf $fullPath))) {
+        throw "清理目标不满足 Claude VM 备份路径边界：$fullPath"
+    }
+    if (Test-ReparsePoint $parentPath) { throw "清理目标的 vm_bundles 父目录是重解析点，拒绝递归删除：$parentPath" }
+    if (Test-ReparsePoint $fullPath) { throw "清理目标是重解析点，拒绝递归删除：$fullPath" }
+    $preDeleteReparseItems = @(Get-ChildItem -LiteralPath $fullPath -Force -Recurse -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })
+    if ($preDeleteReparseItems.Count -gt 0) { throw "清理目标内部含重解析点，拒绝递归删除：$fullPath" }
+    $bytes = [int64]$candidate.SizeBytes
+    Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $fullPath) { throw "清理后目标仍存在：$fullPath" }
+    return [pscustomobject]@{
+        SchemaVersion = 1
+        ToolVersion = $script:ToolVersion
+        Action = 'CleanupBackup'
+        RemovedPath = $fullPath
+        RemovedBytes = $bytes
+        RemovedAt = (Get-Date).ToUniversalTime().ToString('o')
+        RemainingStructurallyVerifiedBackups = $plan.StructurallyVerifiedBackupCount - 1
+        Recoverable = $false
     }
 }
 
@@ -2581,10 +2949,30 @@ function Invoke-Diagnostics {
         }
     }
 
-    if (Get-PendingRestart) { Add-Finding 'pending-restart' 'Warning' 'Windows 有待完成的重启操作' }
-    else { Add-Finding 'pending-restart' 'Pass' '没有检测到待完成重启' }
-
     $recentEvidence = Get-RecentCoworkErrorEvidence
+    $pendingRestart = Get-PendingRestartEvidence -RebuildState $rebuildState -VirtualMachinePlatformState $(if ($vmp) { $vmp.State } else { $null })
+    if ($pendingRestart.Classification -eq 'Required') {
+        Add-Finding 'pending-restart' 'Warning' 'Windows 重启是完成当前 Claude/虚拟化流程的必要步骤' (($pendingRestart.RequiredReasons + $pendingRestart.Signals) -join "`r`n")
+    } elseif ($pendingRestart.Classification -eq 'Recommended') {
+        Add-Finding 'pending-restart' 'Warning' 'Windows 检测到系统级待重启状态；当前 Claude 检查未证明它是阻断项' ("Classification=Recommended`r`n" + ($pendingRestart.Signals -join "`r`n"))
+    } else {
+        Add-Finding 'pending-restart' 'Pass' '没有检测到待完成重启' 'Classification=None'
+    }
+    $lifecycleLogPaths = @($recentEvidence.SuccessCutoffs.PSObject.Properties | ForEach-Object { $_.Name })
+    $lifecycleEvidence = Get-ClaudeVmLifecycleEvidence -LogPaths $lifecycleLogPaths
+    $liveVmEvidence = Get-CurrentLiveVmEvidence
+    if ($liveVmEvidence.Status -eq 'Running') {
+        Add-Finding 'current-live-vm' 'Pass' '当前检测到 Cowork HCS VM 正在运行' (($liveVmEvidence | ConvertTo-Json -Depth 4))
+    } elseif ($liveVmEvidence.Status -eq 'NotDetected') {
+        Add-Finding 'current-live-vm' 'Info' '当前没有检测到正在运行的 Cowork VM' '这不等同历史启动失败；用户未进入 Cowork 或已退出 Claude 时属于正常。普通 Diagnose 不会擅自启动 VM。'
+    } else {
+        Add-Finding 'current-live-vm' 'Warning' '无法可靠读取当前 Cowork HCS VM 状态' (($liveVmEvidence | ConvertTo-Json -Depth 4))
+    }
+    if ($lifecycleEvidence.CurrentRunHealthy -and $lifecycleEvidence.LatestCompleteSuccessAt) {
+        Add-Finding 'recent-verified-lifecycle' 'Pass' "最近完整 Cowork 成功序列距今 $($lifecycleEvidence.LastSuccessAgeSeconds) 秒" "LatestCompleteSuccessAt=$($lifecycleEvidence.LatestCompleteSuccessAt)`r`nRecentVerifiedLifecycle=true"
+    } else {
+        Add-Finding 'recent-verified-lifecycle' 'Info' '没有可验证的最近完整 Cowork 成功序列' 'RecentVerifiedLifecycle=false；这与 CurrentLiveVm 分开报告。'
+    }
     if ($recentEvidence.CurrentErrors.Count -gt 0) {
         Add-Finding 'current-cowork-errors' 'Warning' "找到 $($recentEvidence.CurrentErrors.Count) 条尚未被后续完整成功序列覆盖的 Cowork 错误" ($recentEvidence.CurrentErrors -join "`r`n")
     } else {
@@ -2596,8 +2984,13 @@ function Invoke-Diagnostics {
     if ($recentEvidence.Information.Count -gt 0) {
         Add-Finding 'recent-cowork-success' 'Info' '最近 Cowork 成功事件（用于会话分段）' ($recentEvidence.Information -join "`r`n")
     }
-    if ($recentEvidence.RecoveryWarnings.Count -gt 0) {
-        Add-Finding 'service-recovery-actions' 'Warning' 'CoworkVMService 无法自行配置服务恢复动作，但服务运行状态与 VM 健康需独立判断' (($recentEvidence.RecoveryWarnings -join "`r`n") + "`r`n这不是当前 VM 启动失败的充分证据；若服务崩溃后没有自动恢复，请以管理员身份重启服务或重启 Windows。")
+    $serviceRecovery = Get-ServiceRecoveryPolicyEvidence -RecoveryWarnings $recentEvidence.RecoveryWarnings
+    $serviceRecoveryStatus = if ($recentEvidence.RecoveryWarnings.Count -gt 0) { 'Warning' } elseif ($serviceRecovery.RecoveryConfigured) { 'Pass' } else { 'Info' }
+    $serviceRecoverySummary = if ($serviceRecovery.RecoveryConfigured) { 'CoworkVMService 崩溃恢复策略已配置' } else { 'CoworkVMService 崩溃恢复策略未确认；与服务当前运行状态分开判断' }
+    Add-Finding 'service-recovery-policy' $serviceRecoveryStatus $serviceRecoverySummary (($serviceRecovery | ConvertTo-Json -Depth 6))
+    if ($script:ActiveProbeResult) {
+        $probeStatus = if ($script:ActiveProbeResult.HealthWaitPassed) { 'Pass' } else { 'Warning' }
+        Add-Finding 'active-probe' $probeStatus '已按显式 -ActiveProbe 请求启动 Claude/Cowork 并采集状态' (($script:ActiveProbeResult | ConvertTo-Json -Depth 5))
     }
     if ($script:LastDownloadFailure) {
         Add-Finding 'official-download-failure' 'Fail' "官方下载失败：$($script:LastDownloadFailure.Code)" (($script:LastDownloadFailure | ConvertTo-Json -Depth 6))
@@ -2609,6 +3002,16 @@ function Invoke-Diagnostics {
         Computer = $env:COMPUTERNAME
         User = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         DownloadFailure = $script:LastDownloadFailure
+        Runtime = [pscustomobject]@{
+            CurrentLiveVm = $liveVmEvidence.CurrentLiveVm
+            CurrentLiveVmStatus = $liveVmEvidence.Status
+            RecentVerifiedLifecycle = [bool]$lifecycleEvidence.CurrentRunHealthy
+            LatestCompleteSuccessAt = $lifecycleEvidence.LatestCompleteSuccessAt
+            LastSuccessAgeSeconds = $lifecycleEvidence.LastSuccessAgeSeconds
+        }
+        PendingRestart = $pendingRestart
+        ServiceRecovery = $serviceRecovery
+        ActiveProbe = $script:ActiveProbeResult
         Findings = $script:Findings.ToArray()
     }
 }
@@ -2828,7 +3231,7 @@ function Get-SetupPlan {
             } else {
                 $bootstrapEvidence = Get-LegacyStateBootstrapEvidence -State $state
                 if ($bootstrapEvidence.Eligible) {
-                    & $addStep 'legacy-state' 'LegacyState' 'Conditional' $script:VmRebuildStatePath 'The old bundle and backup are both absent. Auto first installs/verifies the official package, records a UTC execution anchor, starts Claude when allowed, waits up to 180 seconds, and then re-evaluates every Abandoned condition.' 'The state is archived only after package identity, independent VM files, VM-critical EFS, both signatures, and VM/daemon/network/API events newer than the execution anchor all pass; timeout leaves the state unchanged.' $true $false
+                & $addStep 'legacy-state' 'LegacyState' 'Conditional' $script:VmRebuildStatePath "The old bundle and backup are both absent. Auto first installs/verifies the official package, records a UTC execution anchor, starts Claude when allowed, waits up to $LegacyEvidenceWaitSeconds seconds, and then re-evaluates every Abandoned condition." 'The state is archived only after package identity, independent VM files, VM-critical EFS, both signatures, and VM/daemon/network/API events newer than the execution anchor all pass; timeout leaves the state unchanged.' $true $false
                 } else {
                     $activeStateValid = $false
                     try { Assert-VmRebuildState $state; $activeStateValid = $true } catch {}
@@ -3707,6 +4110,52 @@ function Invoke-HealthWait {
     return $false
 }
 
+function Invoke-OptionalActiveVmProbe {
+    if (-not $ActiveProbe) { return $null }
+    $startedAt = (Get-Date).ToUniversalTime().ToString('o')
+    if (-not (Test-IsAdministrator)) {
+        return [pscustomobject]@{
+            Requested = $true
+            StartedAt = $startedAt
+            HealthWaitPassed = $false
+            Status = 'AdministratorRequired'
+            Detail = 'ActiveProbe may start CoworkVMService and Claude; rerun the explicit probe from an administrator console.'
+        }
+    }
+    $signatures = Test-ClaudeCoreSignatures
+    if (-not $signatures.Valid) {
+        return [pscustomobject]@{
+            Requested = $true
+            StartedAt = $startedAt
+            HealthWaitPassed = $false
+            Status = 'CoreSignatureRejected'
+            Detail = 'Claude.exe or cowork-svc.exe did not pass the Anthropic signature gate; no process or service was started.'
+        }
+    }
+    try {
+        Start-CoworkServices
+        Start-ClaudeAppx
+        $passed = Invoke-HealthWait -HandshakeSeconds 30 -VmSeconds 90
+        return [pscustomobject]@{
+            Requested = $true
+            StartedAt = $startedAt
+            CompletedAt = (Get-Date).ToUniversalTime().ToString('o')
+            HealthWaitPassed = [bool]$passed
+            Status = if ($passed) { 'Passed' } else { 'Incomplete' }
+            ExpectedUserAction = if ($passed) { 'None' } else { 'OpenClaudeCowork' }
+        }
+    } catch {
+        return [pscustomobject]@{
+            Requested = $true
+            StartedAt = $startedAt
+            CompletedAt = (Get-Date).ToUniversalTime().ToString('o')
+            HealthWaitPassed = $false
+            Status = 'Error'
+            Detail = $_.Exception.Message
+        }
+    }
+}
+
 function Invoke-AutoSetup {
     Enable-CoworkPrerequisites
     if ($script:NeedsRestart) {
@@ -3732,7 +4181,7 @@ function Invoke-AutoSetup {
             $abandonedLifecycleAnchor = (Get-Date).ToUniversalTime().ToString('o')
             Start-CoworkServices
             if (-not $SkipLaunch) { Start-ClaudeAppx }
-            $evidenceWaitSeconds = if ($SkipLaunch) { 0 } else { 180 }
+            $evidenceWaitSeconds = if ($SkipLaunch) { 0 } else { $LegacyEvidenceWaitSeconds }
             if (-not $SkipLaunch) {
                 Write-Log '请在已启动的 Claude 中进入 Cowork；只有本次启动后的 VM、网络、daemon 与 API 全部成功，才会归档孤立状态。' WARN
             }
@@ -3810,17 +4259,21 @@ if ($env:CLAUDE_SETUP_IMPORT_ONLY -eq '1') {
     return
 }
 
-if ($Action -eq 'Plan') {
+if ($Action -in @('Plan', 'Inventory', 'CleanupPlan')) {
     $script:SuppressConsoleLog = $true
     try {
-        $plan = Get-SetupPlan
+        $plan = switch ($Action) {
+            'Plan' { Get-SetupPlan }
+            'Inventory' { Get-VmBackupInventory -ExplicitPath $BackupPath -Mode Inventory }
+            'CleanupPlan' { Get-VmBackupInventory -ExplicitPath $BackupPath -Mode CleanupPlan }
+        }
         [Console]::Out.WriteLine(($plan | ConvertTo-Json -Depth 10 -Compress))
         exit 0
     } catch {
         $errorPlan = [pscustomobject]@{
             SchemaVersion = 1
             ToolVersion = $script:ToolVersion
-            Action = 'Plan'
+            Action = $Action
             GeneratedAt = (Get-Date).ToUniversalTime().ToString('o')
             ReadOnly = $true
             Error = $_.Exception.Message
@@ -3831,7 +4284,7 @@ if ($Action -eq 'Plan') {
 }
 
 New-Item -ItemType Directory -Path $script:ReportsRoot -Force | Out-Null
-if ($Action -notin @('Diagnose', 'ResolveLegacyState')) {
+if ($Action -notin @('Diagnose', 'ResolveLegacyState', 'CleanupBackup')) {
     New-Item -ItemType Directory -Path $script:DownloadsRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $script:ProgramDataRoot, $script:BackupRoot -Force | Out-Null
 }
@@ -3841,10 +4294,11 @@ Ensure-Administrator
 
 $exitCode = 0
 $actionReport = $null
-$skipFinalReport = $Action -eq 'ResolveLegacyState'
+$skipFinalReport = $Action -in @('ResolveLegacyState', 'CleanupBackup')
 try {
     switch ($Action) {
         'Diagnose' {
+            if ($ActiveProbe) { $script:ActiveProbeResult = Invoke-OptionalActiveVmProbe }
             $actionReport = Invoke-Diagnostics
             Show-DiagnosticSummary $actionReport
         }
@@ -3878,6 +4332,12 @@ try {
         }
         'Launch' { Start-ClaudeAppx }
         'ResolveLegacyState' { $exitCode = Invoke-ResolveLegacyState }
+        'CleanupBackup' {
+            if (-not $BackupPath -or -not $ConfirmationToken) { throw 'CleanupBackup 必须同时提供 -BackupPath 精确路径和 -ConfirmationToken 二次确认令牌。' }
+            $actionReport = Remove-VerifiedVmBackup -Path $BackupPath -Token $ConfirmationToken
+            [Console]::Out.WriteLine(($actionReport | ConvertTo-Json -Depth 8 -Compress))
+            Write-Log "已按精确路径删除经过二次确认的 Claude VM 备份：$($actionReport.RemovedPath)；该删除不可由本工具恢复。" WARN
+        }
         'Auto' { $exitCode = Invoke-AutoSetup }
     }
 
